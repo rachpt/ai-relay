@@ -15,6 +15,7 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1"] }

@@ -139,12 +139,12 @@ try {
     Wait-For 'reload enabled' { [ProxyUiSmoke]::IsWindowEnabled((Control 2004)) }
     Start-Sleep -Milliseconds 250
     $darkCaption = [string][char]0x6DF1 + [char]0x8272
-    Wait-For 'reload restores persisted Dark selection' { [ProxyUiSmoke]::ReadText((Control 2030), [uint32]$child.Id) -eq $darkCaption }
+    Wait-For 'reload restores persisted Dark selection' { [ProxyUiSmoke]::ReadText((Control 2030), [uint32]$child.Id).EndsWith($darkCaption) }
     Stop-Gui
     Start-Gui
     # Assert actual native combo selection after a fresh process loads the saved config.
     $caption = [ProxyUiSmoke]::ReadText((Control 2030), [uint32]$child.Id)
-    if ($caption -ne ([string][char]0x6DF1 + [char]0x8272)) { throw "Restart did not restore Dark selection: $caption" }
+    if (-not $caption.EndsWith(([string][char]0x6DF1 + [char]0x8272))) { throw "Restart did not restore Dark selection: $caption" }
     $actualDpi = [ThemeSmoke]::GetDpiForWindow($window)
     Stop-Gui
 } catch {

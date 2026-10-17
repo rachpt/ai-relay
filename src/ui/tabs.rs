@@ -28,7 +28,7 @@ impl Tabs {
                 0,
                 wide("SysTabControl32").as_ptr(),
                 null(),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | TCS_FIXEDWIDTH,
                 0,
                 0,
                 0,
@@ -106,18 +106,24 @@ impl Tabs {
     pub fn layout(&self, dpi: u32, width: i32) {
         // SAFETY: Live sibling controls; Tab occupies only the header, so it cannot cover page controls.
         unsafe {
+            SendMessageW(
+                self.handle,
+                TCM_SETITEMSIZE,
+                0,
+                (scale(108, dpi) | (scale(34, dpi) << 16)) as isize,
+            );
             MoveWindow(
                 self.handle,
-                scale(16, dpi),
+                scale(24, dpi),
                 scale(12, dpi),
-                width - scale(32, dpi),
+                width - scale(48, dpi),
                 scale(36, dpi),
                 1,
             );
             MoveWindow(
                 self.start,
                 scale(24, dpi),
-                scale(190, dpi),
+                scale(312, dpi),
                 scale(340, dpi),
                 scale(36, dpi),
                 1,
@@ -125,7 +131,7 @@ impl Tabs {
             MoveWindow(
                 self.stop,
                 scale(380, dpi),
-                scale(190, dpi),
+                scale(312, dpi),
                 scale(140, dpi),
                 scale(36, dpi),
                 1,

@@ -1,6 +1,7 @@
 //! 有界 GUI 桥接；本线程独占 Runtime、配置目录与代理句柄。
 use std::{
     collections::VecDeque,
+    net::SocketAddr,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -21,14 +22,14 @@ use crate::{
     },
     history::{self, HistoryHandle, HistoryService},
     logging::{self, LogEvent, LogHandle, LogOptions, LogService, LogStatus, RuntimeEvent},
-    proxy::{self, ProxyError, ProxyHandle},
+    proxy::{self, ProxyError, ProxyHandle, ProxyMetrics, ProxyMetricsSnapshot},
     usage::UsageStore,
-    windows::{autostart, paths},
+    windows::{autostart, paths, preferences},
 };
 
-#[allow(dead_code)] // 日志命令由独立 UI 集成批次接入。
 pub(crate) enum Command {
     Load,
+    #[allow(dead_code)] // 保留不启动代理的独立保存契约。
     Save {
         config: Box<Config>,
         plaintext_confirmed: bool,
@@ -83,6 +84,33 @@ pub(crate) enum Command {
         path: PathBuf,
         confirmed: bool,
     },
+    HistoryExportAll {
+        query: history::Query,
+        path: PathBuf,
+        confirmed: bool,
+    },
+    HistorySetAlias {
+        credential: history::CredentialId,
+        alias: Option<history::CredentialAlias>,
+    },
+    HistoryStorage,
+    HistoryConfigure {
+        retention_days: u32,
+        max_records: u32,
+        confirmed: bool,
+    },
+    HistoryClear {
+        confirmed: bool,
+        remove_aliases: bool,
+    },
+    HistoryPolicy {
+        options: history::Options,
+        reply: mpsc::Sender<Result<history::PolicyReport, String>>,
+    },
+    SaveWindowGeometry {
+        directory: PathBuf,
+        geometry: preferences::WindowGeometry,
+    },
     HistoryCounters,
     HistorySnapshot {
         target: PathBuf,
@@ -98,6 +126,7 @@ pub(crate) enum Command {
         cursor: logging::FileCursor,
     },
     LogListFiles,
+    #[allow(dead_code)] // 文件 UI 当前使用分页；保留有界尾读契约。
     LogReadTail {
         name: String,
     },
@@ -113,9 +142,10 @@ pub(crate) enum Command {
     },
 }
 
-#[allow(dead_code)] // 独立日志 UI 的完整快照契约。
 pub(crate) struct LogViewSnapshot {
     pub text: String,
+    #[allow(dead_code)] // 日志 UI 的高级实时筛选在独立批次订阅此字段。
+    pub entries: Vec<logging::LogEntry>,
     pub cursor: u64,
     pub gap: bool,
     pub status: LogStatus,
@@ -123,7 +153,6 @@ pub(crate) struct LogViewSnapshot {
     pub logging: config::LoggingConfig,
 }
 
-#[allow(dead_code)] // 独立日志 UI 的类型化响应契约。
 pub(crate) enum LogResponse {
     Files(Vec<logging::LogFile>),
     Read {
@@ -157,7 +186,6 @@ pub(crate) enum LogResponse {
     Error(String),
 }
 
-#[allow(dead_code)]
 pub(crate) enum AutostartResponse {
     State {
         status: autostart::Status,
@@ -165,7 +193,6 @@ pub(crate) enum AutostartResponse {
     },
     Error(String),
 }
-#[allow(dead_code)]
 pub(crate) enum ConfigResponse {
     Export {
         text: String,
@@ -192,7 +219,7 @@ pub(crate) enum ConfigResponse {
     Error(String),
 }
 
-#[allow(dead_code)]
+#[derive(Debug)]
 pub(crate) enum HistoryResponse {
     QueryResult {
         directory: PathBuf,
@@ -211,12 +238,50 @@ pub(crate) enum HistoryResponse {
         directory: PathBuf,
         counters: history::Counters,
     },
+    Storage {
+        directory: PathBuf,
+        stats: history::StorageStats,
+    },
+    AliasChanged {
+        directory: PathBuf,
+    },
+    PolicyChanged {
+        directory: PathBuf,
+        report: history::PolicyReport,
+    },
+    ClearPreview {
+        directory: PathBuf,
+        records: u64,
+        remove_aliases: bool,
+    },
+    Cleared {
+        directory: PathBuf,
+        remove_aliases: bool,
+    },
     Error {
         directory: Option<PathBuf>,
         message: String,
     },
 }
 
+pub(crate) struct OverviewSnapshot {
+    pub metrics: ProxyMetricsSnapshot,
+    pub running: bool,
+    pub listen: Option<SocketAddr>,
+    pub upstream: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum WindowResponse {
+    Loaded {
+        directory: PathBuf,
+        geometry: Option<preferences::WindowGeometry>,
+    },
+    Saved,
+    Error(String),
+}
+
+type OverviewState = Arc<Mutex<(Option<SocketAddr>, Option<String>)>>;
 type LogSource = Arc<Mutex<Option<(LogHandle, PathBuf, config::LoggingConfig)>>>;
 
 pub(crate) struct Event {
@@ -231,15 +296,12 @@ pub(crate) struct Controller {
     commands: SyncSender<Command>,
     pub events: ResultQueue<Event>,
     pub usage_events: Receiver<String>,
-    #[allow(dead_code)] // 等待日志 UI 订阅，不借用操作结果队列。
+    pub overview_events: Receiver<OverviewSnapshot>,
+    pub window_events: ResultQueue<WindowResponse>,
     pub log_snapshots: Receiver<LogViewSnapshot>,
-    #[allow(dead_code)]
     pub log_events: ResultQueue<LogResponse>,
-    #[allow(dead_code)] // UI 在独立批次订阅。
     pub autostart_events: ResultQueue<AutostartResponse>,
-    #[allow(dead_code)]
     pub config_events: ResultQueue<ConfigResponse>,
-    #[allow(dead_code)]
     pub history_events: ResultQueue<HistoryResponse>,
     exit: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
@@ -254,6 +316,10 @@ impl Controller {
         let events = ResultQueue::new(event_overflow);
         let event_receiver = events.clone();
         let (usage_events, usage_receiver) = mpsc::sync_channel(1);
+        let (overview_events, overview_receiver) = mpsc::sync_channel(1);
+        let window_events =
+            ResultQueue::new(|_, count| WindowResponse::Error(overflow_message(count)));
+        let window_receiver = window_events.clone();
         let (log_snapshots, log_snapshot_receiver) = mpsc::sync_channel(1);
         let log_events = ResultQueue::new(|_, count| LogResponse::Error(overflow_message(count)));
         let log_event_receiver = log_events.clone();
@@ -295,6 +361,8 @@ impl Controller {
                     signals,
                     (log_snapshots, log_events),
                     action_events,
+                    overview_events,
+                    window_events,
                 );
             })
             .map_err(|_| "无法创建后台控制线程。".to_string())?;
@@ -302,6 +370,8 @@ impl Controller {
             commands,
             events: event_receiver,
             usage_events: usage_receiver,
+            overview_events: overview_receiver,
+            window_events: window_receiver,
             log_snapshots: log_snapshot_receiver,
             log_events: log_event_receiver,
             autostart_events,
@@ -415,6 +485,9 @@ struct Session {
     locked: bool,
     handle: Option<ProxyHandle>,
     usage: Arc<UsageStore>,
+    metrics: Arc<ProxyMetrics>,
+    overview: OverviewState,
+    window_loaded: Option<PathBuf>,
     grace: u64,
     history: Option<HistoryOwner>,
     history_failure: Option<String>,
@@ -430,7 +503,12 @@ impl HistoryResponse {
         match self {
             Self::QueryResult { directory, .. }
             | Self::Exported { directory, .. }
-            | Self::Counters { directory, .. } => Some(directory.clone()),
+            | Self::Counters { directory, .. }
+            | Self::Storage { directory, .. }
+            | Self::AliasChanged { directory }
+            | Self::PolicyChanged { directory, .. }
+            | Self::ClearPreview { directory, .. }
+            | Self::Cleared { directory, .. } => Some(directory.clone()),
             Self::Error { directory, .. } => directory.clone(),
         }
     }
@@ -444,9 +522,14 @@ struct HistoryOwner {
     worker: Option<thread::JoinHandle<()>>,
     stopped: Receiver<Result<(), String>>,
     stop_requested: bool,
+    options: Option<history::Options>,
 }
 impl HistoryOwner {
-    fn start(directory: PathBuf, events: ResultQueue<HistoryResponse>) -> Result<Self, String> {
+    fn start(
+        directory: PathBuf,
+        events: ResultQueue<HistoryResponse>,
+        options: history::Options,
+    ) -> Result<Self, String> {
         let (commands, receiver) = mpsc::sync_channel(4);
         let (ready, started) = mpsc::sync_channel(1);
         let (finished, stopped) = mpsc::sync_channel(1);
@@ -454,7 +537,7 @@ impl HistoryOwner {
         let worker = thread::Builder::new()
             .name("ai-relay-history-control".into())
             .spawn(move || {
-                let mut service = match HistoryService::start(&scope) {
+                let mut service = match HistoryService::start_with_options(&scope, options) {
                     Ok(service) => service,
                     Err(error) => {
                         let _ = ready.send(Err(history_error(error)));
@@ -464,6 +547,7 @@ impl HistoryOwner {
                 if ready.send(Ok(service.handle())).is_err() {
                     return;
                 }
+                let mut clear_preview = None;
                 while let Ok(command) = receiver.recv() {
                     let result = match command {
                         Command::HistoryQuery(query) => service
@@ -480,6 +564,31 @@ impl HistoryOwner {
                             path,
                             confirmed,
                         } => export_history(&service, &scope, query, path, confirmed),
+                        Command::HistoryExportAll { query, path, confirmed } => {
+                            export_all_history(&service, &scope, query, path, confirmed)
+                        }
+                        Command::HistoryStorage => service.stats()
+                            .map(|stats| HistoryResponse::Storage { directory: scope.clone(), stats })
+                            .map_err(history_error),
+                        Command::HistorySetAlias { credential, alias } => {
+                            let result = match alias {
+                                Some(alias) => service.set_alias(credential, alias),
+                                None => service.remove_alias(credential).map(|_| ()),
+                            };
+                            result.map(|()| HistoryResponse::AliasChanged { directory: scope.clone() })
+                                .map_err(history_error)
+                        }
+                        Command::HistoryPolicy { options, reply } => {
+                            clear_preview = None;
+                            let result = service.configure(options).map_err(|error| {
+                                format!("{}；策略或删除可能已经生效，请查询存储状态；未自动重试或回滚。", history_error(error))
+                            });
+                            let _ = reply.send(result);
+                            continue;
+                        }
+                        Command::HistoryClear { confirmed, remove_aliases } => {
+                            clear_history(&service, &scope, &mut clear_preview, confirmed, remove_aliases)
+                        }
                         Command::HistorySnapshot { target, reply } => {
                             let _ = reply.send(service.snapshot_to(target).map_err(history_error));
                             continue;
@@ -507,11 +616,26 @@ impl HistoryOwner {
                 worker: Some(worker),
                 stopped,
                 stop_requested: false,
+                options: Some(options),
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err("历史初始化超过 5 秒或线程失败；未关联历史服务。".into()),
         }
     }
+    fn configure(&mut self, options: history::Options) -> Result<history::PolicyReport, String> {
+        let (reply, result) = mpsc::channel();
+        self.commands
+            .try_send(Command::HistoryPolicy { options, reply })
+            .map_err(|_| "历史队列繁忙或关闭；未提交策略变更。".to_string())?;
+        // 已入队后即可能提交；错误或超时不能继续信任旧策略缓存。
+        self.options = None;
+        let report = result.recv_timeout(Duration::from_secs(30)).map_err(|_| {
+            "历史策略30秒内未确认；可能已生效，未保存配置，请查询状态，勿盲目重试。".to_string()
+        })??;
+        self.options = Some(report.options);
+        Ok(report)
+    }
+
     fn snapshot(&self, target: PathBuf) -> Result<(), String> {
         let (reply, result) = mpsc::channel();
         self.commands
@@ -564,6 +688,72 @@ fn history_error(error: history::Error) -> String {
         history::Error::Closed | history::Error::Worker => "历史服务已关闭或线程失败。".into(),
         history::Error::Invalid(_) => "历史配置、查询或文件身份无效；未静默替换历史身份。".into(),
     }
+}
+
+fn clear_history(
+    service: &HistoryService,
+    directory: &std::path::Path,
+    preview: &mut Option<(u64, bool)>,
+    confirmed: bool,
+    remove_aliases: bool,
+) -> Result<HistoryResponse, String> {
+    if !confirmed {
+        *preview = None;
+        let records = service.stats().map_err(history_error)?.records;
+        *preview = Some((records, remove_aliases));
+        return Ok(HistoryResponse::ClearPreview {
+            directory: directory.to_path_buf(),
+            records,
+            remove_aliases,
+        });
+    }
+    let expected = preview
+        .take()
+        .ok_or("必须先请求清空预览并明确确认；未删除历史。")?;
+    if expected.1 != remove_aliases {
+        return Err("别名清理范围与预览不同；请重新预览，未删除历史。".into());
+    }
+    if service.stats().map_err(history_error)?.records != expected.0 {
+        return Err("历史记录数已与预览不同；请重新预览并确认，未删除历史。".into());
+    }
+    service
+        .clear_with_options(history::ClearOptions { remove_aliases })
+        .map_err(|error| {
+            format!(
+                "{}；清空可能已部分完成，请查询状态，勿盲目重试。",
+                history_error(error)
+            )
+        })?;
+    Ok(HistoryResponse::Cleared {
+        directory: directory.to_path_buf(),
+        remove_aliases,
+    })
+}
+
+fn export_all_history(
+    service: &HistoryService,
+    directory: &std::path::Path,
+    query: history::Query,
+    path: PathBuf,
+    confirmed: bool,
+) -> Result<HistoryResponse, String> {
+    if !confirmed {
+        return Err("全量导出必须明确确认路径及全部筛选结果范围；未写入。".into());
+    }
+    if !path.is_absolute() {
+        return Err("历史导出必须使用绝对路径。".into());
+    }
+    let summary = service.export_all(query, &path).map_err(|error| {
+        format!("全量历史导出失败：{}；文件状态 {:?}，已处理 {} 行；请检查目标，未覆盖、删除或自动重试。",
+            history_error(error.cause), error.file_state, error.rows_written)
+    })?;
+    Ok(HistoryResponse::Exported {
+        directory: directory.to_path_buf(),
+        path: summary.path,
+        rows: usize::try_from(summary.rows).map_err(|_| "导出已完成，但行数超出平台表示范围。")?,
+        page_only: false,
+        counters: service.handle().counters(),
+    })
 }
 
 fn export_history(
@@ -666,7 +856,13 @@ impl Session {
             owner.shutdown()?;
         }
         self.history = None;
-        match HistoryOwner::start(selection.directory.clone(), self.history_events.clone()) {
+        let options =
+            history_options(&self.saved.as_ref().ok_or("没有已保存的历史策略。")?.history);
+        match HistoryOwner::start(
+            selection.directory.clone(),
+            self.history_events.clone(),
+            options,
+        ) {
             Ok(owner) => self.history = Some(owner),
             Err(error) => {
                 self.history_failure = Some(error.clone());
@@ -689,6 +885,114 @@ impl Session {
                 TrySendError::Full(_) => "历史控制队列已满，未执行操作。".into(),
                 TrySendError::Disconnected(_) => "历史控制线程已结束。".into(),
             })
+    }
+
+    fn sync_history_policy(&mut self) -> Result<(), String> {
+        self.ensure_history()?;
+        let options =
+            history_options(&self.saved.as_ref().ok_or("没有已保存的历史策略。")?.history);
+        let owner = self.history.as_mut().ok_or("历史服务尚未初始化。")?;
+        if owner.options != Some(options) {
+            owner.configure(options)?;
+        }
+        Ok(())
+    }
+
+    fn configure_history(
+        &mut self,
+        retention_days: u32,
+        max_records: u32,
+        confirmed: bool,
+    ) -> Result<HistoryResponse, String> {
+        if !confirmed {
+            return Err("历史策略可能立即删除记录，必须明确确认；未应用或保存。".into());
+        }
+        let mut config = self.saved.clone().ok_or("请先保存配置，再修改历史策略。")?;
+        config.history = config::HistoryConfig {
+            retention_days,
+            max_records,
+        };
+        config
+            .validate_for_save()
+            .map_err(|error| validation_error(error.field))?;
+        self.check_baseline()?;
+        self.ensure_history()?;
+        let owner = self.history.as_mut().ok_or("历史服务尚未初始化。")?;
+        let report = owner.configure(history_options(&config.history))?;
+        let directory = owner.directory.clone();
+        let path = self
+            .selection
+            .as_ref()
+            .ok_or("尚未确定配置目录。")?
+            .config_path();
+        let result = config::save_config_atomic_checked(&path, &config, self.baseline.as_ref());
+        if result.is_ok() || matches!(result, Err(ConfigError::BackupPublicationFailed { .. })) {
+            self.baseline = Some(config.clone());
+            self.saved = Some(config);
+        }
+        result.map_err(|error| format!("历史策略和数据库清理已生效（删除 {} 条），但配置持久化未完整成功：{}；属于部分完成，代理未停止，未自动回滚，请查询存储并检查配置。", report.removed_records, config_error(&error)))?;
+        Ok(HistoryResponse::PolicyChanged { directory, report })
+    }
+
+    fn load_window(&mut self, events: &ResultQueue<WindowResponse>) {
+        let Some(selection) = self.selection.as_ref().filter(|selection| {
+            self.valid && self.locked && !selection.needs_initialization && self.saved.is_some()
+        }) else {
+            return;
+        };
+        if self.window_loaded.as_ref() == Some(&selection.directory) {
+            return;
+        }
+        let directory = selection.directory.clone();
+        let geometry = if self
+            .saved
+            .as_ref()
+            .is_some_and(|config| config.ui.remember_window_geometry)
+        {
+            preferences::load(&directory.join(preferences::FILE_NAME))
+        } else {
+            Ok(None)
+        };
+        events.publish(match geometry {
+            Ok(geometry) => {
+                // Cache only successful loads. A transient sharing/permission failure
+                // must remain retryable through an explicit reload of this directory.
+                self.window_loaded = Some(directory.clone());
+                WindowResponse::Loaded {
+                    directory,
+                    geometry,
+                }
+            }
+            Err(error) => WindowResponse::Error(format!(
+                "窗口偏好读取失败（{:?}）；未覆盖原文件。",
+                error.kind()
+            )),
+        });
+    }
+
+    fn save_window(
+        &self,
+        directory: PathBuf,
+        geometry: preferences::WindowGeometry,
+    ) -> Result<WindowResponse, String> {
+        let selection = self
+            .selection
+            .as_ref()
+            .filter(|selection| self.valid && self.locked && !selection.needs_initialization)
+            .ok_or("尚未选定并保存数据目录，未写入窗口偏好。")?;
+        if !directory.is_absolute() || !same_directory(&selection.directory, &directory) {
+            return Err("数据目录已改变；旧窗口偏好保存请求已拒绝。".into());
+        }
+        if !self
+            .saved
+            .as_ref()
+            .is_some_and(|config| config.ui.remember_window_geometry)
+        {
+            return Err("已保存配置已关闭窗口记忆；保留旧文件但不写入。".into());
+        }
+        preferences::save(&selection.directory.join(preferences::FILE_NAME), &geometry)
+            .map_err(|error| format!("窗口偏好保存失败（{:?}）；未报告成功。", error.kind()))?;
+        Ok(WindowResponse::Saved)
     }
 
     fn log_runtime(&self, event: RuntimeEvent, failed: bool) {
@@ -862,14 +1166,26 @@ impl Session {
         self.saved = (!selection.needs_initialization).then(|| config.clone());
         self.logging = config.logging.clone();
         if !selection.needs_initialization {
-            self.ensure_history()?;
+            self.sync_history_policy()?;
             self.ensure_log(&config.logging)?;
             self.log_runtime(RuntimeEvent::ConfigurationApplied, false);
         }
         Ok(config)
     }
 
+    fn check_history_draft(&self, config: &Config) -> Result<(), String> {
+        if self
+            .saved
+            .as_ref()
+            .is_some_and(|saved| saved.history != config.history)
+        {
+            return Err("历史保留策略已独立变更；旧草稿不能覆盖或触发清理。请重新加载后保留网络修改，策略请在历史管理中单独确认。".into());
+        }
+        Ok(())
+    }
+
     fn save(&mut self, config: &Config, confirmed: bool) -> Result<(), String> {
+        self.check_history_draft(config)?;
         if !self.valid {
             return Err("配置未成功加载，禁止覆盖；请修复原文件后重新加载。".into());
         }
@@ -950,7 +1266,7 @@ impl Session {
                     Err(_) => failures.push("配置已保存，但便携标记创建失败；下次请使用 --config-dir 指定此目录，勿直接重试覆盖。".into()),
                 }
             }
-            if let Err(error) = self.ensure_history() {
+            if let Err(error) = self.sync_history_policy() {
                 failures.push(format!("配置已保存；{error}"));
             }
             match self.ensure_log(&config.logging) {
@@ -1004,6 +1320,9 @@ impl Session {
         confirmed: bool,
         allow_lan: bool,
     ) -> Result<String, String> {
+        // Independently confirmed retention changes may be newer than an already
+        // queued GUI draft; reject it before stopping the currently running proxy.
+        self.check_history_draft(config)?;
         // 外部改动与输入校验必须在停止当前服务之前完成，实际保存再次检查 baseline。
         self.check_baseline()?;
         check_secrets(config, confirmed)?;
@@ -1178,6 +1497,8 @@ impl Session {
                 if let Some(selection) = self.selection.as_mut() {
                     selection.needs_initialization = false;
                 }
+                self.sync_history_policy()
+                    .map_err(|error| format!("配置已恢复，但历史策略同步失败：{error}"))?;
                 Ok(ConfigResponse::Restored { retained })
             }
             Command::ConfigMigrationPreview { mode } => {
@@ -1240,7 +1561,7 @@ impl Session {
                     return Err("自启配置与系统实际状态不一致；请先手动修复或关闭后重新迁移。源服务和数据未改变。".into());
                 }
                 let update = startup == autostart::Status::Enabled;
-                self.ensure_history()?;
+                self.sync_history_policy()?;
                 let stage = plan.staging_path()?;
                 self.history
                     .as_ref()
@@ -1337,7 +1658,7 @@ fn start_authorized(
     session.grace = u64::from(config.network.shutdown_grace_secs);
     let handle = runtime.block_on(async {
         tokio::select! {
-            result = proxy::start_with_telemetry(config, Arc::clone(&session.usage), session.log.as_ref().map(LogService::handle), session.history.as_ref().map(|owner| owner.handle.clone())) => result.map_err(|e| proxy_error(&e)),
+            result = proxy::start_with_metrics(config.clone(), Arc::clone(&session.usage), session.log.as_ref().map(LogService::handle), session.history.as_ref().map(|owner| owner.handle.clone()), Arc::clone(&session.metrics)) => result.map_err(|e| proxy_error(&e)),
             _ = async { while !exit.load(Ordering::Acquire) { tokio::time::sleep(Duration::from_millis(50)).await; } } => Err("程序退出，已取消启动。".into()),
             _ = tokio::time::sleep(Duration::from_secs(30)) => Err("代理初始化超过 30 秒，已取消启动。".into()),
         }
@@ -1346,6 +1667,11 @@ fn start_authorized(
         "代理运行中；实际监听 {}，使用已保存配置。",
         handle.local_addr()
     );
+    *session
+        .overview
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) =
+        (Some(handle.local_addr()), Some(config.upstream.url));
     session.handle = Some(handle);
     session.log_runtime(RuntimeEvent::ListenerStarted, false);
     Ok(message)
@@ -1376,6 +1702,10 @@ fn stop(runtime: &tokio::runtime::Runtime, session: &mut Session) -> Result<(), 
             Ok(())
         };
     };
+    *session
+        .overview
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = (None, None);
     let result = runtime.block_on(async {
         tokio::time::timeout(
             Duration::from_secs(session.grace.saturating_add(2)),
@@ -1404,6 +1734,8 @@ fn worker(
         ResultQueue<ConfigResponse>,
         ResultQueue<HistoryResponse>,
     ),
+    overview_events: SyncSender<OverviewSnapshot>,
+    window_events: ResultQueue<WindowResponse>,
 ) {
     let (autostart_events, config_events, history_events) = actions;
     let (log_snapshots, log_events) = logs;
@@ -1420,6 +1752,9 @@ fn worker(
         locked: true,
         handle: None,
         usage: Arc::new(UsageStore::new()),
+        metrics: Arc::new(ProxyMetrics::new()),
+        overview: Arc::new(Mutex::new((None, None))),
+        window_loaded: None,
         grace: 10,
         history: None,
         history_failure: None,
@@ -1445,6 +1780,22 @@ fn worker(
             return;
         }
     };
+    let overview = Arc::clone(&session.overview);
+    let metrics = Arc::clone(&session.metrics);
+    runtime.spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let snapshot = overview_snapshot(&overview, &metrics);
+            if matches!(
+                overview_events.try_send(snapshot),
+                Err(TrySendError::Disconnected(_))
+            ) {
+                break;
+            }
+        }
+    });
     let log_source = Arc::clone(&session.log_source);
     runtime.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -1549,6 +1900,43 @@ fn worker(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
         };
+        if let Command::SaveWindowGeometry {
+            directory,
+            geometry,
+        } = command
+        {
+            window_events.publish(
+                session
+                    .save_window(directory, geometry)
+                    .unwrap_or_else(WindowResponse::Error),
+            );
+            continue;
+        }
+        if let Command::HistoryConfigure {
+            retention_days,
+            max_records,
+            confirmed,
+        } = command
+        {
+            let response = session.configure_history(retention_days, max_records, confirmed);
+            let message = match &response {
+                Ok(_) => {
+                    "历史策略独立保存并应用；网络配置与界面草稿未重新加载，代理未停止。".to_string()
+                }
+                Err(error) => format!("历史策略独立操作失败：{error}"),
+            };
+            history_events.publish(response.unwrap_or_else(|message| {
+                HistoryResponse::Error {
+                    directory: session
+                        .selection
+                        .as_ref()
+                        .map(|selection| selection.directory.clone()),
+                    message,
+                }
+            }));
+            publish(&events, session.event(message, None), &exit);
+            continue;
+        }
         if matches!(
             &command,
             Command::LogListFiles
@@ -1567,7 +1955,13 @@ fn worker(
         }
         if matches!(
             &command,
-            Command::HistoryQuery(_) | Command::HistoryExport { .. } | Command::HistoryCounters
+            Command::HistoryQuery(_)
+                | Command::HistoryExport { .. }
+                | Command::HistoryExportAll { .. }
+                | Command::HistorySetAlias { .. }
+                | Command::HistoryStorage
+                | Command::HistoryClear { .. }
+                | Command::HistoryCounters
         ) {
             if let Err(message) = session.history_command(command) {
                 history_events.publish(HistoryResponse::Error {
@@ -1643,7 +2037,10 @@ fn worker(
                     start_authorized(&runtime, &mut session, &exit, true)
                 }
             }
-            Command::Start(_) => start(&runtime, &mut session, &exit),
+            Command::Start(draft) => {
+                drop(draft); // 兼容参数必须丢弃；只能启动已保存配置。
+                start(&runtime, &mut session, &exit)
+            }
             Command::Restart => {
                 stop(&runtime, &mut session).and_then(|()| start(&runtime, &mut session, &exit))
             }
@@ -1704,6 +2101,7 @@ fn worker(
                     Ok(_) => "配置操作完成；预览、导出或恢复详情见独立配置事件。".to_string(),
                     Err(error) => format!("配置操作失败：{error}"),
                 };
+                session.load_window(&window_events);
                 config_events.publish(response.unwrap_or_else(ConfigResponse::Error));
                 let config = migrating.then(|| session.saved.clone()).flatten();
                 publish(&events, session.event(message, config), &exit);
@@ -1719,6 +2117,7 @@ fn worker(
             }
             _ => unreachable!("special commands are handled separately"),
         };
+        session.load_window(&window_events);
         if let Some(reply) = ipc_stop.take() {
             let _ = reply.try_send(Reply::new(
                 result.is_ok(),
@@ -1759,6 +2158,27 @@ fn worker(
     runtime.shutdown_timeout(Duration::from_secs(2));
 }
 
+fn overview_snapshot(state: &OverviewState, metrics: &ProxyMetrics) -> OverviewSnapshot {
+    let (listen, upstream) = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    OverviewSnapshot {
+        metrics: metrics.snapshot(),
+        running: listen.is_some(),
+        listen,
+        upstream,
+    }
+}
+
+fn history_options(config: &config::HistoryConfig) -> history::Options {
+    history::Options {
+        queue_capacity: 1024,
+        retention_days: config.retention_days,
+        max_records: config.max_records,
+    }
+}
+
 fn log_options(config: &config::LoggingConfig) -> LogOptions {
     LogOptions {
         level: config.level,
@@ -1794,6 +2214,7 @@ fn log_view(source: &LogSource) -> LogViewSnapshot {
     let Some((handle, directory, logging)) = source else {
         return LogViewSnapshot {
             text: "日志尚未初始化，未落盘；保存配置选定目录后启用。".into(),
+            entries: Vec::new(),
             cursor: 0,
             gap: false,
             status: LogStatus::default(),
@@ -1803,12 +2224,10 @@ fn log_view(source: &LogSource) -> LogViewSnapshot {
     };
     let snapshot = handle.snapshot(None);
     let mut text = String::new();
-    // 文本额外限制为最新 1000 条；完整缓存仍遵循 recent_entries。
-    for entry in snapshot
-        .entries
-        .iter()
-        .skip(snapshot.entries.len().saturating_sub(1000))
-    {
+    let entries: Vec<_> = snapshot.entries.into_iter().rev().take(1000).collect();
+    let entries: Vec<_> = entries.into_iter().rev().collect();
+    // 文本和类型化视图都只保留最新 1000 条。
+    for entry in &entries {
         let _ = writeln!(
             text,
             "{} #{} {:?}",
@@ -1817,6 +2236,7 @@ fn log_view(source: &LogSource) -> LogViewSnapshot {
     }
     LogViewSnapshot {
         text,
+        entries,
         cursor: snapshot.cursor,
         gap: snapshot.gap,
         status: snapshot.status,
@@ -1884,6 +2304,590 @@ fn proxy_error(error: &ProxyError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn history_response(queue: &ResultQueue<HistoryResponse>) -> HistoryResponse {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(response) = queue.try_recv() {
+                return response;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history response timed out"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn test_record(handle: &HistoryHandle) -> history::RequestRecord {
+        history::RequestRecord {
+            request_id: handle.request_id(),
+            started_ms: history::now_ms(),
+            peer_ip: "127.0.0.1".parse().unwrap(),
+            client: None,
+            upstream: None,
+            provider: None,
+            requested_model: None,
+            protocol: history::Protocol::OpenAi,
+            interface: history::Interface::Responses,
+            status: Some(200),
+            outcome: history::Outcome::Success,
+            latency_ms: 1,
+            total_ms: 1,
+            report: crate::usage::UsageReport::default(),
+        }
+    }
+
+    #[test]
+    fn history_owner_routes_alias_storage_export_and_scoped_clear() {
+        let directory = std::env::temp_dir().join(format!(
+            "relay-controller-history-management-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let events = ResultQueue::new(|latest: &HistoryResponse, count| HistoryResponse::Error {
+            directory: latest.directory(),
+            message: overflow_message(count),
+        });
+        let mut owner = HistoryOwner::start(
+            directory.clone(),
+            events.clone(),
+            history::Options::default(),
+        )
+        .unwrap();
+        let credential = owner.handle.credential("synthetic-controller-credential");
+        owner
+            .commands
+            .send(Command::HistorySetAlias {
+                credential: credential.clone(),
+                alias: Some(history::CredentialAlias::new("测试客户端").unwrap()),
+            })
+            .unwrap();
+        assert!(
+            matches!(history_response(&events), HistoryResponse::AliasChanged { directory: scope } if scope == directory)
+        );
+        owner.commands.send(Command::HistoryStorage).unwrap();
+        assert!(
+            matches!(history_response(&events), HistoryResponse::Storage { stats, .. } if stats.records == 0 && stats.aliases == 1)
+        );
+        owner
+            .commands
+            .send(Command::HistoryClear {
+                confirmed: true,
+                remove_aliases: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::Error { .. }
+        ));
+        owner
+            .commands
+            .send(Command::HistoryClear {
+                confirmed: false,
+                remove_aliases: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::ClearPreview {
+                records: 0,
+                remove_aliases: false,
+                ..
+            }
+        ));
+        owner
+            .commands
+            .send(Command::HistoryClear {
+                confirmed: true,
+                remove_aliases: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::Error { .. }
+        ));
+        owner
+            .commands
+            .send(Command::HistoryClear {
+                confirmed: true,
+                remove_aliases: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::Error { .. }
+        ));
+        owner
+            .commands
+            .send(Command::HistoryClear {
+                confirmed: false,
+                remove_aliases: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::ClearPreview { .. }
+        ));
+        assert_eq!(
+            owner.handle.try_record(test_record(&owner.handle)),
+            history::TryRecord::Queued
+        );
+        owner.commands.send(Command::HistoryStorage).unwrap();
+        assert!(
+            matches!(history_response(&events), HistoryResponse::Storage { stats, .. } if stats.records == 1)
+        );
+        owner
+            .commands
+            .send(Command::HistoryClear {
+                confirmed: true,
+                remove_aliases: false,
+            })
+            .unwrap();
+        assert!(
+            matches!(history_response(&events), HistoryResponse::Error { message, .. } if message.contains("记录数"))
+        );
+        assert_eq!(
+            owner.handle.try_record(test_record(&owner.handle)),
+            history::TryRecord::Queued
+        );
+        let path = directory.join("all.csv");
+        let query = history::Query {
+            limit: 1,
+            offset: 1,
+            ..history::Query::default()
+        };
+        owner
+            .commands
+            .send(Command::HistoryExportAll {
+                query: query.clone(),
+                path: path.clone(),
+                confirmed: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::Error { .. }
+        ));
+        assert!(!path.exists());
+        owner
+            .commands
+            .send(Command::HistoryExportAll {
+                query: query.clone(),
+                path: path.clone(),
+                confirmed: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::Exported {
+                rows: 2,
+                page_only: false,
+                ..
+            }
+        ));
+        let original = std::fs::read(&path).unwrap();
+        owner
+            .commands
+            .send(Command::HistoryExportAll {
+                query,
+                path: path.clone(),
+                confirmed: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::Error { .. }
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        for remove_aliases in [false, true] {
+            owner
+                .commands
+                .send(Command::HistoryClear {
+                    confirmed: false,
+                    remove_aliases,
+                })
+                .unwrap();
+            assert!(matches!(
+                history_response(&events),
+                HistoryResponse::ClearPreview { .. }
+            ));
+            owner
+                .commands
+                .send(Command::HistoryClear {
+                    confirmed: true,
+                    remove_aliases,
+                })
+                .unwrap();
+            assert!(
+                matches!(history_response(&events), HistoryResponse::Cleared { remove_aliases: actual, .. } if actual == remove_aliases)
+            );
+            owner.commands.send(Command::HistoryStorage).unwrap();
+            assert!(
+                matches!(history_response(&events), HistoryResponse::Storage { stats, .. } if stats.records == 0 && stats.aliases == u64::from(!remove_aliases))
+            );
+        }
+        assert_eq!(
+            owner.handle.credential("synthetic-controller-credential"),
+            credential
+        );
+        owner
+            .commands
+            .send(Command::HistorySetAlias {
+                credential,
+                alias: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            history_response(&events),
+            HistoryResponse::AliasChanged { .. }
+        ));
+        owner.shutdown().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn history_policy_persists_checked_and_reports_partial_save_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "relay-controller-history-policy-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut session = session_at(directory.clone());
+        let mut config = Config::default();
+        config.history.retention_days = 30;
+        config.history.max_records = 50;
+        session.save(&config, false).unwrap();
+        assert_eq!(
+            session.history.as_ref().unwrap().options,
+            Some(history_options(&config.history))
+        );
+        assert!(session.configure_history(20, 25, false).is_err());
+        assert!(session.configure_history(91, 25, true).is_err());
+        assert!(
+            matches!(session.configure_history(20, 25, true).unwrap(), HistoryResponse::PolicyChanged { report, .. } if report.options.retention_days == 20)
+        );
+        let path = directory.join("config.toml");
+        assert_eq!(
+            config::load_config(&path).unwrap().history.retention_days,
+            20
+        );
+        let saved = session.saved.clone().unwrap();
+        let mut external = saved.clone();
+        external.listen.port = 8181;
+        config::save_config_atomic(&path, &external).unwrap();
+        assert!(
+            session
+                .configure_history(10, 10, true)
+                .unwrap_err()
+                .contains("外部")
+        );
+        assert_eq!(
+            session
+                .history
+                .as_ref()
+                .unwrap()
+                .options
+                .unwrap()
+                .retention_days,
+            20
+        );
+        config::save_config_atomic(&path, &saved).unwrap();
+        let backup = directory.join("config.toml.bak");
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        let error = session.configure_history(10, 10, true).unwrap_err();
+        assert!(error.contains("数据库清理已生效") && error.contains("部分完成"));
+        assert_eq!(session.saved.as_ref(), Some(&saved));
+        assert_eq!(session.baseline.as_ref(), Some(&saved));
+        assert_eq!(
+            session
+                .history
+                .as_ref()
+                .unwrap()
+                .options
+                .unwrap()
+                .retention_days,
+            10
+        );
+        session.sync_history_policy().unwrap();
+        assert_eq!(
+            session
+                .history
+                .as_ref()
+                .unwrap()
+                .options
+                .unwrap()
+                .retention_days,
+            20
+        );
+        std::fs::remove_dir(backup).unwrap();
+        drop(session);
+        let mut reloaded = session_at(directory.clone());
+        reloaded
+            .load(&Options {
+                config_dir: Some(directory.clone()),
+                ..Options::default()
+            })
+            .unwrap();
+        assert_eq!(
+            reloaded.history.as_ref().unwrap().options,
+            Some(history_options(&saved.history))
+        );
+        let backup = directory.join("config.toml.bak");
+        let mut restored = saved.clone();
+        restored.history.retention_days = 15;
+        config::save_config_atomic(&backup, &restored).unwrap();
+        reloaded
+            .config_command(Command::ConfigRestorePreview { backup })
+            .unwrap();
+        reloaded
+            .config_command(Command::ConfigRestoreConfirm { confirmed: true })
+            .unwrap();
+        assert_eq!(reloaded.saved.as_ref().unwrap().history, restored.history);
+        assert_eq!(
+            reloaded.history.as_ref().unwrap().options,
+            Some(history_options(&restored.history))
+        );
+        let target = directory.join("migrated-scope");
+        std::fs::create_dir(&target).unwrap();
+        config::save_config_atomic(&target.join("config.toml"), &restored).unwrap();
+        reloaded.selection.as_mut().unwrap().directory = target;
+        reloaded.ensure_history().unwrap();
+        assert_eq!(
+            reloaded.history.as_ref().unwrap().options,
+            Some(history_options(&restored.history))
+        );
+        drop(reloaded);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn window_preferences_are_loaded_once_scoped_and_respect_saved_opt_out() {
+        let root =
+            std::env::temp_dir().join(format!("relay-controller-window-{}", std::process::id()));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let mut session = session_at(first.clone());
+        let events = ResultQueue::new(|_, count| WindowResponse::Error(overflow_message(count)));
+        session.load_window(&events);
+        assert!(events.try_recv().is_err());
+        session.save(&Config::default(), false).unwrap();
+        let geometry = preferences::WindowGeometry {
+            left: 10,
+            top: 20,
+            width: 800,
+            height: 900,
+            dpi: 96,
+            maximized: false,
+        };
+        session.save_window(first.clone(), geometry).unwrap();
+        session.load_window(&events);
+        assert!(
+            matches!(events.try_recv(), Ok(WindowResponse::Loaded { directory, geometry: Some(actual) }) if directory == first && actual == geometry)
+        );
+        session.load_window(&events);
+        assert!(events.try_recv().is_err());
+        let mut off = session.saved.clone().unwrap();
+        off.ui.remember_window_geometry = false;
+        session.save(&off, false).unwrap();
+        assert!(session.save_window(first.clone(), geometry).is_err());
+        assert_eq!(
+            preferences::load(&first.join(preferences::FILE_NAME)).unwrap(),
+            Some(geometry)
+        );
+        session.window_loaded = None;
+        session.load_window(&events);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(WindowResponse::Loaded { geometry: None, .. })
+        ));
+        session.selection.as_mut().unwrap().directory = second.clone();
+        assert!(
+            session
+                .save_window(first.clone(), geometry)
+                .unwrap_err()
+                .contains("目录已改变")
+        );
+        session.load_window(&events);
+        assert!(
+            matches!(events.try_recv(), Ok(WindowResponse::Loaded { directory, geometry: None }) if directory == second)
+        );
+        assert!(!second.join(preferences::FILE_NAME).exists());
+        for _ in 0..12 {
+            events.publish(WindowResponse::Saved);
+        }
+        assert!(
+            matches!(events.try_recv(), Ok(WindowResponse::Error(error)) if error.contains("丢失"))
+        );
+        assert!(session.history_events.try_recv().is_err());
+        drop(session);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_settings_cannot_reapply_old_retention_after_independent_policy_change() {
+        let directory =
+            std::env::temp_dir().join(format!("relay-stale-history-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut session = session_at(directory.clone());
+        let mut stale = Config::default();
+        stale.history.max_records = 1;
+        session.save(&stale, false).unwrap();
+        session.configure_history(90, 100_000, true).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let exit = AtomicBool::new(false);
+        assert!(session.save(&stale, false).unwrap_err().contains("旧草稿"));
+        assert!(
+            session
+                .save_and_apply(&runtime, &exit, &stale, false)
+                .unwrap_err()
+                .contains("旧草稿")
+        );
+        assert_eq!(session.saved.as_ref().unwrap().history.max_records, 100_000);
+        assert_eq!(
+            config::load_config(&directory.join("config.toml"))
+                .unwrap()
+                .history
+                .max_records,
+            100_000
+        );
+        assert_eq!(
+            session
+                .history
+                .as_ref()
+                .unwrap()
+                .options
+                .unwrap()
+                .max_records,
+            100_000
+        );
+        drop(session);
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn window_load_transient_sharing_failure_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("relay-window-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut session = session_at(directory.clone());
+        session.save(&Config::default(), false).unwrap();
+        let path = directory.join(preferences::FILE_NAME);
+        let geometry = preferences::WindowGeometry {
+            left: 10,
+            top: 20,
+            width: 800,
+            height: 900,
+            dpi: 96,
+            maximized: false,
+        };
+        preferences::save(&path, &geometry).unwrap();
+        let events = ResultQueue::new(|_, count| WindowResponse::Error(overflow_message(count)));
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        session.load_window(&events);
+        assert!(matches!(events.try_recv(), Ok(WindowResponse::Error(_))));
+        assert!(session.window_loaded.is_none());
+        drop(lock);
+        session.load_window(&events);
+        assert!(
+            matches!(events.try_recv(), Ok(WindowResponse::Loaded { geometry: Some(value), .. }) if value == geometry)
+        );
+        assert_eq!(session.window_loaded.as_ref(), Some(&directory));
+        drop(session);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn history_errors_do_not_expose_backend_payloads() {
+        let raw = "synthetic-secret raw response body";
+        for error in [
+            history::Error::Invalid(raw),
+            history::Error::Io(std::io::Error::other(raw)),
+            history::Error::Database(rusqlite::Error::InvalidParameterName(raw.into())),
+        ] {
+            assert!(!history_error(error).contains(raw));
+        }
+    }
+
+    #[test]
+    fn overview_snapshots_are_bounded_typed_and_track_actual_listener_state() {
+        let state = Arc::new(Mutex::new((None, None)));
+        let metrics = ProxyMetrics::new();
+        let stopped = overview_snapshot(&state, &metrics);
+        assert!(!stopped.running && stopped.listen.is_none() && stopped.upstream.is_none());
+        let address: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        *state.lock().unwrap() = (Some(address), Some("https://upstream.invalid/v1".into()));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(overview_snapshot(&state, &metrics))
+            .unwrap_or_else(|_| panic!("empty queue"));
+        assert!(matches!(
+            sender.try_send(overview_snapshot(&state, &metrics)),
+            Err(TrySendError::Full(_))
+        ));
+        let running = receiver.try_recv().unwrap();
+        assert!(running.running);
+        assert_eq!(running.listen, Some(address));
+        assert_eq!(
+            running.upstream.as_deref(),
+            Some("https://upstream.invalid/v1")
+        );
+        *state.lock().unwrap() = (None, None);
+        let stopped = overview_snapshot(&state, &metrics);
+        assert!(!stopped.running && stopped.listen.is_none());
+        assert!(stopped.metrics.uptime >= running.metrics.uptime);
+    }
+
+    #[test]
+    fn log_snapshot_exposes_only_latest_thousand_typed_entries() {
+        let directory = std::env::temp_dir().join(format!(
+            "relay-controller-typed-logs-{}",
+            std::process::id()
+        ));
+        let mut session = session_at(directory.clone());
+        assert!(log_view(&session.log_source).entries.is_empty());
+        session
+            .ensure_log(&config::LoggingConfig {
+                file_enabled: false,
+                recent_entries: 1500,
+                ..config::LoggingConfig::default()
+            })
+            .unwrap();
+        let log = session.log.as_ref().unwrap();
+        for _ in 0..1100 {
+            let _ = log.handle().try_log(LogEvent::Runtime {
+                level: config::LogLevel::Info,
+                event: RuntimeEvent::ConfigurationApplied,
+                error: None,
+            });
+            log.barrier().unwrap();
+        }
+        let snapshot = log_view(&session.log_source);
+        assert_eq!(snapshot.entries.len(), 1000);
+        assert_eq!(snapshot.text.lines().count(), 1000);
+        assert!(
+            snapshot
+                .entries
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+        assert_eq!(snapshot.entries.last().unwrap().sequence, snapshot.cursor);
+        drop(session);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn full_result_queues_report_loss_and_leave_ipc_stop_quit_responsive() {
         let directory = std::env::temp_dir().join(format!(
@@ -2055,6 +3059,21 @@ mod tests {
         );
         assert_eq!(session.grace, 45);
         assert_eq!(session.handle.as_ref().unwrap().local_addr().port(), port);
+        assert!(Arc::ptr_eq(
+            &session.metrics,
+            &session.handle.as_ref().unwrap().metrics()
+        ));
+        assert_eq!(
+            session.overview.lock().unwrap().0,
+            Some(session.handle.as_ref().unwrap().local_addr())
+        );
+        assert!(matches!(
+            session.configure_history(30, 5000, true).unwrap(),
+            HistoryResponse::PolicyChanged { .. }
+        ));
+        assert_eq!(session.handle.as_ref().unwrap().local_addr().port(), port);
+        let saved = session.saved.clone().unwrap();
+        let metrics = Arc::clone(&session.metrics);
         let history_id = session
             .history
             .as_ref()
@@ -2062,7 +3081,12 @@ mod tests {
             .handle
             .credential_id("synthetic-restart");
         stop(&runtime, &mut session).unwrap();
+        assert_eq!(*session.overview.lock().unwrap(), (None, None));
         start(&runtime, &mut session, &exit).unwrap();
+        assert!(Arc::ptr_eq(
+            &metrics,
+            &session.handle.as_ref().unwrap().metrics()
+        ));
         assert_eq!(
             history_id,
             session
@@ -2294,6 +3318,9 @@ mod tests {
             locked: true,
             handle: None,
             usage: Arc::new(UsageStore::new()),
+            metrics: Arc::new(ProxyMetrics::new()),
+            overview: Arc::new(Mutex::new((None, None))),
+            window_loaded: None,
             grace: 10,
             history: None,
             history_failure: None,

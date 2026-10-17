@@ -100,6 +100,54 @@ fn legacy_logging_defaults_and_new_options_roundtrip() {
 }
 
 #[test]
+fn history_policy_defaults_roundtrip_and_match_backend_limits() {
+    let defaults = HistoryConfig::default();
+    assert_eq!(
+        (defaults.retention_days, defaults.max_records),
+        (90, 100_000)
+    );
+    for legacy in ["schema_version = 1", "schema_version = 1\n[history]"] {
+        assert_eq!(parse_toml(legacy).unwrap().history, defaults);
+    }
+    for (days, records) in [(1, 1), (30, 5000), (90, 100_000)] {
+        let config = parse_toml(&format!(
+            "schema_version = 1\n[history]\nretention_days = {days}\nmax_records = {records}"
+        ))
+        .unwrap();
+        assert_eq!(
+            parse_toml(&to_persistence_toml(&config).unwrap()).unwrap(),
+            config
+        );
+        assert_eq!(config.history.retention_days, days);
+        assert_eq!(config.history.max_records, records);
+    }
+    for (days, records, field) in [
+        (0, 1, "history.retention_days"),
+        (91, 1, "history.retention_days"),
+        (3650, 1, "history.retention_days"),
+        (1, 0, "history.max_records"),
+        (1, 100_001, "history.max_records"),
+    ] {
+        let config = Config {
+            history: HistoryConfig {
+                retention_days: days,
+                max_records: records,
+            },
+            ..Config::default()
+        };
+        assert_eq!(config.validate_for_save().unwrap_err().field, field);
+        assert!(to_persistence_toml(&config).is_err());
+    }
+    for invalid in [
+        "retention_days = -1",
+        "max_records = '100'",
+        "queue_capacity = 1024",
+    ] {
+        assert!(parse_toml(&format!("schema_version = 1\n[history]\n{invalid}")).is_err());
+    }
+}
+
+#[test]
 fn versions_types_and_unknown_fields_are_strict() {
     for text in [
         "",

@@ -3,6 +3,7 @@
 pub mod autostart;
 pub mod instance;
 pub mod paths;
+pub mod preferences;
 
 use std::ptr::null_mut;
 use windows_sys::Win32::{
@@ -126,11 +127,11 @@ pub(crate) struct Font(pub(crate) HFONT);
 
 impl Font {
     pub(crate) fn new(dpi: u32) -> Result<Self, String> {
-        Self::sized(dpi, 16, 400)
+        Self::sized(dpi, 14, 400)
     }
 
     pub(crate) fn heading(dpi: u32) -> Result<Self, String> {
-        Self::sized(dpi, 22, 600)
+        Self::sized(dpi, 20, 600)
     }
 
     fn sized(dpi: u32, pixels: i32, weight: i32) -> Result<Self, String> {

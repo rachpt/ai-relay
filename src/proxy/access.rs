@@ -1,7 +1,10 @@
 //! Terminal-only access observations. No URI, headers, body or raw errors retained.
 use std::{
     net::SocketAddr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::logging::{AccessMetadata, Endpoint, ErrorCode, LogEvent, LogHandle, LogLevel, Method};
@@ -21,6 +24,9 @@ pub(super) struct AccessRecording {
     history: Option<super::history::HistoryRecording>,
     usage: Option<super::body::UsageRecording>,
     local_reply: bool,
+    finished: bool,
+    metrics: Option<super::metrics::RequestGuard>,
+    request: Option<Arc<super::request_model::RequestMetadata>>,
 }
 impl AccessRecording {
     pub(super) fn new(
@@ -46,6 +52,9 @@ impl AccessRecording {
             history: None,
             usage: None,
             local_reply: false,
+            finished: false,
+            metrics: None,
+            request: None,
             metadata: AccessMetadata {
                 request_id: Some(NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)),
                 ip: Some(peer.ip()),
@@ -58,6 +67,23 @@ impl AccessRecording {
                 }),
                 ..Default::default()
             },
+        }
+    }
+
+    pub(super) fn set_metrics(&mut self, metrics: super::metrics::RequestGuard) {
+        self.metrics = Some(metrics);
+    }
+
+    pub(super) fn set_request_metadata(
+        &mut self,
+        request: Arc<super::request_model::RequestMetadata>,
+    ) {
+        self.request = Some(request);
+    }
+
+    pub(super) fn tunnel(&mut self) {
+        if let Some(metrics) = &mut self.metrics {
+            metrics.tunnel();
         }
     }
 
@@ -84,6 +110,9 @@ impl AccessRecording {
     }
 
     pub(super) fn feed(&mut self, bytes: &[u8]) {
+        if let Some(metrics) = &self.metrics {
+            metrics.download(bytes.len());
+        }
         if let Some(usage) = &mut self.usage {
             usage.feed(bytes);
         }
@@ -120,6 +149,14 @@ impl AccessRecording {
     }
 
     pub(super) fn finish(&mut self, error: Option<ErrorCode>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(mut metrics) = self.metrics.take() {
+            metrics.finish(error.is_some() || self.metadata.status.is_some_and(|s| s >= 400));
+        }
+        let requested_model = self.request.take().and_then(|request| request.finish());
         let report = self
             .usage
             .take()
@@ -136,7 +173,13 @@ impl AccessRecording {
                 None if self.metadata.status.is_some_and(|s| s >= 400) => Outcome::HttpError,
                 None => Outcome::Success,
             };
-            history.finish(self.metadata.status, self.elapsed_ms(), outcome, report);
+            history.finish(
+                self.metadata.status,
+                self.elapsed_ms(),
+                outcome,
+                report,
+                requested_model,
+            );
         }
         if let Some(log) = self.log.take() {
             self.metadata.duration_ms = Some(self.elapsed_ms());

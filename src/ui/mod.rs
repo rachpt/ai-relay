@@ -1,8 +1,14 @@
 //! Win32 设置与代理控制；所有磁盘和网络初始化由后台控制器执行。
+mod choices;
+mod control_theme;
+mod date_picker;
 mod files;
 mod history;
+mod history_chart;
 mod logs;
+mod overview;
 mod settings;
+mod status_bar;
 mod tabs;
 mod theme;
 pub(crate) mod usage;
@@ -41,6 +47,7 @@ const TRAY_ID: u32 = 1;
 const SHOW_COMMAND: u32 = 1001;
 const EXIT_COMMAND: u32 = 1002;
 const WINDOW_CLASS: &str = "AIRelay.Window.v1";
+const PLACEMENT_CHANGED: u32 = WM_APP + 21;
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -56,6 +63,8 @@ struct State {
     status_label: HWND,
     settings: settings::Settings,
     tabs: tabs::Tabs,
+    overview: overview::Overview,
+    preferences: overview::Preferences,
     logs: logs::Logs,
     history: history::History,
     controller: Controller,
@@ -117,12 +126,7 @@ impl State {
         }
         let margin = scale(24, self.dpi);
         let width = (rect.right - margin * 2).max(1);
-        let rows = [
-            (64, 28),
-            (rect.bottom * 96 / self.dpi as i32 - 84, 76),
-            (112, 64),
-            (250, 64),
-        ];
+        let rows = [(64, 28)];
         for (label, (top, height)) in self.labels.iter().zip(rows) {
             // SAFETY: Each handle is a live child STATIC; this moves only the child,
             // not the parent, so it cannot recursively resize the parent.
@@ -138,9 +142,11 @@ impl State {
             };
         }
         self.tabs.layout(self.dpi, rect.right);
+        self.overview.layout(self.dpi, rect.right);
         self.settings.layout(self.dpi, width, rect.bottom);
         self.logs.layout(self.dpi, rect.right, rect.bottom);
         self.history.layout(self.dpi, rect.right, rect.bottom);
+        status_bar::layout(self.status_label, self.dpi, rect.right, rect.bottom);
     }
 
     fn show_page(&mut self, index: usize) {
@@ -150,6 +156,7 @@ impl State {
         self.settings
             .show_session(index == 1 && self.history.session);
         self.logs.show(index == 2);
+        self.overview.show(index == 0);
         for (i, label) in self.labels.iter().enumerate() {
             // SAFETY: Live STATIC controls. Status stays visible on every page.
             unsafe {
@@ -179,6 +186,7 @@ impl State {
         }
         self.settings.set_font(font.0);
         self.tabs.set_font(font.0);
+        self.overview.set_font(font.0);
         self.logs.set_font(font.0);
         self.history.set_font(font.0);
         let heading = Font::heading(dpi)?;
@@ -190,6 +198,11 @@ impl State {
         self.font = font;
         self.dpi = dpi;
         self.layout(hwnd);
+        // SAFETY: Queue color/DPI refresh after replacing fonts; no reentrant
+        // parent dispatch occurs while State is borrowed by this method.
+        unsafe {
+            PostMessageW(hwnd, theme::REFRESH, 0, 0);
+        }
         Ok(())
     }
 }
@@ -225,6 +238,8 @@ pub(crate) fn run(
         status_label: null_mut(),
         settings: settings::Settings::default(),
         tabs: tabs::Tabs::default(),
+        overview: overview::Overview::default(),
+        preferences: overview::Preferences::default(),
         logs: logs::Logs::default(),
         history: history::History::default(),
         controller: Controller::spawn(options, ipc, signals.clone())?,
@@ -286,12 +301,7 @@ pub(crate) fn run(
     let result = (|| {
         // SAFETY: hwnd is a live window owned by this thread.
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-        let texts = [
-            "AI Relay 开发版",
-            "代理已停止；正在后台加载配置。",
-            "关闭窗口隐藏到托盘，不停止代理；双击可恢复，右键可退出。\r\n保存并应用会受控重启；启动仅使用已保存配置，不使用草稿。",
-            "DPAPI 仅当前用户；登录自启只由手动确认操作修改。\r\n目录迁移受后台安全检查限制；不修改系统代理或防火墙。",
-        ];
+        let texts = ["AI Relay 开发版", "代理已停止；正在后台加载配置。"];
         let static_class = wide("STATIC");
         for text in texts {
             let text = wide(text);
@@ -320,11 +330,36 @@ pub(crate) fn run(
         }
         state.status_label = state.labels[1];
         state.tabs.create(hwnd)?;
+        // SAFETY: boxed State and native status STATIC outlive its subclass.
+        unsafe {
+            status_bar::attach(&mut *state)?;
+        }
+        state.overview.create(hwnd)?;
         state.settings.create(hwnd, instance)?;
         state.logs.create(hwnd, instance)?;
         state.history.create(hwnd)?;
         state.show_page(0);
         state.update_dpi(hwnd, dpi)?;
+        // Clamp the initial default as well as saved geometry before first showing.
+        if let Some(work) = overview::work_area(hwnd) {
+            let mut rect = RECT::default();
+            // SAFETY: Live HWND and writable RECT; no State borrow crosses resizing.
+            unsafe {
+                if GetWindowRect(hwnd, &mut rect) != 0 {
+                    let width = (rect.right - rect.left).min(work.right - work.left).max(1);
+                    let height = (rect.bottom - rect.top).min(work.bottom - work.top).max(1);
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        rect.left.clamp(work.left, work.right - width),
+                        rect.top.clamp(work.top, work.bottom - height),
+                        width,
+                        height,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                }
+            }
+        }
         // SAFETY: Stable boxed state; refresh holds no State reference across Win32 calls.
         unsafe { theme::refresh(hwnd, &mut *state) };
         // SAFETY: This live window owns timer 1; callbacks are dispatched on its UI thread.
@@ -412,9 +447,16 @@ impl Drop for WindowClass {
 fn show_window(hwnd: HWND) {
     // SAFETY: Called only for our live top-level window, outside State borrows.
     unsafe {
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
+        let maximize = !state.is_null() && (*state).preferences.maximize_on_show;
+        if !state.is_null() {
+            (*state).preferences.maximize_on_show = false;
+        }
         ShowWindow(
             hwnd,
-            if IsIconic(hwnd) != 0 {
+            if maximize {
+                SW_SHOWMAXIMIZED
+            } else if IsIconic(hwnd) != 0 {
                 SW_RESTORE
             } else {
                 SW_SHOW
@@ -543,6 +585,9 @@ unsafe extern "system" fn window_proc(
                 0
             }
             WM_NOTIFY => {
+                if choices::notify(lparam) || date_picker::notify(lparam) {
+                    return 0;
+                }
                 let notification = &*(lparam as *const NMHDR);
                 if notification.hwndFrom == (*state).tabs.handle
                     && notification.code == TCN_SELCHANGE
@@ -557,6 +602,20 @@ unsafe extern "system" fn window_proc(
                 (*state).layout(hwnd);
                 0
             }
+            WM_EXITSIZEMOVE | PLACEMENT_CHANGED => {
+                (*state).preferences.changed();
+                overview::flush(hwnd, state, message == WM_EXITSIZEMOVE);
+                0
+            }
+            WM_SYSCOMMAND => {
+                if matches!(
+                    wparam as u32 & 0xfff0,
+                    SC_MAXIMIZE | SC_RESTORE | SC_MINIMIZE
+                ) {
+                    PostMessageW(hwnd, PLACEMENT_CHANGED, 0, 0);
+                }
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            }
             WM_DPICHANGED => {
                 let dpi = (wparam & 0xffff) as u32;
                 let result = (*state).update_dpi(hwnd, dpi.max(96));
@@ -565,7 +624,15 @@ unsafe extern "system" fn window_proc(
                     DestroyWindow(hwnd);
                 } else {
                     // WM_DPICHANGED provides a RECT valid throughout this callback.
-                    let rect = *(lparam as *const RECT);
+                    let mut rect = *(lparam as *const RECT);
+                    if let Some(work) = overview::rect_work_area(&rect) {
+                        let width = (rect.right - rect.left).min(work.right - work.left).max(1);
+                        let height = (rect.bottom - rect.top).min(work.bottom - work.top).max(1);
+                        rect.left = rect.left.clamp(work.left, work.right - width);
+                        rect.top = rect.top.clamp(work.top, work.bottom - height);
+                        rect.right = rect.left + width;
+                        rect.bottom = rect.top + height;
+                    }
                     SetWindowPos(
                         hwnd,
                         null_mut(),
@@ -575,16 +642,27 @@ unsafe extern "system" fn window_proc(
                         rect.bottom - rect.top,
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
+                    (*state).preferences.changed();
                 }
                 0
             }
             WM_GETMINMAXINFO => {
                 let info = &mut *(lparam as *mut MINMAXINFO);
-                info.ptMinTrackSize.x = scale(760, (*state).dpi);
-                info.ptMinTrackSize.y = scale(880, (*state).dpi);
+                let work = overview::work_area(hwnd);
+                info.ptMinTrackSize.x =
+                    scale(760, (*state).dpi).min(work.map_or(i32::MAX, |r| r.right - r.left));
+                info.ptMinTrackSize.y =
+                    scale(880, (*state).dpi).min(work.map_or(i32::MAX, |r| r.bottom - r.top));
                 0
             }
             WM_CLOSE => {
+                if (*state).exiting.is_some() {
+                    return 0;
+                }
+                if !(*state).settings.close_to_tray() {
+                    PostMessageW(hwnd, WM_COMMAND, EXIT_COMMAND as usize, 0);
+                    return 0;
+                }
                 if !(*state).tray_present {
                     show_error(
                         hwnd,
@@ -605,7 +683,8 @@ unsafe extern "system" fn window_proc(
                         );
                     }
                     // A nested message loop may have processed an Exit command.
-                    if IsWindow(hwnd) != 0 && (*state).tray_present {
+                    if IsWindow(hwnd) != 0 && (*state).tray_present && (*state).exiting.is_none() {
+                        overview::flush(hwnd, state, true);
                         ShowWindow(hwnd, SW_HIDE);
                     }
                 }
@@ -629,9 +708,18 @@ unsafe extern "system" fn window_proc(
             }
             WM_COMMAND => {
                 let command = (wparam & 0xffff) as u32;
-                if command == EXIT_COMMAND {
-                    (*state).controller.request_exit();
-                    let wait = (*state).settings.exit_wait_secs();
+                if command == EXIT_COMMAND && (*state).exiting.is_none() {
+                    // Save before setting the controller's exit flag: send() rejects
+                    // commands after request_exit. The timer waits for acknowledgement,
+                    // bounded to two seconds, then begins ordinary graceful shutdown.
+                    overview::flush(hwnd, state, true);
+                    if (*state).preferences.needs_flush() {
+                        (*state).preferences.exit_flush_deadline =
+                            Some(Instant::now() + std::time::Duration::from_secs(2));
+                    } else {
+                        (*state).controller.request_exit();
+                    }
+                    let wait = (*state).settings.exit_wait_secs().saturating_add(2);
                     (*state).exiting.get_or_insert_with(|| {
                         Instant::now() + std::time::Duration::from_secs(wait)
                     });
@@ -649,10 +737,11 @@ unsafe extern "system" fn window_proc(
                         tabs::STOP => settings::STOP,
                         other => other,
                     };
-                    if (2300..=2324).contains(&command) {
+                    if (overview::RESTART..=overview::OPEN_DIRECTORY).contains(&command) {
+                        overview::command(hwnd, state, command);
+                    } else if (2300..=2399).contains(&command) {
                         history::command(hwnd, state, command);
-                    } else if (2201..=2219).contains(&command) || command == 2222 || command == 2223
-                    {
+                    } else if (2201..=2229).contains(&command) {
                         (*state).logs.handle(&(*state).controller, command);
                     } else {
                         settings::handle_command(hwnd, state, command);
@@ -662,8 +751,18 @@ unsafe extern "system" fn window_proc(
             }
             WM_TIMER => {
                 settings::poll(hwnd, state);
+                overview::poll(hwnd, state);
+                if let Some(deadline) = (*state).preferences.exit_flush_deadline
+                    && (!(*state).preferences.needs_flush() || Instant::now() >= deadline)
+                {
+                    (*state).preferences.exit_flush_deadline = None;
+                    (*state).controller.request_exit();
+                }
                 logs::poll(hwnd, state);
                 (*state).history.poll(&(*state).controller);
+                if let Some(policy) = (*state).history.take_applied_policy() {
+                    (*state).settings.sync_history(policy);
+                }
                 let signals = Arc::clone(&(*state).signals);
                 if signals.show.swap(false, Ordering::AcqRel) {
                     show_window(hwnd);
@@ -682,6 +781,7 @@ unsafe extern "system" fn window_proc(
             WM_ENDSESSION => {
                 if wparam != 0 {
                     // 系统会话结束不等待 GUI 消息或磁盘；进程退出是最终资源边界。
+                    overview::flush(hwnd, state, true);
                     (*state).controller.request_exit();
                     DestroyWindow(hwnd);
                 }

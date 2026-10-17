@@ -1,6 +1,7 @@
 use ai_relay_usage::{ObservationFormat, Provider, TokenUsage, UsageReport};
 use std::{
     net::IpAddr,
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 // The parent supplies the application's existing, non-serializable usage types.
@@ -57,7 +58,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct CredentialId(pub(super) String);
 impl CredentialId {
     /// Accept only the complete local HMAC identifier, never an API key or prefix.
@@ -70,6 +71,62 @@ impl CredentialId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+/// A user-chosen display name, never a raw key or a fragment of one. Pattern
+/// checks reject common secret formats, but cannot identify every possible key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialAlias(String);
+impl CredentialAlias {
+    pub fn new(value: &str) -> Result<Self> {
+        if !(1..=64).contains(&value.chars().count())
+            || value.trim().is_empty()
+            || value.chars().any(|c| {
+                c.is_control()
+                    || matches!(c, '\u{ad}' | '\u{61c}' | '\u{200b}'..='\u{200f}'
+                        | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}' | '\u{fff9}'..='\u{fffb}')
+            })
+        {
+            return Err(Error::Invalid("credential alias display text"));
+        }
+        let lower = value.to_ascii_lowercase();
+        for (i, _) in lower.char_indices() {
+            if i != 0
+                && lower[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            if [
+                "sk-",
+                "sk_",
+                "rk-",
+                "pk_",
+                "aiza",
+                "akia",
+                "asia",
+                "ghp_",
+                "github_pat_",
+                "bearer ",
+            ]
+            .iter()
+            .any(|prefix| lower[i..].starts_with(prefix))
+            {
+                return Err(Error::Invalid("credential alias resembles a secret"));
+            }
+        }
+        Ok(Self(value.into()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialAliasEntry {
+    pub credential: CredentialId,
+    pub alias: CredentialAlias,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(pub(super) String);
@@ -141,6 +198,7 @@ pub struct RequestRecord {
 impl RequestRecord {
     pub(super) fn validate(&self) -> Result<()> {
         if self.started_ms < 0
+            || chrono::DateTime::from_timestamp_millis(self.started_ms).is_none()
             || self.status.is_some_and(|s| !(100..=599).contains(&s))
             || self.latency_ms > self.total_ms
             || self.total_ms > i64::MAX as u64
@@ -153,30 +211,79 @@ impl RequestRecord {
         Ok(())
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupBy {
     Day,
     Hour,
+    Month,
     Model,
+    RequestedModel,
+    Protocol,
     Ip,
     Credential,
     UpstreamCredential,
     Interface,
     Provider,
 }
-impl GroupBy {
-    pub(super) fn sql(self) -> &'static str {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TimeZone {
+    #[default]
+    Utc,
+    /// The OS local zone at each historical instant, including its DST rules.
+    Local,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrendGranularity {
+    Hour,
+    #[default]
+    Day,
+    Month,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenField {
+    Input,
+    Output,
+    Total,
+    CachedInput,
+    Reasoning,
+    CacheCreationInput,
+    CacheReadInput,
+}
+impl TokenField {
+    pub(super) fn index(self) -> usize {
         match self {
-            Self::Day => "started_ms / 86400000",
-            Self::Hour => "started_ms / 3600000",
-            Self::Model => "response_model",
-            Self::Ip => "ip",
-            Self::Credential => "client",
-            Self::UpstreamCredential => "upstream",
-            Self::Interface => "interface",
-            Self::Provider => "origin",
+            Self::Input => 0,
+            Self::Output => 1,
+            Self::Total => 2,
+            Self::CachedInput => 3,
+            Self::Reasoning => 4,
+            Self::CacheCreationInput => 5,
+            Self::CacheReadInput => 6,
         }
     }
+}
+/// Unknown token values sort last in both directions; ties use time/request ID.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DetailSort {
+    TimeAsc,
+    #[default]
+    TimeDesc,
+    TokensAsc(TokenField),
+    TokensDesc(TokenField),
+}
+/// Keys break ties deterministically. TimeAsc uses the earliest request in a
+/// group; TimeDesc uses the latest. Unknown token totals always sort last.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GroupSort {
+    #[default]
+    KeysAsc,
+    KeysDesc,
+    CountAsc,
+    CountDesc,
+    TimeAsc,
+    TimeDesc,
+    TokensAsc(TokenField),
+    TokensDesc(TokenField),
 }
 #[derive(Clone, Debug)]
 pub struct Query {
@@ -193,6 +300,12 @@ pub struct Query {
     pub outcome: Option<Outcome>,
     pub interface: Option<Interface>,
     pub group_by: Vec<GroupBy>,
+    /// Filters remain UTC milliseconds with an inclusive start/exclusive end.
+    /// This zone controls calendar grouping, trend buckets and export labels.
+    pub time_zone: TimeZone,
+    pub trend_granularity: TrendGranularity,
+    pub detail_sort: DetailSort,
+    pub group_sort: GroupSort,
     pub limit: u32,
     pub offset: u32,
 }
@@ -212,6 +325,10 @@ impl Default for Query {
             outcome: None,
             interface: None,
             group_by: vec![],
+            time_zone: TimeZone::default(),
+            trend_granularity: TrendGranularity::default(),
+            detail_sort: DetailSort::default(),
+            group_sort: GroupSort::default(),
             limit: 100,
             offset: 0,
         }
@@ -239,7 +356,11 @@ pub struct Group {
 }
 #[derive(Clone, Debug)]
 pub struct TrendPoint {
+    /// Legacy calendar-day label as days since 1970-01-01, not an hour/month
+    /// index. For Local this labels the local date; Month labels its first day.
     pub utc_day: i64,
+    pub bucket_start_ms: i64,
+    pub label: String,
     pub summary: Summary,
 }
 #[derive(Clone, Debug)]
@@ -249,12 +370,15 @@ pub struct QueryReport {
     pub details: Vec<RequestRecord>,
     pub trend: Vec<TrendPoint>,
     pub trend_truncated: bool,
+    /// Only aliases referenced by this page's details/groups, at this snapshot.
+    /// Group keys and records retain their irreversible credential identifiers.
+    pub aliases: Vec<CredentialAliasEntry>,
 }
 impl QueryReport {
     /// Bounded page only, not a whole-database export. IPs and credential IDs are omitted.
     pub fn export_csv(&self) -> String {
         fn cell(s: &str) -> String {
-            let safe = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+            let safe = if super::csv::needs_formula_guard(s) {
                 format!("'{s}")
             } else {
                 s.into()
@@ -298,7 +422,7 @@ impl QueryReport {
         s
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Options {
     pub queue_capacity: usize,
     pub retention_days: u32,
@@ -313,6 +437,91 @@ impl Default for Options {
         }
     }
 }
+impl Options {
+    pub(super) fn validate(self) -> Result<()> {
+        if !(1..=65536).contains(&self.queue_capacity)
+            || !(1..=90).contains(&self.retention_days)
+            || !(1..=100_000).contains(&self.max_records)
+        {
+            return Err(Error::Invalid("options"));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClearOptions {
+    /// Explicit opt-in: clear() preserves aliases as well as HMAC identity.
+    pub remove_aliases: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointStatus {
+    Complete,
+    /// Policy/deletions committed, but an active report/export or external
+    /// reader prevented truncation; writer admission is not paused.
+    Busy,
+}
+#[derive(Clone, Debug)]
+pub struct StorageStats {
+    pub options: Options,
+    pub records: u64,
+    pub aliases: u64,
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+    pub shared_memory_bytes: u64,
+    /// Reusable SQLite pages, not a promise of reclaimed disk space.
+    pub free_database_bytes: u64,
+}
+impl StorageStats {
+    pub fn total_bytes(&self) -> u64 {
+        self.database_bytes
+            .saturating_add(self.wal_bytes)
+            .saturating_add(self.shared_memory_bytes)
+    }
+}
+#[derive(Clone, Debug)]
+pub struct PolicyReport {
+    pub options: Options,
+    pub removed_records: u64,
+    pub checkpoint: CheckpointStatus,
+    pub storage: StorageStats,
+}
+#[derive(Clone, Debug)]
+pub struct ExportSummary {
+    pub path: PathBuf,
+    pub rows: u64,
+    pub bytes: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportFileState {
+    NotCreated,
+    /// A new file was created and retained; it is not a successful export.
+    Incomplete,
+    /// Worker completion was lost. Inspect the target; never blindly retry.
+    Unknown,
+}
+#[derive(Debug)]
+pub struct ExportError {
+    pub cause: Error,
+    pub path: PathBuf,
+    /// Complete rows accepted before failure, not a durability guarantee.
+    pub rows_written: u64,
+    pub file_state: ExportFileState,
+}
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "history CSV export failed after {} rows ({:?}): {}",
+            self.rows_written, self.file_state, self.cause
+        )
+    }
+}
+impl std::error::Error for ExportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+pub type ExportResult<T> = std::result::Result<T, ExportError>;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counters {
     pub queued: u64,

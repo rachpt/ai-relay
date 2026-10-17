@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#[allow(unused_imports)]
 #[path = "../src/history/mod.rs"]
 mod history;
 #[allow(unused_imports)]
@@ -236,7 +237,7 @@ fn bounded_queue_and_drop_drain() {
 }
 #[test]
 fn migration_rejects_newer_or_unversioned_database() {
-    for version in [0, 2] {
+    for version in [0, 3] {
         let t = Temp::new();
         let mut s = HistoryService::start(&t.0).unwrap();
         s.shutdown().unwrap();

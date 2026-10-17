@@ -1,4 +1,8 @@
-use super::{BoxError, access::AccessRecording};
+use super::{
+    BoxError, ProxyMetrics,
+    access::AccessRecording,
+    request_model::{ModelObserver, RequestMetadata},
+};
 use crate::logging::ErrorCode;
 use crate::usage::{UsageObserver, UsageStore};
 use bytes::Bytes;
@@ -70,6 +74,88 @@ impl UsageRecording {
 impl Drop for UsageRecording {
     fn drop(&mut self) {
         self.finish(false);
+    }
+}
+
+/// Zero preread, pump or queue: only upstream demand polls the inbound body.
+/// Every successful frame (including trailers) is returned unchanged. A model
+/// is published only at real EOS, never merely because a token/JSON was found.
+pub(super) struct RequestBody<B> {
+    inner: B,
+    observer: Option<ModelObserver>,
+    metadata: Arc<RequestMetadata>,
+    metrics: Arc<ProxyMetrics>,
+}
+impl<B: Body<Data = Bytes> + Unpin> RequestBody<B> {
+    pub(super) fn new(
+        inner: B,
+        observer: ModelObserver,
+        metadata: Arc<RequestMetadata>,
+        metrics: Arc<ProxyMetrics>,
+    ) -> Self {
+        let mut this = Self {
+            inner,
+            observer: Some(observer),
+            metadata,
+            metrics,
+        };
+        // Hyper need not poll an initially empty body.
+        if this.inner.is_end_stream() {
+            this.finish(true);
+        }
+        this
+    }
+    fn finish(&mut self, complete: bool) {
+        if let Some(observer) = self.observer.take() {
+            self.metadata.publish(observer.finish(complete));
+        }
+    }
+}
+impl<B: Body<Data = Bytes> + Unpin> Body for RequestBody<B> {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.metrics.upload(data.len());
+                    if let Some(observer) = &mut this.observer {
+                        observer.feed(data);
+                    }
+                }
+                if this.inner.is_end_stream() {
+                    this.finish(true);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => {
+                this.finish(true);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(_))) => {
+                this.finish(false);
+                Poll::Ready(Some(Err("request body failed".into())))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+impl<B> Drop for RequestBody<B> {
+    fn drop(&mut self) {
+        // Drop is not upload completion, even if a full model token was seen.
+        if self.observer.take().is_some() {
+            self.metadata.publish(None);
+        }
     }
 }
 
@@ -174,5 +260,130 @@ impl Body for ResponseBody {
         self.inner
             .as_ref()
             .map_or_else(|| SizeHint::with_exact(0), Body::size_hint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    enum Step {
+        Frame(Frame<Bytes>),
+        Error,
+        End,
+        Pending,
+    }
+    struct Script {
+        steps: VecDeque<Step>,
+        polls: Arc<AtomicUsize>,
+        ended: bool,
+    }
+    impl Body for Script {
+        type Data = Bytes;
+        type Error = BoxError;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, Ordering::Relaxed);
+            match this.steps.pop_front().unwrap_or(Step::Pending) {
+                Step::Frame(frame) => Poll::Ready(Some(Ok(frame))),
+                Step::Error => {
+                    this.ended = true;
+                    Poll::Ready(Some(Err("test body failure".into())))
+                }
+                Step::End => {
+                    this.ended = true;
+                    Poll::Ready(None)
+                }
+                Step::Pending => Poll::Pending,
+            }
+        }
+        fn is_end_stream(&self) -> bool {
+            self.ended
+        }
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(57)
+        }
+    }
+    fn wrapped(
+        steps: Vec<Step>,
+    ) -> (
+        RequestBody<Script>,
+        Arc<AtomicUsize>,
+        Arc<RequestMetadata>,
+        Arc<ProxyMetrics>,
+    ) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let metadata = Arc::new(RequestMetadata::default());
+        let metrics = Arc::new(ProxyMetrics::new());
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let body = RequestBody::new(
+            Script {
+                steps: steps.into(),
+                polls: polls.clone(),
+                ended: false,
+            },
+            ModelObserver::new(&headers),
+            metadata.clone(),
+            metrics.clone(),
+        );
+        (body, polls, metadata, metrics)
+    }
+
+    #[tokio::test]
+    async fn demand_only_passes_original_data_and_trailer_frames_and_counts_only_data() {
+        let data = Bytes::from_static(br#"{"model":"raw-model"}"#);
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert("x-test", "original".parse().unwrap());
+        let (mut body, polls, metadata, metrics) = wrapped(vec![
+            Step::Frame(Frame::data(data.clone())),
+            Step::Frame(Frame::trailers(trailers.clone())),
+            Step::End,
+        ]);
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        assert_eq!(body.size_hint().exact(), Some(57));
+        let received = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(received, data);
+        assert_eq!(received.as_ptr(), data.as_ptr());
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        let received = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(received, trailers);
+        assert!(body.frame().await.is_none());
+        assert_eq!(metadata.finish().unwrap().as_str(), "raw-model");
+        assert_eq!(metrics.snapshot().upload_body_bytes, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn drop_or_body_error_after_complete_json_is_not_upload_completion() {
+        for error in [true, false] {
+            let data = Bytes::from_static(br#"{"model":"not-complete-upload"}"#);
+            let (mut body, _, metadata, _) = wrapped(vec![
+                Step::Frame(Frame::data(data)),
+                if error { Step::Error } else { Step::Pending },
+            ]);
+            body.frame().await.unwrap().unwrap();
+            if error {
+                assert!(body.frame().await.unwrap().is_err());
+            }
+            drop(body);
+            assert_eq!(metadata.finish(), None);
+        }
     }
 }

@@ -339,21 +339,8 @@ impl Settings {
             0,
             (24, 550, 150, 28),
         )?;
-        self.theme = self.control(
-            hwnd,
-            instance,
-            "COMBOBOX",
-            "",
-            WS_TABSTOP | CBS_DROPDOWNLIST as u32,
-            THEME,
-            (180, 546, 550, 160),
-        )?;
-        for title in ["跟随系统", "浅色", "深色"] {
-            // SAFETY: Native combo copies each terminated string synchronously.
-            unsafe {
-                SendMessageW(self.theme, CB_ADDSTRING, 0, wide(title).as_ptr() as isize);
-            }
-        }
+        self.theme = choices::create(hwnd, THEME, &["◐ 跟随系统", "☀ 浅色", "☾ 深色"])?;
+        self.controls.push((self.theme, 180, 546, 550, 32));
         select(self.theme, 0);
         self.control(
             hwnd,
@@ -444,6 +431,25 @@ impl Settings {
             ShowWindow(self.usage, if visible { SW_SHOW } else { SW_HIDE });
         }
     }
+    pub fn has_config(&self) -> bool {
+        self.config.is_some()
+    }
+    pub fn scope(&self) -> Option<&std::path::PathBuf> {
+        self.scope.as_ref()
+    }
+    pub fn close_to_tray(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_none_or(|config| config.ui.close_to_tray)
+    }
+    pub fn remember_geometry(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.ui.remember_window_geometry)
+    }
+    pub fn overview_available(&self) -> bool {
+        !self.busy && !self.action_busy && self.file_task.is_none() && self.config.is_some()
+    }
     pub fn sync_overview(&self, tabs: &tabs::Tabs) {
         // SAFETY: Live UI-owned buttons, matching the settings commands' availability.
         unsafe {
@@ -533,6 +539,12 @@ impl Settings {
     pub fn disable(&mut self) {
         self.busy = true;
         self.enable();
+    }
+    pub fn sync_history(&mut self, options: crate::history::Options) {
+        if let Some(config) = &mut self.config {
+            config.history.retention_days = options.retention_days;
+            config.history.max_records = options.max_records;
+        }
     }
     pub fn sync_logging(&mut self, logging: crate::config::LoggingConfig) {
         if let Some(config) = &mut self.config {
@@ -816,10 +828,10 @@ impl Settings {
             hwnd,
             instance,
             "STATIC",
-            "日志完整设置、即时应用与持久化：使用下方入口。窗口几何记忆尚未实现。",
+            "窗口选项通过“保存并应用”生效；记忆位置只在实际数据目录加载后写入。取消“关闭到托盘”后，关闭窗口会停止代理并退出。日志完整设置使用下方入口。",
             0,
             0,
-            (24, 278, 706, 64),
+            (24, 398, 706, 84),
         )?;
         let shortcut = self.control(
             hwnd,
@@ -828,9 +840,35 @@ impl Settings {
             "打开日志设置",
             WS_TABSTOP,
             LOG_SETTINGS,
-            (24, 356, 220, 32),
+            (24, 496, 220, 32),
         )?;
         self.groups.extend([(note, 5), (shortcut, 5)]);
+        for (id, caption, field, y) in [
+            (
+                2063,
+                "关闭窗口时隐藏到托盘（不停止代理）",
+                "close_to_tray",
+                286,
+            ),
+            (
+                2064,
+                "记忆窗口位置、尺寸与最大化状态",
+                "remember_window_geometry",
+                332,
+            ),
+        ] {
+            let control = self.control(
+                hwnd,
+                instance,
+                "BUTTON",
+                caption,
+                WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+                id,
+                (24, y, 706, 32),
+            )?;
+            self.groups.push((control, 5));
+            self.fields.push((control, "ui", field));
+        }
         Ok(())
     }
     pub fn exit_wait_secs(&self) -> u64 {
@@ -1440,7 +1478,8 @@ pub(super) unsafe fn poll(hwnd: HWND, state: *mut State) {
         if let Ok(text) = (*state).controller.usage_events.try_recv() {
             (*state).settings.pending_usage = Some(text);
         }
-        if (*state).tabs.active == 1
+        if IsWindowVisible(hwnd) != 0
+            && (*state).tabs.active == 1
             && (*state).history.session
             && let Some(text) = (*state).settings.pending_usage.take()
         {
@@ -1527,6 +1566,24 @@ mod tests {
         assert_eq!(actual.proxy.connect_allowed_ports, [443, 8443]);
         assert!(actual.cors.enabled && actual.cors.allow_credentials);
         assert_eq!(actual.network.max_active_requests, 17);
+    }
+
+    #[test]
+    fn window_checkboxes_round_trip_without_changing_proxy_preferences() {
+        let original = Config::default();
+        let mut value = toml::Value::try_from(&original).unwrap();
+        for field in ["close_to_tray", "remember_window_geometry"] {
+            let target = value.get_mut("ui").unwrap().get_mut(field).unwrap();
+            *target = field_value(target, field, "", false).unwrap();
+        }
+        let actual: Config = value.try_into().unwrap();
+        assert!(!actual.ui.close_to_tray);
+        assert!(!actual.ui.remember_window_geometry);
+        for section in ["proxy", "listen", "upstream", "network", "access", "cors"] {
+            let before = toml::Value::try_from(&original).unwrap();
+            let after = toml::Value::try_from(&actual).unwrap();
+            assert_eq!(before.get(section), after.get(section));
+        }
     }
 
     #[test]

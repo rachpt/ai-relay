@@ -1,7 +1,8 @@
 use super::*;
 use ai_relay_usage::{ObservationFormat, Provider, UsageReport};
-use rusqlite::{Connection, params, params_from_iter, types::Value};
-pub(super) fn open(dir: &std::path::Path, options: Options) -> Result<Connection> {
+use rusqlite::{Connection, OptionalExtension, params};
+fn check_files(dir: &Path) -> Result<()> {
+    identity::check_path(dir)?;
     for name in [
         "history.sqlite3",
         "history.sqlite3-wal",
@@ -16,10 +17,14 @@ pub(super) fn open(dir: &std::path::Path, options: Options) -> Result<Connection
             _ => {}
         }
     }
+    Ok(())
+}
+pub(super) fn open(dir: &std::path::Path, options: Options) -> Result<Connection> {
+    check_files(dir)?;
     let mut c = Connection::open(dir.join("history.sqlite3"))?;
     c.busy_timeout(std::time::Duration::from_secs(2))?;
     let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version != 0 && version != 1 {
+    if !(0..=2).contains(&version) {
         return Err(Error::Invalid("unsupported schema version"));
     }
     if version == 0 {
@@ -32,14 +37,108 @@ pub(super) fn open(dir: &std::path::Path, options: Options) -> Result<Connection
             return Err(Error::Invalid("unversioned database"));
         }
         let tx = c.transaction()?;
-        tx.execute_batch("CREATE TABLE records(request_id TEXT PRIMARY KEY,started_ms INTEGER NOT NULL,ip TEXT NOT NULL,client TEXT,upstream TEXT,origin TEXT,requested_model TEXT,response_model TEXT,protocol TEXT NOT NULL,interface TEXT NOT NULL,status INTEGER,outcome TEXT NOT NULL,latency_ms INTEGER NOT NULL,total_ms INTEGER NOT NULL,report TEXT NOT NULL); CREATE INDEX history_time ON records(started_ms,request_id); PRAGMA user_version=1;")?;
+        tx.execute_batch("CREATE TABLE records(request_id TEXT PRIMARY KEY,started_ms INTEGER NOT NULL,ip TEXT NOT NULL,client TEXT,upstream TEXT,origin TEXT,requested_model TEXT,response_model TEXT,protocol TEXT NOT NULL,interface TEXT NOT NULL,status INTEGER,outcome TEXT NOT NULL,latency_ms INTEGER NOT NULL,total_ms INTEGER NOT NULL,report TEXT NOT NULL); CREATE INDEX history_time ON records(started_ms,request_id);")?;
+        create_alias_table(&tx)?;
+        tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
     }
+    validate_columns(
+        &c,
+        "records",
+        &[
+            "request_id",
+            "started_ms",
+            "ip",
+            "client",
+            "upstream",
+            "origin",
+            "requested_model",
+            "response_model",
+            "protocol",
+            "interface",
+            "status",
+            "outcome",
+            "latency_ms",
+            "total_ms",
+            "report",
+        ],
+    )?;
+    if version == 1 {
+        // DDL and version advance commit together; never recreate records or the
+        // separately protected identity. Unexpected/conflicting schemas fail.
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        create_alias_table(&tx)?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+    }
+    validate_columns(&c, "credential_aliases", &["credential", "alias"])?;
     c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=FILE; PRAGMA cache_size=-2048; PRAGMA trusted_schema=OFF;")?;
     retain(&mut c, options)?;
     Ok(c)
 }
-fn checkpoint(c: &Connection) -> Result<()> {
+/// Called only after the writer has committed schema setup/migration. The main
+/// database is OS/SQLite read-only; TEMP remains writable for bounded sorting.
+/// query_only is deliberately not enabled because it also forbids TEMP writes.
+pub(super) fn open_reader(dir: &Path) -> Result<Connection> {
+    check_files(dir)?;
+    let c = Connection::open_with_flags(
+        dir.join("history.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )?;
+    c.busy_timeout(Duration::from_millis(100))?;
+    c.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA temp_store=FILE; PRAGMA cache_size=-2048; PRAGMA temp.cache_size=-2048;")?;
+    let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if version != 2 || mode != "wal" || !c.is_readonly("main")? {
+        return Err(Error::Invalid("reader schema or journal mode"));
+    }
+    validate_columns(
+        &c,
+        "records",
+        &[
+            "request_id",
+            "started_ms",
+            "ip",
+            "client",
+            "upstream",
+            "origin",
+            "requested_model",
+            "response_model",
+            "protocol",
+            "interface",
+            "status",
+            "outcome",
+            "latency_ms",
+            "total_ms",
+            "report",
+        ],
+    )?;
+    validate_columns(&c, "credential_aliases", &["credential", "alias"])?;
+    Ok(c)
+}
+fn create_alias_table(c: &Connection) -> Result<()> {
+    c.execute_batch("CREATE TABLE credential_aliases(credential TEXT PRIMARY KEY NOT NULL CHECK(length(credential)=64),alias TEXT NOT NULL CHECK(length(alias) BETWEEN 1 AND 64));")?;
+    Ok(())
+}
+fn validate_columns(c: &Connection, table: &str, expected: &[&str]) -> Result<()> {
+    let stmt = c.prepare(&format!("SELECT * FROM {table} LIMIT 0"))?;
+    if stmt.column_names() != expected {
+        return Err(Error::Invalid("unexpected database schema"));
+    }
+    // Preparing alone must also reject views that could execute arbitrary SQL.
+    let kind: String = c.query_row(
+        "SELECT type FROM sqlite_master WHERE name=?",
+        [table],
+        |r| r.get(0),
+    )?;
+    if kind != "table" {
+        return Err(Error::Invalid("unexpected database schema"));
+    }
+    Ok(())
+}
+pub(super) fn checkpoint(c: &Connection) -> Result<()> {
     let (busy, log, done): (i64, i64, i64) =
         c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -48,6 +147,13 @@ fn checkpoint(c: &Connection) -> Result<()> {
         return Err(Error::Busy);
     }
     Ok(())
+}
+/// Online maintenance must not wait for a report's WAL read snapshot.
+pub(super) fn checkpoint_now(c: &Connection) -> Result<()> {
+    c.busy_timeout(Duration::ZERO)?;
+    let result = checkpoint(c);
+    let restored = c.busy_timeout(Duration::from_secs(2)).map_err(Error::from);
+    restored.and(result)
 }
 pub(super) fn close(c: Connection) -> Result<()> {
     let checkpoint_result = checkpoint(&c);
@@ -70,25 +176,68 @@ pub(super) fn snapshot(c: &Connection, target: &std::path::Path, key: &[u8; 32])
     identity::save_key(target, key)?;
     Ok(())
 }
-pub(super) fn clear(c: &mut Connection) -> Result<()> {
+#[derive(Default)]
+pub(super) struct RecordCount {
+    cached: Option<(i64, i64)>,
+}
+impl RecordCount {
+    fn current(&mut self, c: &Connection) -> Result<(i64, i64)> {
+        let version: i64 = c.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        if let Some((old, count)) = self.cached
+            && old == version
+        {
+            return Ok((version, count));
+        }
+        Ok((
+            version,
+            c.query_row("SELECT count(*) FROM records", [], |r| r.get(0))?,
+        ))
+    }
+    pub(super) fn invalidate(&mut self) {
+        self.cached = None;
+    }
+}
+pub(super) fn clear(c: &mut Connection, options: ClearOptions) -> Result<()> {
     c.execute_batch("PRAGMA secure_delete=ON;")?;
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM records", [])?;
+    if options.remove_aliases {
+        tx.execute("DELETE FROM credential_aliases", [])?;
+    }
     tx.commit()?;
     c.execute_batch("VACUUM;")?;
-    checkpoint(c)
+    checkpoint_now(c)
 }
-pub(super) fn retain(c: &mut Connection, o: Options) -> Result<()> {
+pub(super) fn retain(c: &mut Connection, o: Options) -> Result<u64> {
     let cutoff = now_ms().saturating_sub(i64::from(o.retention_days) * 86_400_000);
     let tx = c.transaction()?;
-    tx.execute("DELETE FROM records WHERE started_ms < ?", [cutoff])?;
-    tx.execute("DELETE FROM records WHERE request_id IN (SELECT request_id FROM records ORDER BY started_ms DESC,request_id DESC LIMIT -1 OFFSET ?)",[o.max_records])?;
+    let removed = tx.execute("DELETE FROM records WHERE started_ms < ?", [cutoff])?;
+    let count: i64 = tx.query_row("SELECT count(*) FROM records", [], |r| r.get(0))?;
+    let overflow = trim_capacity(&tx, count.saturating_sub(i64::from(o.max_records)))?;
     tx.commit()?;
-    Ok(())
+    Ok((removed + overflow) as u64)
 }
+fn trim_capacity(c: &Connection, excess: i64) -> Result<usize> {
+    if excess <= 0 {
+        return Ok(0);
+    }
+    Ok(c.execute("DELETE FROM records WHERE request_id IN (SELECT request_id FROM records ORDER BY started_ms,request_id LIMIT ?)", [excess])?)
+}
+#[cfg(test)]
 pub(super) fn insert(c: &mut Connection, r: &RequestRecord, o: Options) -> Result<()> {
+    insert_counted(c, r, o, &mut RecordCount::default())
+}
+pub(super) fn insert_counted(
+    c: &mut Connection,
+    r: &RequestRecord,
+    o: Options,
+    count: &mut RecordCount,
+) -> Result<()> {
     let report=serde_json::json!({"tokens":usage_values(&r.report.usage),"provider":provider_text(r.report.provider),"format":format_text(r.report.format),"truncated":r.report.truncated,"parse_error":r.report.parse_error,"limit_exceeded":r.report.limit_exceeded,"provider_error":r.report.provider_error,"overflow":r.report.arithmetic_overflow}).to_string();
-    let tx = c.transaction()?;
+    // One writer owns this cache. BEGIN IMMEDIATE makes the data_version/count
+    // check atomic with the insert, including externally committed test/tool rows.
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (version, before) = count.current(&tx)?;
     tx.execute(
         "INSERT INTO records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
@@ -109,15 +258,17 @@ pub(super) fn insert(c: &mut Connection, r: &RequestRecord, o: Options) -> Resul
             report
         ],
     )?;
-    tx.execute(
+    let expired = tx.execute(
         "DELETE FROM records WHERE started_ms < ?",
         [now_ms().saturating_sub(i64::from(o.retention_days) * 86_400_000)],
     )?;
-    tx.execute("DELETE FROM records WHERE request_id IN (SELECT request_id FROM records ORDER BY started_ms DESC,request_id DESC LIMIT -1 OFFSET ?)",[o.max_records])?;
+    let after = before + 1 - expired as i64;
+    let removed = trim_capacity(&tx, after.saturating_sub(i64::from(o.max_records)))?;
     tx.commit()?;
+    count.cached = Some((version, after - removed as i64));
     Ok(())
 }
-fn decode(row: &rusqlite::Row<'_>) -> Result<RequestRecord> {
+pub(super) fn decode(row: &rusqlite::Row<'_>) -> Result<RequestRecord> {
     let json: String = row.get(14)?;
     if json.len() > 4096 {
         return Err(Error::Invalid("stored report size"));
@@ -179,7 +330,7 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<RequestRecord> {
     r.validate()?;
     Ok(r)
 }
-fn add(s: &mut Summary, r: &RequestRecord) {
+pub(super) fn add(s: &mut Summary, r: &RequestRecord) {
     s.requests += 1;
     match r.report.completeness() {
         ai_relay_usage::UsageCompleteness::Complete => s.complete += 1,
@@ -210,124 +361,83 @@ fn add(s: &mut Summary, r: &RequestRecord) {
     }
     s.tokens = usage_from(totals);
 }
-fn summary(c: &Connection, filter: &str, values: &[Value]) -> Result<Summary> {
-    let mut stmt = c.prepare(&format!("SELECT * FROM records WHERE {filter}"))?;
-    let mut rows = stmt.query(params_from_iter(values))?;
-    let mut s = Summary::default();
-    while let Some(row) = rows.next()? {
-        add(&mut s, &decode(row)?);
-    }
-    Ok(s)
+pub(super) fn alias(c: &Connection, credential: &CredentialId) -> Result<Option<CredentialAlias>> {
+    let value: Option<String> = c
+        .query_row(
+            "SELECT alias FROM credential_aliases WHERE credential=?",
+            [credential.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    value.map(|v| CredentialAlias::new(&v)).transpose()
 }
-pub(super) fn query(c: &mut Connection, q: Query) -> Result<QueryReport> {
-    if q.limit == 0
-        || q.limit > 100
-        || q.offset > 100_000
-        || q.group_by.len() > 3
-        || q.time_from.is_some_and(|v| v < 0)
-        || q.time_to.is_some_and(|v| v < 0)
-        || matches!((q.time_from,q.time_to),(Some(a),Some(b)) if a>=b)
-    {
-        return Err(Error::Invalid("query bounds"));
-    }
-    let tx = c.transaction()?;
-    let mut clauses = vec!["1=1".to_string()];
-    let mut values = Vec::<Value>::new();
-    macro_rules! filter {
-        ($value:expr,$sql:literal) => {
-            if let Some(v) = $value {
-                clauses.push($sql.into());
-                values.push(v.into());
-            }
-        };
-    }
-    filter!(q.time_from, "started_ms >= ?");
-    filter!(q.time_to, "started_ms < ?");
-    filter!(q.ip.map(|v| v.to_string()), "ip = ?");
-    filter!(q.model.map(|v| v.0), "response_model = ?");
-    filter!(q.requested_model.map(|v| v.0), "requested_model = ?");
-    filter!(q.client.map(|v| v.0), "client = ?");
-    filter!(q.upstream.map(|v| v.0), "upstream = ?");
-    filter!(q.provider.map(|v| v.0), "origin = ?");
-    filter!(q.protocol.map(|v| v.text().to_owned()), "protocol = ?");
-    filter!(q.interface.map(|v| v.text().to_owned()), "interface = ?");
-    filter!(q.outcome.map(|v| v.text().to_owned()), "outcome = ?");
-    filter!(q.status.map(i64::from), "status = ?");
-    let filter = clauses.join(" AND ");
-    let total = summary(&tx, &filter, &values)?;
-    let mut details = Vec::new();
-    {
-        let mut args = values.clone();
-        args.push(i64::from(q.limit).into());
-        args.push(i64::from(q.offset).into());
-        let mut stmt=tx.prepare(&format!("SELECT * FROM records WHERE {filter} ORDER BY started_ms DESC,request_id DESC LIMIT ? OFFSET ?"))?;
-        let mut rows = stmt.query(params_from_iter(&args))?;
-        while let Some(row) = rows.next()? {
-            details.push(decode(row)?);
+pub(super) fn aliases(
+    c: &Connection,
+    budget: &reader::Budget,
+) -> Result<Vec<CredentialAliasEntry>> {
+    let mut stmt = c.prepare(
+        "SELECT credential,alias FROM credential_aliases ORDER BY credential LIMIT 100001",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        budget.check()?;
+        if result.len() == 100_000 {
+            return Err(Error::Invalid("alias capacity"));
         }
+        result.push(CredentialAliasEntry {
+            credential: CredentialId::parse(&row.get::<_, String>(0)?)?,
+            alias: CredentialAlias::new(&row.get::<_, String>(1)?)?,
+        });
     }
-    let mut groups = Vec::new();
-    if !q.group_by.is_empty() {
-        let names = q.group_by.iter().map(|v| v.sql()).collect::<Vec<_>>();
-        let keys = names
-            .iter()
-            .map(|v| format!("CAST({v} AS TEXT)"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut args = values.clone();
-        args.push(i64::from(q.limit).into());
-        args.push(i64::from(q.offset).into());
-        let mut stmt = tx.prepare(&format!(
-            "SELECT {keys} FROM records WHERE {filter} GROUP BY {} ORDER BY {} LIMIT ? OFFSET ?",
-            names.join(","),
-            names.join(",")
-        ))?;
-        let mut rows = stmt.query(params_from_iter(&args))?;
-        while let Some(row) = rows.next()? {
-            let mut group_keys = Vec::new();
-            let mut sub = filter.clone();
-            let mut args = values.clone();
-            for (i, name) in names.iter().enumerate() {
-                let key: Option<String> = row.get(i)?;
-                sub.push_str(&format!(" AND CAST({name} AS TEXT) IS ?"));
-                args.push(key.clone().map(Value::Text).unwrap_or(Value::Null));
-                group_keys.push(key);
-            }
-            groups.push(Group {
-                keys: group_keys,
-                summary: summary(&tx, &sub, &args)?,
-            });
-        }
+    Ok(result)
+}
+pub(super) fn set_alias(
+    c: &mut Connection,
+    credential: &CredentialId,
+    alias: &CredentialAlias,
+) -> Result<()> {
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let count: i64 = tx.query_row("SELECT count(*) FROM credential_aliases", [], |r| r.get(0))?;
+    if count >= 100_000 && self::alias(&tx, credential)?.is_none() {
+        return Err(Error::Invalid("alias capacity"));
     }
-    let mut trend = Vec::new();
-    let mut trend_truncated = false;
-    {
-        let mut stmt=tx.prepare(&format!("SELECT started_ms / 86400000 FROM records WHERE {filter} GROUP BY started_ms / 86400000 ORDER BY 1 LIMIT 367"))?;
-        let mut rows = stmt.query(params_from_iter(&values))?;
-        while let Some(row) = rows.next()? {
-            if trend.len() == 366 {
-                trend_truncated = true;
-                break;
-            }
-            let day: i64 = row.get(0)?;
-            let mut args = values.clone();
-            args.push(day.into());
-            trend.push(TrendPoint {
-                utc_day: day,
-                summary: summary(
-                    &tx,
-                    &format!("{filter} AND started_ms / 86400000 = ?"),
-                    &args,
-                )?,
-            });
-        }
-    }
+    tx.execute("INSERT INTO credential_aliases VALUES (?,?) ON CONFLICT(credential) DO UPDATE SET alias=excluded.alias", params![credential.as_str(), alias.as_str()])?;
     tx.commit()?;
-    Ok(QueryReport {
-        summary: total,
-        groups,
-        details,
-        trend,
-        trend_truncated,
+    Ok(())
+}
+pub(super) fn remove_alias(c: &Connection, credential: &CredentialId) -> Result<bool> {
+    Ok(c.execute(
+        "DELETE FROM credential_aliases WHERE credential=?",
+        [credential.as_str()],
+    )? != 0)
+}
+pub(super) fn stats(c: &Connection, dir: &Path, options: Options) -> Result<StorageStats> {
+    let size = |name: &str| -> Result<u64> {
+        let path = dir.join(name);
+        identity::check_path(&path)?;
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => Ok(m.len()),
+            Ok(_) => Err(Error::Invalid("database file type")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    };
+    let read_count = |sql: &str| -> Result<u64> {
+        let value: i64 = c.query_row(sql, [], |r| r.get(0))?;
+        value
+            .try_into()
+            .map_err(|_| Error::Invalid("database size/count"))
+    };
+    let pages = read_count("PRAGMA freelist_count")?;
+    let page_size = read_count("PRAGMA page_size")?;
+    Ok(StorageStats {
+        options,
+        records: read_count("SELECT count(*) FROM records")?,
+        aliases: read_count("SELECT count(*) FROM credential_aliases")?,
+        database_bytes: size("history.sqlite3")?,
+        wal_bytes: size("history.sqlite3-wal")?,
+        shared_memory_bytes: size("history.sqlite3-shm")?,
+        free_database_bytes: pages.saturating_mul(page_size),
     })
 }

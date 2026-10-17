@@ -1,6 +1,10 @@
 # Build a Windows x64 portable PREVIEW with a static C runtime; never include user data.
 [CmdletBinding()]
-param([string]$CargoPath = 'cargo')
+param(
+    [string]$CargoPath = 'cargo',
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
+    [string]$BuildLabel
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -52,6 +56,7 @@ try {
     $versionMatch = [regex]::Match([IO.File]::ReadAllText((Join-Path $root 'Cargo.toml')), '(?m)^version\s*=\s*"([0-9.]+)"')
     if (-not $versionMatch.Success) { throw 'Cannot determine package version.' }
     $name = 'ai-relay-' + $versionMatch.Groups[1].Value + '-windows-x64-preview'
+    if ($BuildLabel) { $name += '-' + $BuildLabel }
     $stage = Join-Path $root ('target\package\' + $name + '-' + [Guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($stage)
     Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'ai-relay.exe')

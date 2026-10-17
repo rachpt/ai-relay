@@ -7,6 +7,8 @@
 /secrets.dat
 /secrets.dat.*
 /portable.flag
+/window.json
+/.window-*.tmp
 /logs/
 /history.sqlite3*
 /history.identity

@@ -87,6 +87,8 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
+    pub history: HistoryConfig,
+    #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
     pub system: SystemConfig,
@@ -116,6 +118,7 @@ impl Default for Config {
             cors: CorsConfig::default(),
             network: NetworkConfig::default(),
             logging: LoggingConfig::default(),
+            history: HistoryConfig::default(),
             ui: UiConfig::default(),
             system: SystemConfig::default(),
             storage: StorageConfig::default(),
@@ -282,6 +285,21 @@ impl Default for LoggingConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    pub retention_days: u32,
+    pub max_records: u32,
+}
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: 90,
+            max_records: 100_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     pub theme: ThemeMode,
     pub close_to_tray: bool,
@@ -313,7 +331,7 @@ impl Default for SystemConfig {
     }
 }
 
-/// DPAPI 仅保留模式，尚无加解密实现；目录选择不信任该字段。
+/// 持久化秘密可采用当前用户DPAPI；目录发现不信任文件中的模式字段。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
@@ -471,6 +489,16 @@ impl Config {
             self.logging.retention_days > 0,
             "logging.retention_days",
             "must be nonzero",
+        )?;
+        require(
+            (1..=90).contains(&self.history.retention_days),
+            "history.retention_days",
+            "must be between 1 and 90",
+        )?;
+        require(
+            (1..=100_000).contains(&self.history.max_records),
+            "history.max_records",
+            "must be between 1 and 100000",
         )?;
         Ok(())
     }

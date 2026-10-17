@@ -86,7 +86,6 @@ impl HistoryRecording {
             client: credential(&handle, request.headers(), true),
             upstream: None,
             provider: None,
-            // Request bodies are streamed without inspection in this batch.
             requested_model: None,
             protocol,
             interface,
@@ -116,6 +115,7 @@ impl HistoryRecording {
         elapsed: u64,
         outcome: Outcome,
         mut report: UsageReport,
+        requested_model: Option<crate::history::Model>,
     ) {
         if report
             .model
@@ -124,6 +124,9 @@ impl HistoryRecording {
         {
             report.model = None;
         }
+        // Independent request-side metadata only; never infer it from usage's
+        // response model, even for cancellation, parse limits or missing JSON.
+        self.record.requested_model = requested_model;
         self.record.status = status;
         self.record.total_ms = elapsed;
         self.record.outcome = outcome;

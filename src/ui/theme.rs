@@ -9,6 +9,11 @@ use windows_sys::Win32::{
 };
 
 // Public commctrl.h helpers (windows-sys places these behind an unused feature).
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetFocus() -> HWND;
+}
+
 type SubclassProc =
     Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
 #[link(name = "comctl32")]
@@ -50,6 +55,8 @@ pub(super) struct Palette {
     pub text: u32,
     pub disabled: u32,
     pub accent: u32,
+    pub border: u32,
+    pub accent_surface: u32,
 }
 impl Palette {
     fn new(kind: Resolved) -> Self {
@@ -62,20 +69,26 @@ impl Palette {
                     text: GetSysColor(COLOR_WINDOWTEXT),
                     disabled: GetSysColor(COLOR_GRAYTEXT),
                     accent: GetSysColor(COLOR_HIGHLIGHT),
+                    border: GetSysColor(COLOR_WINDOWTEXT),
+                    accent_surface: GetSysColor(COLOR_HIGHLIGHT),
                 },
                 Resolved::Light => Self {
-                    background: 0x00faf8f6,
+                    background: 0x00ffffff,
                     surface: 0x00ffffff,
-                    text: 0x00292320,
-                    disabled: 0x00696260,
-                    accent: 0x00b45e00,
+                    text: 0x00262220,
+                    disabled: 0x00756d66,
+                    accent: 0x00d77800,
+                    border: 0x00e3ded9,
+                    accent_surface: 0x00fcf0e5,
                 },
                 Resolved::Dark => Self {
-                    background: 0x00201e1c,
-                    surface: 0x00302d29,
+                    background: 0x0024201e,
+                    surface: 0x00322c29,
                     text: 0x00f5f2ee,
                     disabled: 0x00b2aaa2,
                     accent: 0x00ffc078,
+                    border: 0x00574e47,
+                    accent_surface: 0x00543e29,
                 },
             }
         }
@@ -173,16 +186,9 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
         (*state).theme = theme;
         let tab = (*state).tabs.handle;
         SetWindowSubclass(tab, Some(tab_proc), 1, state as usize);
+        // Native Tab still owns hit testing, selection, keyboard and accessibility.
         let style = GetWindowLongPtrW(tab, GWL_STYLE) as u32;
-        SetWindowLongPtrW(
-            tab,
-            GWL_STYLE,
-            if kind == Resolved::Contrast {
-                style & !TCS_OWNERDRAWFIXED
-            } else {
-                style | TCS_OWNERDRAWFIXED
-            } as isize,
-        );
+        SetWindowLongPtrW(tab, GWL_STYLE, (style & !TCS_OWNERDRAWFIXED) as isize);
         let dark = i32::from(kind == Resolved::Dark);
         // Unsupported attributes return HRESULT errors; retain native non-client rendering.
         let _ = DwmSetWindowAttribute(
@@ -201,27 +207,33 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
         let mut child = GetWindow(hwnd, GW_CHILD);
         while !child.is_null() {
             let next = GetWindow(child, GW_HWNDNEXT);
-            // Empty theme disables visual styles for colorable client controls only.
-            // High contrast restores the OS theme. No undocumented dark class names.
+            // Keep Common Controls v6 in light/high-contrast mode. Disabling it
+            // globally made native buttons, combo arrows and tabs look classic.
+            // Dark mode uses only documented color/owner-draw fallbacks.
             let empty = wide("");
             let _ = SetWindowTheme(
                 child,
-                if kind == Resolved::Contrast {
-                    null()
-                } else {
+                if kind == Resolved::Dark {
                     empty.as_ptr()
+                } else {
+                    null()
                 },
-                if kind == Resolved::Contrast {
-                    null()
-                } else {
+                if kind == Resolved::Dark {
                     empty.as_ptr()
+                } else {
+                    null()
                 },
             );
             let mut class = [0u16; 32];
             let count = GetClassNameW(child, class.as_mut_ptr(), class.len() as i32);
             let style = GetWindowLongPtrW(child, GWL_STYLE) as u32;
+            let class = String::from_utf16_lossy(&class[..count.max(0) as usize]);
+            if class == "Edit" {
+                let margin = scale(6, (*state).dpi);
+                SendMessageW(child, 0x00d3, 3, (margin | (margin << 16)) as isize);
+            }
             let button_kind = style & BS_TYPEMASK as u32;
-            if String::from_utf16_lossy(&class[..count.max(0) as usize]) == "Button"
+            if class == "Button"
                 && [
                     BS_PUSHBUTTON as u32,
                     BS_DEFPUSHBUTTON as u32,
@@ -233,13 +245,16 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
                     child,
                     GWL_STYLE,
                     ((style & !(BS_TYPEMASK as u32))
-                        | if kind == Resolved::Contrast {
-                            BS_PUSHBUTTON as u32
-                        } else {
+                        | if kind == Resolved::Dark {
                             BS_OWNERDRAW as u32
+                        } else {
+                            BS_PUSHBUTTON as u32
                         }) as isize,
                 );
             }
+            control_theme::apply(child, kind, (*state).theme.palette, (*state).dpi);
+            choices::apply(child, kind, (*state).theme.palette, (*state).dpi);
+            date_picker::apply(child, kind, (*state).theme.palette, (*state).dpi);
             InvalidateRect(child, null(), 1);
             child = next;
         }
@@ -301,12 +316,20 @@ pub(super) unsafe fn paint(
                     return None;
                 }
                 if item.CtlType == ODT_BUTTON {
-                    FillRect(item.hDC, &item.rcItem, (*state).theme.surface.0);
                     let active = item.itemState & (ODS_FOCUS | ODS_SELECTED) != 0;
-                    let border = Brush::new(if active {
+                    let primary = [2001, tabs::START, 2320].contains(&item.CtlID)
+                        && item.itemState & ODS_DISABLED == 0;
+                    let fill = Brush::new(if primary || active {
+                        palette.accent_surface
+                    } else {
+                        palette.surface
+                    })
+                    .ok()?;
+                    FillRect(item.hDC, &item.rcItem, fill.0);
+                    let border = Brush::new(if active || primary {
                         palette.accent
                     } else {
-                        palette.disabled
+                        palette.border
                     })
                     .ok()?;
                     FrameRect(item.hDC, &item.rcItem, border.0);
@@ -315,6 +338,8 @@ pub(super) unsafe fn paint(
                         item.hDC,
                         if item.itemState & ODS_DISABLED != 0 {
                             palette.disabled
+                        } else if primary {
+                            palette.accent
                         } else {
                             palette.text
                         },
@@ -376,8 +401,11 @@ pub(super) unsafe fn paint(
                 Some(1)
             }
             WM_NOTIFY if l != 0 => {
+                if let Some(result) = control_theme::custom_draw(l) {
+                    return Some(result);
+                }
                 let header = &*(l as *const NMHDR);
-                if header.code != NM_CUSTOMDRAW || (*state).theme.kind == Resolved::Contrast {
+                if header.code != NM_CUSTOMDRAW || (*state).theme.kind != Resolved::Dark {
                     return None;
                 }
                 let draw = &*(l as *const NMCUSTOMDRAW);
@@ -429,8 +457,8 @@ pub(super) unsafe fn paint(
     }
 }
 
-// The native Tab remains responsible for selection, accessibility and keyboard
-// navigation. Only its unused header background is filled here.
+// Native Tab handles input, selection and accessibility; only its header is
+// painted here, so no classic page border or raised button edges are exposed.
 unsafe extern "system" fn tab_proc(
     hwnd: HWND,
     message: u32,
@@ -443,6 +471,74 @@ unsafe extern "system" fn tab_proc(
     unsafe {
         if message == WM_NCDESTROY {
             RemoveWindowSubclass(hwnd, Some(tab_proc), id);
+        }
+        let state = data as *mut State;
+        if (message == WM_PAINT || message == WM_PRINTCLIENT)
+            && (*state).theme.kind != Resolved::Contrast
+        {
+            let mut paint = PAINTSTRUCT::default();
+            let dc = if message == WM_PAINT {
+                BeginPaint(hwnd, &mut paint)
+            } else {
+                w as HDC
+            };
+            if !dc.is_null() {
+                let saved = SaveDC(dc);
+                let mut bounds = RECT::default();
+                GetClientRect(hwnd, &mut bounds);
+                FillRect(dc, &bounds, (*state).theme.background.0);
+                let palette = (*state).theme.palette;
+                let font = SelectObject(dc, (*state).font.0);
+                SetBkMode(dc, TRANSPARENT as i32);
+                let selected = SendMessageW(hwnd, TCM_GETCURSEL, 0, 0);
+                for (index, title) in ["概览", "统计分析", "实时日志", "设置"].iter().enumerate()
+                {
+                    let mut rect = RECT::default();
+                    if SendMessageW(
+                        hwnd,
+                        TCM_GETITEMRECT,
+                        index,
+                        (&mut rect as *mut RECT) as isize,
+                    ) == 0
+                    {
+                        continue;
+                    }
+                    let active = selected == index as isize;
+                    if active && let Ok(brush) = Brush::new(palette.accent_surface) {
+                        FillRect(dc, &rect, brush.0);
+                    }
+                    SetTextColor(dc, if active { palette.accent } else { palette.text });
+                    DrawTextW(
+                        dc,
+                        wide(title).as_ptr(),
+                        -1,
+                        &mut rect,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                    );
+                    if active {
+                        let mut line = rect;
+                        line.top = line.bottom - scale(2, (*state).dpi);
+                        if let Ok(brush) = Brush::new(palette.accent) {
+                            FillRect(dc, &line, brush.0);
+                        }
+                    }
+                    if active
+                        && GetFocus() == hwnd
+                        && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize == 0
+                    {
+                        InflateRect(&mut rect, -scale(4, (*state).dpi), -scale(4, (*state).dpi));
+                        DrawFocusRect(dc, &rect);
+                    }
+                }
+                SelectObject(dc, font);
+                if saved != 0 {
+                    RestoreDC(dc, saved);
+                }
+            }
+            if message == WM_PAINT {
+                EndPaint(hwnd, &paint);
+            }
+            return 0;
         }
         if message == WM_ERASEBKGND {
             let state = data as *mut State;

@@ -16,6 +16,8 @@
 
 - [0007：DPAPI原子配置、SQLite历史与迁移](0007-secure-config-history-migration.md)
 
+- [0008：历史读写隔离、日历报表与窗口偏好](0008-history-read-isolation.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

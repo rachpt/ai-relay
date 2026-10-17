@@ -216,8 +216,9 @@ try {
     $configPath = Join-Path $temp 'config.toml'
     Start-TestGui
     Wait-Until 'initial configuration loaded and Save enabled' { [ProxyUiSmoke]::IsWindowEnabled((Button 2001)) }
-    $tabs = @([ProxyUiSmoke]::Children($window, 'SysTabControl32'))
-    if ($tabs.Count -ne 1) { throw 'Expected a native Common Controls Tab' }
+    # Native segmented choices also use Tab controls; identify main navigation by ID.
+    $tabs = @([ProxyUiSmoke]::Children($window, 'SysTabControl32') | Where-Object { $_ -eq (Button 2100) })
+    if ($tabs.Count -ne 1) { throw 'Expected main native Common Controls Tab ID 2100' }
     Wait-Until 'initial overview page visible' { [ProxyUiSmoke]::IsWindowVisible((Button 2102)) -and -not [ProxyUiSmoke]::IsWindowVisible((Button 2001)) }
     Select-Page 3
     $edits = @([ProxyUiSmoke]::Children($window, 'Edit') | Where-Object { [ProxyUiSmoke]::IsWindowVisible($_) })

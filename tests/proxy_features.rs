@@ -178,6 +178,7 @@ async fn connect_preserves_head_bytes_and_client_half_close_without_usage() {
         c.network.connect_timeout_secs = 5;
         let p = start(c).await;
         let usage = p.usage_store();
+        let metrics = p.metrics();
         let mock = tokio::spawn(async move {
             let (mut s, _) = upstream.accept().await.unwrap();
             let mut b = Vec::new();
@@ -205,6 +206,20 @@ async fn connect_preserves_head_bytes_and_client_half_close_without_usage() {
         mock.await.unwrap();
         assert_eq!(usage.snapshot().aggregate.counters.reports, 0);
         p.shutdown().await.unwrap();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.errors, 0);
+        assert_eq!(
+            snapshot.upload_body_bytes,
+            b"early opaque bytes".len() as u64
+        );
+        assert_eq!(
+            snapshot.download_body_bytes,
+            b"after client FIN".len() as u64
+        );
+        assert_eq!(snapshot.active_requests, 0);
+        assert_eq!(snapshot.active_tunnels, 0);
+        assert_eq!(snapshot.inbound_connections, 0);
     }
 }
 
@@ -274,9 +289,13 @@ async fn connect_idle_limit_cancellation_and_bounded_shutdown() {
             c.network.response_body_idle_timeout_secs = 0;
         }
         let p = start(c).await;
+        let metrics = p.metrics();
         let mut client = send(p.local_addr(), &connect(&addr.to_string(), "")).await;
         let (mut remote, _) = upstream.accept().await.unwrap();
         assert!(head(&mut client).await.starts_with("HTTP/1.1 200"));
+        assert_eq!(metrics.snapshot().active_requests, 0);
+        assert_eq!(metrics.snapshot().active_tunnels, 1);
+        assert_eq!(metrics.snapshot().inbound_connections, 1);
         assert!(
             response(p.local_addr(), &get("/", ""))
                 .await
@@ -289,6 +308,12 @@ async fn connect_idle_limit_cancellation_and_bounded_shutdown() {
                 .await
                 .unwrap()
                 .unwrap();
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.total_requests, 2);
+            assert_eq!(snapshot.errors, 2); // Limit refusal + cancelled tunnel.
+            assert_eq!(snapshot.active_requests, 0);
+            assert_eq!(snapshot.active_tunnels, 0);
+            assert_eq!(snapshot.inbound_connections, 0);
             let mut b = Vec::new();
             timeout(Duration::from_secs(2), remote.read_to_end(&mut b))
                 .await
@@ -308,6 +333,12 @@ async fn connect_idle_limit_cancellation_and_bounded_shutdown() {
             .unwrap()
             .unwrap();
         p.shutdown().await.unwrap();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.total_requests, 2);
+        assert_eq!(snapshot.errors, 2, "{mode}");
+        assert_eq!(snapshot.active_requests, 0);
+        assert_eq!(snapshot.active_tunnels, 0);
+        assert_eq!(snapshot.inbound_connections, 0);
     }
 }
 
@@ -321,6 +352,7 @@ async fn cors_preflight_is_local_validated_and_can_bypass_token_only() {
     c.access.client_token_enabled = true;
     c.access.client_token = SecretString::new("synthetic-client-token");
     let p = start(c).await;
+    let metrics = p.metrics();
     for (origin, method, requested, status) in [
         (
             "https://browser.invalid",
@@ -365,6 +397,13 @@ async fn cors_preflight_is_local_validated_and_can_bypass_token_only() {
             .is_err()
     );
     p.shutdown().await.unwrap();
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.total_requests, 6);
+    assert_eq!(snapshot.errors, 4); // Three refused preflights + auth; two 204s succeed.
+    assert_eq!(snapshot.active_requests, 0);
+    assert_eq!(snapshot.inbound_connections, 0);
+    assert_eq!(snapshot.upload_body_bytes, 0);
+    assert_eq!(snapshot.download_body_bytes, 0);
 }
 
 #[tokio::test]
@@ -409,6 +448,7 @@ async fn connect_upstream_half_close_keeps_upload_open_and_activity_resets_idle(
     let mut c = config(addr);
     c.proxy.connect_allowed_ports = vec![addr.port()];
     let p = start(c).await;
+    let metrics = p.metrics();
     let mock = tokio::spawn(async move {
         let (mut s, _) = upstream.accept().await.unwrap();
         s.write_all(b"hello").await.unwrap();
@@ -422,6 +462,8 @@ async fn connect_upstream_half_close_keeps_upload_open_and_activity_resets_idle(
     let mut b = Vec::new();
     s.read_to_end(&mut b).await.unwrap();
     assert_eq!(b, b"hello");
+    assert_eq!(metrics.snapshot().active_tunnels, 1);
+    assert_eq!(metrics.snapshot().active_requests, 0);
     for _ in 0..4 {
         sleep(Duration::from_millis(350)).await;
         s.write_all(&[7]).await.unwrap();
@@ -429,6 +471,13 @@ async fn connect_upstream_half_close_keeps_upload_open_and_activity_resets_idle(
     s.shutdown().await.unwrap();
     mock.await.unwrap();
     p.shutdown().await.unwrap();
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.total_requests, 1);
+    assert_eq!(snapshot.errors, 0);
+    assert_eq!(snapshot.upload_body_bytes, 4);
+    assert_eq!(snapshot.download_body_bytes, 5);
+    assert_eq!(snapshot.active_tunnels, 0);
+    assert_eq!(snapshot.inbound_connections, 0);
 }
 
 #[tokio::test]
@@ -439,6 +488,7 @@ async fn connect_ipv6_streams_large_bidirectional_payload_with_backpressure() {
     c.proxy.connect_allowed_ports = vec![addr.port()];
     c.network.response_body_idle_timeout_secs = 5;
     let p = start(c).await;
+    let metrics = p.metrics();
     let mock = tokio::spawn(async move {
         let (socket, _) = upstream.accept().await.unwrap();
         let (mut read, mut write) = socket.into_split();
@@ -475,6 +525,13 @@ async fn connect_ipv6_streams_large_bidirectional_payload_with_backpressure() {
     .await
     .unwrap();
     p.shutdown().await.unwrap();
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.total_requests, 1);
+    assert_eq!(snapshot.errors, 0);
+    assert_eq!(snapshot.upload_body_bytes, 2 * 1024 * 1024);
+    assert_eq!(snapshot.download_body_bytes, 2 * 1024 * 1024);
+    assert_eq!(snapshot.active_tunnels, 0);
+    assert_eq!(snapshot.inbound_connections, 0);
 }
 
 #[tokio::test]

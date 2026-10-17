@@ -135,10 +135,15 @@ async fn persisted_actual_response_and_injected_identity_combined_filters() {
         assert!(head.contains("/prefix/v1/chat/completions?private=query-marker"));
         assert!(head.contains("authorization: bearer synthetic-upstream"));
         assert!(!head.contains("proxy-authorization"));
+        let mut uploaded = vec![0; br#"{"model":"requested-model","messages":[{"content":"synthetic-prompt-never-store"}]}"#.len()];
+        socket.read_exact(&mut uploaded).await.unwrap();
+        assert_eq!(uploaded, br#"{"model":"requested-model","messages":[{"content":"synthetic-prompt-never-store"}]}"#);
         let body = r#"{"model":"actual-model","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
         socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     });
-    let response = request(proxy.local_addr(), "POST /v1/chat/completions?private=query-marker HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer synthetic-client\r\nx-api-key: ignored-client\r\nProxy-Authorization: Bearer ignored-proxy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+    let payload =
+        r#"{"model":"requested-model","messages":[{"content":"synthetic-prompt-never-store"}]}"#;
+    let response = request(proxy.local_addr(), &format!("POST /v1/chat/completions?private=query-marker HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer synthetic-client\r\nx-api-key: ignored-client\r\nProxy-Authorization: Bearer ignored-proxy\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())).await;
     assert!(response.contains("actual-model"));
     mock.await.unwrap();
     proxy.shutdown().await.unwrap();
@@ -146,7 +151,10 @@ async fn persisted_actual_response_and_injected_identity_combined_filters() {
     assert_eq!(all.summary.requests, 1);
     assert_eq!(all.summary.tokens.total_tokens, Some(5));
     let r = &all.details[0];
-    assert_eq!(r.requested_model, None);
+    assert_eq!(
+        r.requested_model.as_ref().map(Model::as_str),
+        Some("requested-model")
+    );
     assert_eq!(r.report.model.as_deref(), Some("actual-model"));
     assert_eq!(r.outcome, Outcome::Success);
     assert!(r.latency_ms <= r.total_ms);
@@ -157,6 +165,7 @@ async fn persisted_actual_response_and_injected_identity_combined_filters() {
         time_from: Some(start),
         time_to: Some(history::now_ms() + 1),
         ip: Some("127.0.0.1".parse().unwrap()),
+        requested_model: Some(Model::new("requested-model").unwrap()),
         model: Some(Model::new("actual-model").unwrap()),
         client: Some(identity(
             &service.handle(),
@@ -188,6 +197,7 @@ async fn persisted_actual_response_and_injected_identity_combined_filters() {
             "ignored-proxy",
             "query-marker",
             "/v1/chat/completions",
+            "synthetic-prompt-never-store",
         ] {
             assert!(!text.contains(raw), "{raw}");
         }
@@ -425,6 +435,7 @@ async fn before_and_after_headers_failure_timeout_cancel_finish_once() {
             let proxy = proxy::start_with_telemetry(cfg, usage.clone(), None, Some(h.clone()))
                 .await
                 .unwrap();
+            let metrics = proxy.metrics();
             let (ready, wait) = tokio::sync::oneshot::channel();
             let (release, released) = tokio::sync::oneshot::channel();
             let mock = tokio::spawn(async move {
@@ -457,6 +468,9 @@ async fn before_and_after_headers_failure_timeout_cancel_finish_once() {
                     ];
                 client.read_exact(&mut prefix).await.unwrap();
             }
+            assert_eq!(metrics.snapshot().total_requests, 1);
+            assert_eq!(metrics.snapshot().active_requests, 1);
+            assert_eq!(metrics.snapshot().errors, 0);
             release.send(()).unwrap();
             if mode == "cancel" {
                 drop(client);
@@ -469,6 +483,22 @@ async fn before_and_after_headers_failure_timeout_cancel_finish_once() {
             admitted(&h, 1).await;
             mock.await.unwrap();
             proxy.shutdown().await.unwrap();
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.total_requests, 1, "{phase}/{mode}");
+            assert_eq!(snapshot.errors, 1, "{phase}/{mode}");
+            assert_eq!(snapshot.active_requests, 0);
+            assert_eq!(snapshot.active_tunnels, 0);
+            assert_eq!(snapshot.inbound_connections, 0);
+            assert_eq!(snapshot.upload_body_bytes, 0);
+            assert_eq!(
+                snapshot.download_body_bytes,
+                if phase == "after" {
+                    b"data: {\"model\":\"prefix-model\",\"usage\":{\"prompt_tokens\":3}}\n\n".len()
+                        as u64
+                } else {
+                    0
+                }
+            );
             let (service, result) = query(service, Query::default()).await;
             assert_eq!(result.summary.requests, 1, "{phase}/{mode}");
             assert_eq!(h.counters().queued, 1);

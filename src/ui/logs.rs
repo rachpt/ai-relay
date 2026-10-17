@@ -4,9 +4,11 @@ use super::*;
 use crate::{
     app::controller::{Command, LogResponse, LogViewSnapshot},
     config::{LogLevel, LoggingConfig},
-    logging::{FileCursor, LogFile, PageCursor, ReadResponse},
+    logging::{FileCursor, LogEntry, LogFile, PageCursor, ReadResponse},
 };
 use windows_sys::Win32::{Foundation::HINSTANCE, Graphics::Gdi::HFONT};
+
+const MAX_LINES: usize = 1000;
 
 fn bounded_file_text(first: &str, second: &str, keep_end: bool) -> String {
     let mut joined = String::with_capacity((first.len() + second.len()).min(LIMIT * 2));
@@ -33,6 +35,15 @@ fn bounded_file_text(first: &str, second: &str, keep_end: bool) -> String {
             joined.truncate(end);
         }
     }
+    let lines: Vec<_> = joined.lines().collect();
+    if lines.len() > MAX_LINES {
+        let selected = if keep_end {
+            &lines[lines.len() - MAX_LINES..]
+        } else {
+            &lines[..MAX_LINES]
+        };
+        return selected.join("\n") + "\n";
+    }
     joined
 }
 fn sequence(line: &str) -> Option<u64> {
@@ -42,26 +53,192 @@ fn sequence(line: &str) -> Option<u64> {
         .parse()
         .ok()
 }
-fn filter(source: &str, file: bool, cursor: u64, search: &str, level: usize) -> String {
-    let levels = ["", "trace", "debug", "info", "warn", "error"];
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Filters {
+    search: String,
+    level: usize,
+    start: Option<u64>,
+    end: Option<u64>,
+    category: usize,
+    status: Option<(u16, u16)>,
+    errors_only: bool,
+}
+
+// Dates are whole UTC days; numeric endpoints are inclusive UTC Unix seconds.
+fn utc_bound(input: &str, end: bool) -> Result<Option<u64>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    if input.bytes().all(|c| c.is_ascii_digit()) {
+        return input
+            .parse()
+            .map(Some)
+            .map_err(|_| "UTC epoch 秒超出范围".into());
+    }
+    let invalid = || "时间须为非负 UTC epoch 秒或 YYYY-MM-DD".to_string();
+    let bytes = input.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return Err(invalid());
+    }
+    let number = |range: std::ops::Range<usize>| -> Result<u64, String> {
+        let part = &bytes[range];
+        if !part.iter().all(u8::is_ascii_digit) {
+            return Err(invalid());
+        }
+        Ok(part.iter().fold(0, |n, c| n * 10 + u64::from(c - b'0')))
+    };
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let leap = |y: u64| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let months = [
+        31,
+        if leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if year < 1970 || !(1..=12).contains(&month) || day == 0 || day > months[month as usize - 1] {
+        return Err(invalid());
+    }
+    let leap_days = |y: u64| y / 4 - y / 100 + y / 400;
+    let days = (year - 1970) * 365 + leap_days(year - 1) - leap_days(1969)
+        + months[..month as usize - 1].iter().sum::<u64>()
+        + day
+        - 1;
+    Ok(Some(days * 86400 + if end { 86399 } else { 0 }))
+}
+
+fn status_range(input: &str) -> Result<Option<(u16, u16)>, String> {
+    let input = input.trim().to_ascii_lowercase();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || "状态须为 100–599 单码、1xx–5xx 或区间（如 400-499）".to_string();
+    let code = |s: &str| -> Result<u16, String> {
+        if s.len() != 3 || !s.bytes().all(|c| c.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        s.parse::<u16>()
+            .ok()
+            .filter(|n| (100..=599).contains(n))
+            .ok_or_else(invalid)
+    };
+    let (start, end) = if let Some(class) = input.strip_suffix("xx") {
+        let start = code(&format!("{class}00"))?;
+        (start, start + 99)
+    } else if let Some((a, b)) = input.split_once('-') {
+        (code(a.trim())?, code(b.trim())?)
+    } else {
+        let value = code(&input)?;
+        (value, value)
+    };
+    if start > end {
+        return Err(invalid());
+    }
+    Ok(Some((start, end)))
+}
+
+impl Filters {
+    fn validate(&self) -> Result<(), String> {
+        if self
+            .start
+            .zip(self.end)
+            .is_some_and(|(start, end)| start > end)
+        {
+            return Err("UTC 起始时间不得晚于结束时间".into());
+        }
+        Ok(())
+    }
+    fn needs_metadata(&self) -> bool {
+        self.level != 0
+            || self.start.is_some()
+            || self.end.is_some()
+            || self.category != 0
+            || self.status.is_some()
+            || self.errors_only
+    }
+    fn matches_file(&self, value: &serde_json::Value) -> bool {
+        let event = &value["event"];
+        let category = event["category"].as_str();
+        let access = category == Some("access");
+        let timestamp = value["timestamp"].as_u64();
+        let level = ["", "trace", "debug", "info", "warn", "error"];
+        let status = if access {
+            event["metadata"]["status"].as_u64()
+        } else {
+            None
+        };
+        // Only the schema's error enum is accepted, not incidental strings/objects.
+        let error = if access {
+            &event["metadata"]["error"]
+        } else if category == Some("runtime") {
+            &event["error"]
+        } else {
+            &serde_json::Value::Null
+        };
+        let error_code = error.as_str().is_some_and(|code| {
+            matches!(
+                code,
+                "io" | "permission_denied"
+                    | "disk_full"
+                    | "timeout"
+                    | "cancelled"
+                    | "connection"
+                    | "tls"
+                    | "protocol"
+                    | "invalid_configuration"
+                    | "resource_limit"
+                    | "internal"
+            )
+        });
+        (self.level == 0
+            || level
+                .get(self.level)
+                .is_some_and(|l| event["level"].as_str() == Some(*l)))
+            && self
+                .start
+                .is_none_or(|start| timestamp.is_some_and(|t| t >= start))
+            && self
+                .end
+                .is_none_or(|end| timestamp.is_some_and(|t| t <= end))
+            && (self.category == 0
+                || category
+                    == Some(if self.category == 1 {
+                        "runtime"
+                    } else {
+                        "access"
+                    }))
+            && self
+                .status
+                .is_none_or(|(a, b)| status.is_some_and(|s| s >= u64::from(a) && s <= u64::from(b)))
+            && (!self.errors_only
+                || event["level"].as_str() == Some("error")
+                || error_code
+                || status.is_some_and(|s| (400..=599).contains(&s)))
+    }
+}
+
+fn filter(source: &str, filters: &Filters) -> Result<String, String> {
+    filters.validate()?;
     let mut result = String::new();
-    for line in source.lines() {
-        if !file && sequence(line).is_some_and(|n| n <= cursor) {
+    for line in source.lines().take(MAX_LINES) {
+        if !line.to_lowercase().contains(&filters.search) {
             continue;
         }
-        let lower = line.to_lowercase();
-        let matches_level = level == 0
-            || levels.get(level).is_some_and(|level| {
-                if file {
-                    serde_json::from_str::<serde_json::Value>(line)
-                        .ok()
-                        .and_then(|v| v.get("event")?.get("level")?.as_str().map(str::to_owned))
-                        .is_some_and(|value| value == *level)
-                } else {
-                    lower.contains(&format!("level: {level}"))
-                }
-            });
-        if matches_level && lower.contains(search) {
+        let matches = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => filters.matches_file(&value),
+            Err(_) => !filters.needs_metadata(),
+        };
+        if matches {
             if result.len() + line.len() + 2 > LIMIT {
                 break;
             }
@@ -69,7 +246,53 @@ fn filter(source: &str, file: bool, cursor: u64, search: &str, level: usize) -> 
             result.push_str("\r\n");
         }
     }
-    result
+    Ok(result)
+}
+
+fn filter_live(
+    source: &str,
+    entries: &[LogEntry],
+    cursor: u64,
+    filters: &Filters,
+) -> Result<String, String> {
+    filters.validate()?;
+    // Sequence only associates the original Debug display with typed metadata;
+    // never interpret status, level, error or timestamp from the display text.
+    let entries: std::collections::BTreeMap<_, _> = entries
+        .iter()
+        .rev()
+        .take(MAX_LINES)
+        .map(|entry| (entry.sequence, entry))
+        .collect();
+    let mut result = String::new();
+    for line in source.lines().take(MAX_LINES) {
+        if !line.to_lowercase().contains(&filters.search) {
+            continue;
+        }
+        let matches = if let Some(number) = sequence(line) {
+            let Some(entry) = entries.get(&number) else {
+                continue;
+            };
+            if entry.sequence <= cursor {
+                continue;
+            }
+            let value =
+                serde_json::to_value(entry).map_err(|_| "实时日志元数据序列化失败".to_string())?;
+            filters.matches_file(&value)
+        } else {
+            // Preserve the controller's pre-initialization message, without
+            // allowing untyped lines to satisfy any metadata filter.
+            !filters.needs_metadata()
+        };
+        if matches {
+            if result.len() + line.len() + 2 > LIMIT {
+                break;
+            }
+            result.push_str(line);
+            result.push_str("\r\n");
+        }
+    }
+    Ok(result)
 }
 
 // No State references may cross confirmation dialogs, which run nested message loops.
@@ -81,7 +304,7 @@ pub(super) unsafe fn poll(hwnd: HWND, state: *mut State) {
             if !logs.initialized && snapshot.directory.is_some() {
                 logs.populate_options(&snapshot.logging);
             }
-            let first = snapshot.text.lines().find_map(sequence);
+            let first = snapshot.entries.first().map(|entry| entry.sequence);
             if logs.displayed_cursor != 0
                 && first.is_some_and(|n| n > logs.displayed_cursor.saturating_add(1))
             {
@@ -138,18 +361,60 @@ mod tests {
     use super::*;
     #[test]
     fn live_cursor_and_filters_are_independent() {
-        let text = "100 #1 Runtime { level: Info, event: Started }\n101 #2 Runtime { level: Error, event: OperationFailed }\n";
-        assert!(!filter(text, false, 1, "", 0).contains("Started"));
-        assert!(filter(text, false, 1, "failed", 5).contains("#2"));
-        assert!(filter(text, false, 0, "", 4).is_empty());
-        assert!(filter(text, false, 2, "", 0).is_empty());
+        let entries = live_fixture();
+        let text = debug_text(&entries);
+        let all = Filters::default();
+        assert!(
+            !filter_live(&text, &entries, 1, &all)
+                .unwrap()
+                .contains("Started")
+        );
+        let errors = Filters {
+            search: "failed".into(),
+            level: 5,
+            ..all.clone()
+        };
+        assert!(
+            filter_live(&text, &entries, 1, &errors)
+                .unwrap()
+                .contains("#2")
+        );
+        assert!(
+            filter_live(
+                &text,
+                &entries,
+                0,
+                &Filters {
+                    level: 1,
+                    ..all.clone()
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(filter_live(&text, &entries, 6, &all).unwrap().is_empty());
     }
     #[test]
     fn file_levels_use_json_not_incidental_text() {
         let text = "{\"sequence\":1,\"event\":{\"level\":\"info\",\"error\":\"error\"}}\n";
-        assert!(filter(text, true, 100, "", 5).is_empty());
-        assert!(filter(text, true, 100, "sequence", 3).contains("sequence"));
-        assert!(filter("invalid json", true, 0, "", 3).is_empty());
+        let filters = Filters {
+            level: 5,
+            ..Filters::default()
+        };
+        assert!(filter(text, &filters).unwrap().is_empty());
+        assert!(
+            filter(
+                text,
+                &Filters {
+                    search: "sequence".into(),
+                    level: 3,
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .contains("sequence")
+        );
+        assert!(filter("invalid json", &filters).unwrap().is_empty());
     }
     #[test]
     fn file_append_and_prepend_are_utf8_bounded() {
@@ -163,9 +428,572 @@ mod tests {
     }
 
     #[test]
+    fn utc_dates_and_epoch_are_explicit_and_validated() {
+        assert_eq!(utc_bound("1970-01-01", false).unwrap(), Some(0));
+        assert_eq!(utc_bound("1970-01-01", true).unwrap(), Some(86399));
+        assert_eq!(utc_bound("2000-03-01", false).unwrap(), Some(951868800));
+        assert_eq!(utc_bound("2024-02-29", false).unwrap(), Some(1709164800));
+        assert_eq!(utc_bound(" 123 ", true).unwrap(), Some(123));
+        assert_eq!(utc_bound("", false).unwrap(), None);
+        for invalid in [
+            "1969-12-31",
+            "2023-02-29",
+            "2100-02-29",
+            "2024-00-01",
+            "2024-13-01",
+            "2024-01-00",
+            "2024-04-31",
+            "2024-1-01",
+            "2024-01-01T00:00Z",
+            "-1",
+            "18446744073709551616",
+            "中文日期输入",
+        ] {
+            assert!(utc_bound(invalid, false).is_err(), "{invalid}");
+        }
+        let filters = Filters {
+            start: Some(2),
+            end: Some(1),
+            ..Filters::default()
+        };
+        assert!(filter("", &filters).unwrap_err().contains("不得晚于"));
+    }
+
+    #[test]
+    fn status_syntax_is_validated_not_silently_empty() {
+        for (input, expected) in [
+            ("200", (200, 200)),
+            ("2xx", (200, 299)),
+            ("5XX", (500, 599)),
+            (" 400 - 499 ", (400, 499)),
+        ] {
+            assert_eq!(status_range(input).unwrap(), Some(expected));
+        }
+        assert_eq!(status_range(" ").unwrap(), None);
+        for invalid in [
+            "99",
+            "600",
+            "0xx",
+            "6xx",
+            "20xx",
+            "500-400",
+            "200-",
+            "200,201",
+            "status:200",
+            "２００",
+        ] {
+            assert!(status_range(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    fn fixture() -> String {
+        [
+            r#"{"sequence":1,"timestamp":100,"event":{"category":"runtime","level":"info","event":"started","error":null},"text":"status: 503 error timeout"}"#,
+            r#"{"sequence":2,"timestamp":101,"event":{"category":"access","level":"info","metadata":{"status":200,"error":null}},"text":"500 error"}"#,
+            r#"{"sequence":3,"timestamp":102,"event":{"category":"access","level":"warn","metadata":{"status":503,"error":null}}}"#,
+            r#"{"sequence":4,"timestamp":103,"event":{"category":"access","level":"info","metadata":{"status":null,"error":"timeout"}}}"#,
+            r#"{"sequence":5,"timestamp":104,"event":{"category":"runtime","level":"error","event":"operation_failed","error":"io"}}"#,
+            r#"{"sequence":6,"timestamp":105,"event":{"category":"access","level":"info","metadata":{"status":200,"error":null}}}"#,
+        ].join("\n")
+    }
+
+    #[test]
+    fn structured_metadata_and_all_conditions_are_anded() {
+        let source = fixture();
+        let filters = Filters {
+            start: Some(102),
+            end: Some(102),
+            category: 2,
+            status: Some((500, 599)),
+            errors_only: true,
+            level: 4,
+            search: "metadata".into(),
+        };
+        let output = filter(&source, &filters).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("\"sequence\":3"));
+        assert!(
+            filter(
+                &source,
+                &Filters {
+                    search: "started".into(),
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            filter(
+                &source,
+                &Filters {
+                    level: 3,
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let success = filter(
+            &source,
+            &Filters {
+                status: Some((200, 200)),
+                ..Filters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(success.lines().count(), 2);
+        assert!(!success.contains("started"));
+        let errors = filter(
+            &source,
+            &Filters {
+                errors_only: true,
+                ..Filters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(errors.lines().count(), 3);
+        assert!(!errors.contains("\"sequence\":1"));
+        assert!(!errors.contains("\"sequence\":2"));
+        let runtime = filter(
+            &source,
+            &Filters {
+                category: 1,
+                ..Filters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(runtime.lines().count(), 2);
+    }
+
+    #[test]
+    fn missing_malformed_and_incidental_fields_never_match_metadata() {
+        let text = ["invalid json", r#"{"text":"status 500 error","timestamp":"100","event":{"category":"runtime","level":"info","status":500,"metadata":{"status":500},"error":"not-an-error-code"}}"#,
+            r#"{"event":{"category":"access","level":"info","metadata":{"status":"500","error":null}}}"#].join("\n");
+        for filters in [
+            Filters {
+                status: Some((500, 599)),
+                ..Filters::default()
+            },
+            Filters {
+                errors_only: true,
+                ..Filters::default()
+            },
+            Filters {
+                start: Some(0),
+                ..Filters::default()
+            },
+        ] {
+            assert!(filter(&text, &filters).unwrap().is_empty());
+        }
+        assert_eq!(
+            filter(&text, &Filters::default()).unwrap().lines().count(),
+            3
+        );
+    }
+
+    #[test]
+    fn live_metadata_is_typed_and_keeps_original_debug_lines() {
+        let entries = live_fixture();
+        // Deliberately misleading display text must affect text search only.
+        let text = debug_text(&entries)
+            .lines()
+            .map(|line| format!("{line} status: Some(503) level: Error error: Some(Timeout)\n"))
+            .collect::<String>();
+        let all = Filters::default();
+        let status = Filters {
+            status: Some((500, 599)),
+            ..all.clone()
+        };
+        let output = filter_live(&text, &entries, 0, &status).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("#4 Access"));
+        assert!(output.contains("status: Some(503) level: Error"));
+        let errors = filter_live(
+            &text,
+            &entries,
+            0,
+            &Filters {
+                errors_only: true,
+                ..all.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(errors.lines().count(), 4);
+        assert!(!errors.contains("#1 "));
+        assert!(!errors.contains("#3 "));
+        let combined = Filters {
+            start: Some(103),
+            end: Some(103),
+            category: 2,
+            status: Some((503, 503)),
+            errors_only: true,
+            level: 4,
+            search: "access".into(),
+        };
+        assert_eq!(filter_live(&text, &entries, 0, &combined).unwrap(), output);
+        assert!(
+            filter_live(&text, &entries, 4, &combined)
+                .unwrap()
+                .is_empty()
+        );
+        for mismatch in [
+            Filters {
+                category: 1,
+                ..combined.clone()
+            },
+            Filters {
+                level: 3,
+                ..combined.clone()
+            },
+            Filters {
+                search: "started".into(),
+                ..combined.clone()
+            },
+            Filters {
+                end: Some(102),
+                start: None,
+                ..combined.clone()
+            },
+        ] {
+            assert!(
+                filter_live(&text, &entries, 0, &mismatch)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let runtime = filter_live(
+            &text,
+            &entries,
+            0,
+            &Filters {
+                category: 1,
+                ..all.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(runtime.lines().count(), 2);
+        assert!(runtime.contains("#1 Runtime") && runtime.contains("#2 Runtime"));
+        let success = filter_live(
+            &text,
+            &entries,
+            0,
+            &Filters {
+                status: Some((200, 299)),
+                ..all
+            },
+        )
+        .unwrap();
+        assert_eq!(success.lines().count(), 1);
+        assert!(success.contains("#3 Access"));
+        assert!(filter_live(&text, &[], 0, &status).unwrap().is_empty());
+    }
+
+    fn live_fixture() -> Vec<LogEntry> {
+        use crate::logging::{AccessMetadata, ErrorCode, LogEvent, RuntimeEvent};
+        [
+            LogEvent::Runtime {
+                level: LogLevel::Info,
+                event: RuntimeEvent::Started,
+                error: None,
+            },
+            LogEvent::Runtime {
+                level: LogLevel::Error,
+                event: RuntimeEvent::OperationFailed,
+                error: Some(ErrorCode::Io),
+            },
+            LogEvent::Access {
+                level: LogLevel::Info,
+                metadata: AccessMetadata {
+                    status: Some(200),
+                    ..AccessMetadata::default()
+                },
+            },
+            LogEvent::Access {
+                level: LogLevel::Warn,
+                metadata: AccessMetadata {
+                    status: Some(503),
+                    ..AccessMetadata::default()
+                },
+            },
+            LogEvent::Access {
+                level: LogLevel::Info,
+                metadata: AccessMetadata {
+                    error: Some(ErrorCode::Timeout),
+                    ..AccessMetadata::default()
+                },
+            },
+            LogEvent::Access {
+                level: LogLevel::Error,
+                metadata: AccessMetadata::default(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| LogEntry {
+            sequence: i as u64 + 1,
+            timestamp: 100 + i as u64,
+            event,
+        })
+        .collect()
+    }
+
+    fn debug_text(entries: &[LogEntry]) -> String {
+        entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} #{} {:?}\n",
+                    entry.timestamp, entry.sequence, entry.event
+                )
+            })
+            .collect()
+    }
+
+    fn live_snapshot(entries: Vec<LogEntry>) -> LogViewSnapshot {
+        LogViewSnapshot {
+            text: debug_text(&entries),
+            cursor: entries.last().map_or(0, |entry| entry.sequence),
+            entries,
+            gap: false,
+            status: Default::default(),
+            directory: None,
+            logging: Default::default(),
+        }
+    }
+
+    #[test]
+    fn file_cache_keeps_direction_and_complete_line_bounds() {
+        let first = (0..1000).map(|n| format!("old-{n}\n")).collect::<String>();
+        let last = (0..1000).map(|n| format!("new-{n}\n")).collect::<String>();
+        assert_eq!(bounded_file_text(&first, &last, true), last);
+        assert_eq!(bounded_file_text(&first, &last, false), first);
+    }
+
+    #[test]
+    fn native_controls_layout_filters_pause_and_invalid_preservation() {
+        struct Parent(HWND);
+        impl Drop for Parent {
+            fn drop(&mut self) {
+                // SAFETY: This test owns the parent and all its child controls.
+                unsafe {
+                    DestroyWindow(self.0);
+                }
+            }
+        }
+        // SAFETY: No application singleton/controller is created. All windows are
+        // owned, used and destroyed on this test thread, with no disk/network IO.
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            let parent = Parent(CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("logs test").as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                1800,
+                2200,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            ));
+            assert!(!parent.0.is_null());
+            let mut logs = Logs::default();
+            logs.create(parent.0, instance).unwrap();
+            logs.visible = true;
+            logs.file_mode = true;
+            logs.paused = true;
+            logs.file_text = fixture();
+            logs.before = Some(FileCursor {
+                index: 1,
+                identity: [1, 2, 3],
+                offset: 10,
+                observed_len: 100,
+                partial_line: false,
+            });
+            logs.follow = logs.before.clone();
+            for dpi in [96, 144, 192] {
+                for (width, height) in [(744, 820), (784, 840), (1100, 1000)] {
+                    logs.layout(dpi, scale(width, dpi), scale(height, dpi));
+                    for (i, &(control, _, _, _, _)) in logs.controls.iter().enumerate() {
+                        let mut rect = RECT::default();
+                        assert_ne!(GetWindowRect(control, &mut rect), 0);
+                        let id = GetDlgCtrlID(control);
+                        if [2208, 2209, 2226].contains(&id) {
+                            rect.bottom = rect.bottom.min(rect.top + scale(30, dpi));
+                        }
+                        assert!(
+                            rect.bottom > rect.top && rect.right > rect.left,
+                            "empty {id}"
+                        );
+                        assert!(
+                            rect.bottom <= scale(height - 84, dpi),
+                            "bottom clipping {id} at {dpi}"
+                        );
+                        assert!(
+                            rect.right <= scale(width - 24, dpi),
+                            "right clipping {id} at {dpi}"
+                        );
+                        for &(other, ..) in &logs.controls[i + 1..] {
+                            let mut other_rect = RECT::default();
+                            assert_ne!(GetWindowRect(other, &mut other_rect), 0);
+                            let other_id = GetDlgCtrlID(other);
+                            if [2208, 2209, 2226].contains(&other_id) {
+                                other_rect.bottom =
+                                    other_rect.bottom.min(other_rect.top + scale(30, dpi));
+                            }
+                            assert!(
+                                !(rect.left < other_rect.right
+                                    && rect.right > other_rect.left
+                                    && rect.top < other_rect.bottom
+                                    && rect.bottom > other_rect.top),
+                                "overlap {id} / {other_id} at {dpi}"
+                            );
+                        }
+                    }
+                }
+            }
+            logs.render();
+            assert_eq!(logs.rendered.lines().count(), 6);
+            settings::set_text(logs.control(2224), "102");
+            settings::set_text(logs.control(2225), "102");
+            settings::set_text(logs.control(2227), "5xx");
+            SendMessageW(logs.control(2226), CB_SETCURSEL, 2, 0);
+            SendMessageW(logs.control(2208), CB_SETCURSEL, 4, 0);
+            SendMessageW(logs.control(2228), BM_SETCHECK, 1, 0);
+            settings::set_text(logs.control(2207), "metadata");
+            logs.render();
+            assert_eq!(logs.rendered.lines().count(), 1);
+            assert!(logs.rendered.contains("\"sequence\":3"));
+            let valid = logs.rendered.clone();
+            settings::set_text(logs.control(2227), "6xx");
+            logs.render();
+            assert_eq!(logs.rendered, valid);
+            assert!(settings::text(logs.control(2220)).contains("筛选无效"));
+            assert!(settings::text(logs.control(2229)).contains("保留原显示"));
+            assert_eq!(logs.file_text, fixture());
+            assert_eq!(logs.before.as_ref().unwrap().offset, 10);
+            assert_eq!(logs.follow.as_ref().unwrap().offset, 10);
+            assert!(logs.paused);
+
+            // Switch to live, then advance the backend while paused. Both the
+            // display text and metadata must remain from the frozen batch.
+            for id in [2207, 2224, 2225, 2227] {
+                settings::set_text(logs.control(id), "");
+            }
+            SendMessageW(logs.control(2226), CB_SETCURSEL, 0, 0);
+            SendMessageW(logs.control(2208), CB_SETCURSEL, 0, 0);
+            SendMessageW(logs.control(2228), BM_SETCHECK, 0, 0);
+            logs.file_mode = false;
+            logs.paused = false;
+            logs.snapshot = Some(live_snapshot(live_fixture()));
+            logs.render();
+            assert_eq!(logs.rendered.lines().count(), 6);
+            let frozen_text = logs.live_text.clone();
+            logs.paused = true;
+            let mut newer = live_fixture();
+            for entry in &mut newer {
+                entry.sequence += 10;
+                entry.timestamp += 1000;
+            }
+            logs.snapshot = Some(live_snapshot(newer));
+            settings::set_text(logs.control(2224), "103");
+            settings::set_text(logs.control(2225), "103");
+            settings::set_text(logs.control(2227), "5xx");
+            SendMessageW(logs.control(2226), CB_SETCURSEL, 2, 0);
+            SendMessageW(logs.control(2208), CB_SETCURSEL, 4, 0);
+            SendMessageW(logs.control(2228), BM_SETCHECK, 1, 0);
+            logs.render();
+            assert_eq!(logs.rendered.lines().count(), 1);
+            assert!(logs.rendered.contains("103 #4 Access"));
+            assert_eq!(logs.live_text, frozen_text);
+            assert_eq!(logs.live_entries[3].timestamp, 103);
+            let valid = logs.rendered.clone();
+            settings::set_text(logs.control(2224), "104");
+            logs.render();
+            assert_eq!(logs.rendered, valid);
+            assert!(settings::text(logs.control(2220)).contains("不得晚于"));
+            assert_eq!(logs.displayed_cursor, 6);
+
+            // Clear uses the latest typed sequence cursor, but does not alter
+            // either file cursor. Resuming cannot resurrect old live entries.
+            logs.clear_view();
+            assert_eq!(logs.clear_cursor, 16);
+            assert!(logs.live_entries.is_empty() && logs.live_text.is_empty());
+            assert_eq!(logs.before.as_ref().unwrap().offset, 10);
+            assert_eq!(logs.follow.as_ref().unwrap().offset, 10);
+            for id in [2224, 2225, 2227] {
+                settings::set_text(logs.control(id), "");
+            }
+            SendMessageW(logs.control(2226), CB_SETCURSEL, 0, 0);
+            SendMessageW(logs.control(2208), CB_SETCURSEL, 0, 0);
+            SendMessageW(logs.control(2228), BM_SETCHECK, 0, 0);
+            logs.paused = false;
+            logs.render();
+            assert!(logs.rendered.is_empty());
+            let mut next = live_fixture()[0].clone();
+            next.sequence = 17;
+            logs.snapshot = Some(live_snapshot(vec![next]));
+            logs.render();
+            assert!(logs.rendered.contains("#17 Runtime"));
+            assert_eq!(logs.before.as_ref().unwrap().offset, 10);
+            assert_eq!(logs.follow.as_ref().unwrap().offset, 10);
+        }
+    }
+
+    #[test]
+    fn live_rendering_is_bounded_and_untyped_messages_cannot_match_metadata() {
+        let entry = live_fixture()[0].clone();
+        let entries: Vec<_> = (1..=2000)
+            .map(|sequence| LogEntry {
+                sequence,
+                ..entry.clone()
+            })
+            .collect();
+        let text = debug_text(&entries[1000..]);
+        let rendered = filter_live(&text, &entries, 0, &Filters::default()).unwrap();
+        assert_eq!(rendered.lines().count(), MAX_LINES);
+        assert!(rendered.len() <= LIMIT);
+        let untyped = "日志尚未初始化";
+        assert_eq!(
+            filter_live(untyped, &[], 0, &Filters::default()).unwrap(),
+            format!("{untyped}\r\n")
+        );
+        assert!(
+            filter_live(
+                untyped,
+                &[],
+                0,
+                &Filters {
+                    category: 1,
+                    ..Filters::default()
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn rendered_view_is_bounded() {
         let text = "a".repeat(1000) + "\n";
-        assert!(filter(&text.repeat(1000), true, 0, "", 0).len() <= LIMIT);
+        assert!(
+            filter(&text.repeat(1000), &Filters::default())
+                .unwrap()
+                .len()
+                <= LIMIT
+        );
+        let many = "x\n".repeat(4000);
+        assert_eq!(
+            filter(&many, &Filters::default()).unwrap().lines().count(),
+            MAX_LINES
+        );
+        assert_eq!(
+            bounded_file_text("", &many, true).lines().count(),
+            MAX_LINES
+        );
     }
 }
 pub(super) const CONTENT: u32 = 2200;
@@ -175,6 +1003,8 @@ pub(super) struct Logs {
     controls: Vec<(HWND, i32, i32, i32, i32)>,
     content: HWND,
     snapshot: Option<LogViewSnapshot>,
+    live_text: String,
+    live_entries: Vec<LogEntry>,
     files: Vec<LogFile>,
     file_text: String,
     file_name: Option<String>,
@@ -237,7 +1067,7 @@ impl Logs {
             "等待后台日志状态；未初始化时请先正常保存配置。",
             0,
             2220,
-            (24, 64, 700, 26),
+            (24, 64, 700, 40),
         )?;
         let button = WS_TABSTOP;
         for (title, id, x, w) in [
@@ -255,7 +1085,7 @@ impl Logs {
                 title,
                 button,
                 id,
-                (x, 100, w, 30),
+                (x, 108, w, 30),
             )?;
         }
         self.add(
@@ -265,7 +1095,7 @@ impl Logs {
             "搜索 / 级别 / 文件",
             0,
             0,
-            (24, 144, 160, 26),
+            (24, 150, 160, 26),
         )?;
         self.add(
             parent,
@@ -274,7 +1104,7 @@ impl Logs {
             "",
             WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
             2207,
-            (184, 140, 210, 30),
+            (184, 146, 210, 30),
         )?;
         for (id, x, w, items) in [
             (
@@ -292,7 +1122,7 @@ impl Logs {
                 "",
                 WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
                 id,
-                (x, 140, w, 180),
+                (x, 146, w, 180),
             )?;
             // SAFETY: Live COMBOBOX copies each string; selection index exists.
             unsafe {
@@ -302,11 +1132,83 @@ impl Logs {
                 SendMessageW(combo, CB_SETCURSEL, 0, 0);
             }
         }
+        self.add(
+            parent,
+            instance,
+            "STATIC",
+            "UTC 起（左）/ 止（右）：epoch 秒或 YYYY-MM-DD；含端点，日期含整日",
+            0,
+            0,
+            (24, 182, 696, 22),
+        )?;
+        for (id, x) in [(2224, 24), (2225, 372)] {
+            let edit = self.add(
+                parent,
+                instance,
+                "EDIT",
+                "",
+                WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+                id,
+                (x, 208, 336, 28),
+            )?;
+            // SAFETY: Live EDIT; bound user input before parsing it on timer ticks.
+            unsafe {
+                SendMessageW(edit, 0x00c5, 32, 0);
+            }
+        }
+        let category = self.add(
+            parent,
+            instance,
+            "COMBOBOX",
+            "",
+            WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+            2226,
+            (24, 244, 156, 180),
+        )?;
+        // SAFETY: Live COMBOBOX copies the labels synchronously.
+        unsafe {
+            for label in ["全部类别", "Runtime", "Access"] {
+                SendMessageW(category, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+            }
+            SendMessageW(category, CB_SETCURSEL, 0, 0);
+        }
+        self.add(
+            parent,
+            instance,
+            "STATIC",
+            "状态码 / 2xx / 400-499",
+            0,
+            0,
+            (192, 248, 208, 24),
+        )?;
+        let status = self.add(
+            parent,
+            instance,
+            "EDIT",
+            "",
+            WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+            2227,
+            (404, 244, 128, 28),
+        )?;
+        // SAFETY: Live EDIT; no retained pointers.
+        unsafe {
+            SendMessageW(status, 0x00c5, 32, 0);
+        }
+        self.add(
+            parent,
+            instance,
+            "BUTTON",
+            "仅错误（AND）",
+            WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+            2228,
+            (544, 244, 176, 28),
+        )?;
+        self.add(parent, instance, "STATIC", "", 0, 2229, (24, 280, 696, 40))?;
         self.content = self.add(parent, instance, "EDIT",
             "等待后台快照。只读内容支持选中及 Ctrl+C。\r\n文件视图每秒异步跟随追加，支持向前分页；暂停时不请求追加。",
             WS_TABSTOP | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
                 (ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL) as u32,
-            CONTENT, (24, 182, 696, 220))?;
+            CONTENT, (24, 324, 696, 96))?;
         // SAFETY: Live EDIT; fixed input limit, no retained pointers.
         unsafe {
             SendMessageW(self.content, 0x00c5, LIMIT, 0);
@@ -324,7 +1226,7 @@ impl Logs {
                 title,
                 button,
                 id,
-                (x, 416, w, 30),
+                (x, 432, w, 30),
             )?;
         }
         self.add(
@@ -334,7 +1236,7 @@ impl Logs {
             "暂停不停止记录；向前分页会暂停跟随。打开目录由后台执行，不阻塞界面。",
             0,
             0,
-            (24, 454, 696, 42),
+            (24, 468, 696, 30),
         )?;
         self.add(
             parent,
@@ -513,20 +1415,69 @@ impl Logs {
             .get(settings::selected(self.control(2209)))
             .map(|f| f.name.clone())
     }
+    // IDs 2224–2228 are sampled by the existing UI timer, so no parent dispatch
+    // expansion or nested message-loop callbacks are required.
+    fn filters(&self) -> Result<Filters, String> {
+        let start = utc_bound(&settings::text(self.control(2224)), false)?;
+        let end = utc_bound(&settings::text(self.control(2225)), true)?;
+        let status = status_range(&settings::text(self.control(2227)))?;
+        // SAFETY: Live checkbox owned by this page; message contains no pointers.
+        let errors_only = unsafe { SendMessageW(self.control(2228), BM_GETCHECK, 0, 0) != 0 };
+        Ok(Filters {
+            search: settings::text(self.control(2207)).to_lowercase(),
+            level: settings::selected(self.control(2208)),
+            start,
+            end,
+            status,
+            errors_only,
+            category: settings::selected(self.control(2226)),
+        })
+    }
+    fn clear_view(&mut self) {
+        self.clear_cursor = self.snapshot.as_ref().map_or(0, |s| s.cursor);
+        self.file_text.clear();
+        self.live_text.clear();
+        self.live_entries.clear();
+        self.rendered.clear();
+        settings::set_text(self.content, "");
+        self.message = "已清空视图，未删除文件".into();
+    }
     fn render(&mut self) {
         if !self.visible {
             return;
         }
-        let snapshot = self.snapshot.as_ref();
-        let source = if self.file_mode {
-            self.file_text.as_str()
-        } else {
-            snapshot.map_or("", |s| s.text.as_str())
-        };
-        let search = settings::text(self.control(2207)).to_lowercase();
-        let level = settings::selected(self.control(2208));
-        let filtered = filter(source, self.file_mode, self.clear_cursor, &search, level);
-        if filtered != self.rendered && (!self.paused || self.file_mode) {
+        if !self.file_mode && !self.paused {
+            self.live_text = self
+                .snapshot
+                .as_ref()
+                .map_or_else(String::new, |s| bounded_file_text("", &s.text, true));
+            self.live_entries = self.snapshot.as_ref().map_or_else(Vec::new, |s| {
+                s.entries[s.entries.len().saturating_sub(MAX_LINES)..].to_vec()
+            });
+        }
+        let result = self.filters().and_then(|filters| {
+            if self.file_mode {
+                filter(&self.file_text, &filters)
+            } else {
+                filter_live(
+                    &self.live_text,
+                    &self.live_entries,
+                    self.clear_cursor,
+                    &filters,
+                )
+            }
+        });
+        let error = result
+            .as_ref()
+            .err()
+            .map(|e| format!("筛选无效：{e}；保留原显示"));
+        let hint = error.as_deref().unwrap_or("所有条件 AND；仅错误 = error 级别、错误码或 HTTP 4xx/5xx。最多显示 1000 行 / 256 KiB；文件筛选仅作用于已加载窗口。");
+        if settings::text(self.control(2229)) != hint {
+            settings::set_text(self.control(2229), hint);
+        }
+        if let Ok(filtered) = result
+            && filtered != self.rendered
+        {
             // SAFETY: Live readonly EDIT. Preserve selection and vertical viewport; never force follow.
             unsafe {
                 let mut start = 0u32;
@@ -545,7 +1496,8 @@ impl Logs {
             }
             self.rendered = filtered;
         }
-        if !self.paused && !self.file_mode {
+        let snapshot = self.snapshot.as_ref();
+        if !self.paused && !self.file_mode && error.is_none() {
             self.displayed_cursor = snapshot.map_or(0, |s| s.cursor);
         }
         let status = format!(
@@ -566,7 +1518,7 @@ impl Logs {
             } else {
                 "有界缓存"
             },
-            self.message
+            error.as_deref().unwrap_or(&self.message)
         );
         if settings::text(self.control(2220)) != status {
             settings::set_text(self.control(2220), &status);
@@ -627,7 +1579,7 @@ impl Logs {
                                     bounded_file_text(&self.file_text, &page.text, true);
                                 self.follow = Some(page.follow);
                             } else {
-                                self.file_text = page.text;
+                                self.file_text = bounded_file_text("", &page.text, true);
                                 self.before = page.before;
                                 self.follow = Some(page.follow);
                             }
@@ -659,7 +1611,7 @@ impl Logs {
             }
             LogResponse::Tail { name, tail } => {
                 if self.file_name.as_ref() == Some(&name) {
-                    self.file_text = tail.text;
+                    self.file_text = bounded_file_text("", &tail.text, true);
                     self.message = format!(
                         "{} / {} bytes；尾部截断 {}；未自动跟随",
                         name, tail.file_bytes, tail.truncated
@@ -724,6 +1676,7 @@ impl Logs {
             2201 => {
                 self.file_mode = false;
                 self.paused = false;
+                settings::set_text(self.control(2202), "暂停显示");
             }
             2202 => {
                 self.paused = !self.paused;
@@ -736,13 +1689,7 @@ impl Logs {
                     },
                 );
             }
-            2204 => {
-                self.clear_cursor = self.snapshot.as_ref().map_or(0, |s| s.cursor);
-                self.file_text.clear();
-                self.rendered.clear();
-                settings::set_text(self.content, "");
-                self.message = "已清空视图，未删除文件".into();
-            }
+            2204 => self.clear_view(),
             2203 | 2205 => self.send(controller, Command::LogListFiles),
             2206 | 2209 => {
                 if let Some(name) = self.selected_file() {
@@ -827,10 +1774,10 @@ impl Logs {
         }
     }
     pub fn layout(&self, dpi: u32, width: i32, height: i32) {
-        let extra = (height - scale(848, dpi)).max(0);
+        let extra = (height - scale(848, dpi)).max(-scale(32, dpi));
         for &(control, x, y, w, h) in &self.controls {
             let wide = w == 696 || w == 700;
-            let y = scale(y, dpi) + if y >= 416 { extra } else { 0 };
+            let y = scale(y, dpi) + if y >= 432 { extra } else { 0 };
             let h = scale(h, dpi) + if control == self.content { extra } else { 0 };
             // SAFETY: Live owned children, no parent resizing or disk operations.
             unsafe {

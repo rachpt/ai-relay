@@ -5,7 +5,11 @@ mod body;
 mod cors;
 mod headers;
 mod history;
+mod metrics;
+mod request_model;
 mod tunnel;
+
+pub use metrics::{ProxyMetrics, ProxyMetricsSnapshot};
 
 use std::{convert::Infallible, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -37,7 +41,7 @@ use crate::{
     usage::UsageStore,
 };
 use access::AccessRecording;
-use body::ResponseBody;
+use body::{RequestBody, ResponseBody};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, BoxError>;
@@ -74,6 +78,7 @@ impl std::error::Error for ProxyError {}
 pub struct ProxyHandle {
     addr: SocketAddr,
     usage: Arc<UsageStore>,
+    metrics: Arc<ProxyMetrics>,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<Result<(), ProxyError>>>,
 }
@@ -85,6 +90,12 @@ impl ProxyHandle {
     /// Passive observations of upstream attempts only, not billing statistics.
     pub fn usage_store(&self) -> Arc<UsageStore> {
         self.usage.clone()
+    }
+
+    /// Nonblocking overview counters. Keep this Arc after shutdown, or pass it
+    /// to `start_with_metrics` to retain counters across listener restarts.
+    pub fn metrics(&self) -> Arc<ProxyMetrics> {
+        self.metrics.clone()
     }
 
     /// Stops accepting immediately, drains connections for the configured grace
@@ -127,14 +138,28 @@ pub async fn start_with_observers(
 }
 
 /// History service lifecycle belongs to the controller; request paths only HMAC
-/// bounded metadata and try-record. Health is excluded from all observations.
+/// bounded metadata and try-record. Health is excluded from request/log/history
+/// observations; its admitted TCP socket still contributes to connection gauges.
 pub async fn start_with_telemetry(
     config: Config,
     usage: Arc<UsageStore>,
     log: Option<LogHandle>,
     history: Option<HistoryHandle>,
 ) -> Result<ProxyHandle, ProxyError> {
-    let state = State::new(config, usage, log, history).await?;
+    start_with_metrics(config, usage, log, history, Arc::new(ProxyMetrics::new())).await
+}
+
+/// Reuses overview metrics as well as usage/log/history. Existing start APIs
+/// remain compatible and create a fresh metrics session. See the snapshot type
+/// for health exclusions, byte boundaries, errors and session uptime semantics.
+pub async fn start_with_metrics(
+    config: Config,
+    usage: Arc<UsageStore>,
+    log: Option<LogHandle>,
+    history: Option<HistoryHandle>,
+    metrics: Arc<ProxyMetrics>,
+) -> Result<ProxyHandle, ProxyError> {
+    let state = State::new(config, usage, log, history, metrics).await?;
     let listener = TcpListener::bind((state.config.listen.address, state.config.listen.port))
         .await
         .map_err(|_| ProxyError::Bind)?;
@@ -156,13 +181,17 @@ pub async fn start_on_listener_with_usage(
     listener: TcpListener,
     usage: Arc<UsageStore>,
 ) -> Result<ProxyHandle, ProxyError> {
-    launch(State::new(config, usage, None, None).await?, listener)
+    launch(
+        State::new(config, usage, None, None, Arc::new(ProxyMetrics::new())).await?,
+        listener,
+    )
 }
 
 fn launch(state: State, listener: TcpListener) -> Result<ProxyHandle, ProxyError> {
     let addr = listener.local_addr().map_err(|_| ProxyError::Listener)?;
     let (stop, rx) = watch::channel(false);
     let usage = state.usage.clone();
+    let metrics = state.metrics.clone();
     let task = tokio::spawn(serve(
         Arc::new(state),
         listener,
@@ -172,6 +201,7 @@ fn launch(state: State, listener: TcpListener) -> Result<ProxyHandle, ProxyError
     Ok(ProxyHandle {
         addr,
         usage,
+        metrics,
         stop,
         task: Some(task),
     })
@@ -182,6 +212,7 @@ struct State {
     log: Option<LogHandle>,
     history: Option<HistoryHandle>,
     usage: Arc<UsageStore>,
+    metrics: Arc<ProxyMetrics>,
     origin: String,
     prefix: String,
     host: hyper::header::HeaderValue,
@@ -197,6 +228,7 @@ impl State {
         usage: Arc<UsageStore>,
         log: Option<LogHandle>,
         history: Option<HistoryHandle>,
+        metrics: Arc<ProxyMetrics>,
     ) -> Result<Self, ProxyError> {
         config
             .validate_for_start()
@@ -255,6 +287,7 @@ impl State {
             log,
             history,
             usage,
+            metrics,
             origin,
             prefix,
             host,
@@ -300,9 +333,11 @@ async fn serve(
                 let (stream, peer) = match accepted { Ok(pair) => pair, Err(_) => { failure = true; break; } };
                 let Ok(permit) = connections.clone().try_acquire_owned() else { drop(stream); continue; };
                 let state = state.clone();
+                let connection_guard = state.metrics.connection();
                 let mut stop = stop.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
+                    let _connection_guard = connection_guard;
                     let (tunnel_tx, mut tunnel_rx) = mpsc::channel(1);
                     let service = service_fn(move |request| {
                         let state = state.clone();
@@ -376,6 +411,9 @@ async fn dispatch(
         request.method(),
         request.uri().path(),
     );
+    if !health {
+        access.set_metrics(state.metrics.request());
+    }
     if !health && let Some(history) = &state.history {
         access.set_history(history::HistoryRecording::new(
             history.clone(),
@@ -490,6 +528,11 @@ async fn dispatch(
         (uri, state.host.clone(), true)
     };
     *request.uri_mut() = uri;
+    // Observe original content headers: Connection filtering must not turn an
+    // unsupported/ambiguous encoding into apparently unencoded JSON.
+    let model = request_model::ModelObserver::new(request.headers());
+    let metadata = Arc::new(request_model::RequestMetadata::default());
+    access.set_request_metadata(metadata.clone());
     headers::strip(request.headers_mut());
     request.headers_mut().insert(hyper::header::HOST, host);
     if trusted {
@@ -500,10 +543,8 @@ async fn dispatch(
             &state.key,
         );
     }
-    let mut request = request.map(|body| {
-        body.map_err(|_| -> BoxError { "request body failed".into() })
-            .boxed_unsync()
-    });
+    let mut request = request
+        .map(|body| RequestBody::new(body, model, metadata, state.metrics.clone()).boxed_unsync());
     let mut captured = capture_connection(&mut request);
     // Scope: one observation per upstream attempt, including failures/cancellation
     // before headers. Local health/auth/validation/limit replies above do not count.
@@ -679,9 +720,15 @@ mod tests {
         config.network.max_active_requests = 1;
         config.access.client_token_enabled = true;
         config.access.client_token = crate::config::SecretString::new("test-client-token");
-        let state = State::new(config, Arc::new(UsageStore::new()), None, None)
-            .await
-            .unwrap();
+        let state = State::new(
+            config,
+            Arc::new(UsageStore::new()),
+            None,
+            None,
+            Arc::new(ProxyMetrics::new()),
+        )
+        .await
+        .unwrap();
         let (stop, rx) = watch::channel(false);
         let task = tokio::spawn(serve(Arc::new(state), listener, rx, Duration::from_secs(1)));
         let mut clients = Vec::new();

@@ -1,5 +1,5 @@
 //! CONNECT stays inside its owning HTTP connection task, including upgrade wait.
-use super::{AccessRecording, Body, State, reply, secs};
+use super::{AccessRecording, Body, ProxyMetrics, State, reply, secs};
 use crate::logging::ErrorCode;
 use hyper::{Request, Response, StatusCode, Uri, body::Incoming, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
@@ -21,6 +21,7 @@ pub(super) struct Tunnel {
     upstream: TcpStream,
     _permit: OwnedSemaphorePermit,
     access: AccessRecording,
+    metrics: Arc<ProxyMetrics>,
     idle_secs: u32,
 }
 
@@ -97,11 +98,13 @@ pub(super) async fn prepare(
         }
     };
     access.response_headers(StatusCode::OK);
+    access.tunnel();
     Ok(Tunnel {
         upgrade: hyper::upgrade::on(request),
         upstream,
         _permit: permit,
         access,
+        metrics: state.metrics.clone(),
         idle_secs: state.config.network.response_body_idle_timeout_secs,
     })
 }
@@ -121,10 +124,14 @@ impl Tunnel {
         let mut client = Active {
             inner: TokioIo::new(upgraded),
             activity: activity.clone(),
+            metrics: self.metrics.clone(),
+            upload: false,
         };
         let mut upstream = Active {
             inner: self.upstream,
             activity,
+            metrics: self.metrics.clone(),
+            upload: true,
         };
         let copy = tokio::io::copy_bidirectional(&mut client, &mut upstream);
         tokio::pin!(copy);
@@ -148,6 +155,8 @@ impl Tunnel {
 struct Active<T> {
     inner: T,
     activity: watch::Sender<Instant>,
+    metrics: Arc<ProxyMetrics>,
+    upload: bool,
 }
 impl<T: AsyncRead + Unpin> AsyncRead for Active<T> {
     fn poll_read(
@@ -172,7 +181,16 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Active<T> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
+        if let Poll::Ready(Ok(n)) = &result
+            && *n > 0
+        {
+            // Count successful writes only: counting both reads and writes
+            // would double traffic and count data never forwarded on errors.
+            if this.upload {
+                this.metrics.upload(*n);
+            } else {
+                this.metrics.download(*n);
+            }
             this.activity.send_replace(Instant::now());
         }
         result
