@@ -1,0 +1,27 @@
+/target/
+/dist/
+
+# Local application data and credentials.
+/config.toml
+/config.toml.*
+/secrets.dat
+/secrets.dat.*
+/portable.flag
+/logs/
+/history.sqlite3*
+/history.identity
+/.ai-relay-migration-*/
+/.ai-relay-*.tmp
+
+# Legacy files may contain real deployment credentials; preserve locally, never stage.
+/ai-proxy.js
+/allow-firewall.cmd
+/install-shortcut.ps1
+/proxy.cmd
+/start-proxy.cmd
+*.log
+*.pid
+.env
+.env.*
+
+# Keep Cargo.lock tracked for this application.
