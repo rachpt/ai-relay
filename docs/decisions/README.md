@@ -22,6 +22,8 @@
 
 - [0010：SVG设计源与内嵌原生导航图标](0010-native-navigation-assets.md)
 
+- [0011：公开准备与历史卫生](0011-publication-history-hygiene.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

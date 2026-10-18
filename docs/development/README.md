@@ -4,6 +4,7 @@
 
 - [当前状态与下一步](STATUS.md)
 - [批次记录模板](TEMPLATE.md)
+- [2026-10-18-19：公开准备、历史身份与旧实现清理](2026-10-18-19-publication-cleanup.md)
 - [2026-10-18-18：布局重绘回归、原生输入边框与SVG导航](2026-10-18-18-ui-regressions-svg.md)
 - [2026-10-18-17：拖动缩放残影与任务栏图标修复](2026-10-18-17-resize-taskbar-icon.md)
 - [2026-10-18-16：UI 切页与滚动卡顿修复](2026-10-18-16-ui-interaction-performance.md)

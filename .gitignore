@@ -15,7 +15,7 @@
 /.ai-relay-migration-*/
 /.ai-relay-*.tmp
 
-# Legacy files may contain real deployment credentials; preserve locally, never stage.
+# Retired legacy files may contain deployment credentials; never reintroduce them.
 /ai-proxy.js
 /allow-firewall.cmd
 /install-shortcut.ps1

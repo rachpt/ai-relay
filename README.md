@@ -2,7 +2,7 @@
 
 Windows 原生 AI Provider 流量转发工具，**Rust + Win32**，支持托盘、单实例、流式代理和本地用量分析。
 
-> 当前为功能开发预览，不是全部验收完成的正式版本。未完成项目与验证限制见 [STATUS](docs/development/STATUS.md)。旧 JS/CMD/PowerShell 保留，仅作参考，不属于原生版发布包。
+> 当前为功能开发预览，不是全部验收完成的正式版本。未完成项目与验证限制见 [STATUS](docs/development/STATUS.md)。旧 JS/CMD/PowerShell 参考实现及其日志/PID 已按用户授权移除，不属于公开仓库或原生版发布包。
 
 ## 运行
 
@@ -113,6 +113,13 @@ Windows PowerShell 冒烟使用临时目录、本地mock和虚构凭据，不产
 ```
 
 应用图标源为 `assets/ai-relay.svg`，`tools/generate-icon.ps1` 生成 ICO。导航图标源在 `assets/navigation/`；`tools/generate-navigation-icons.ps1 -ValidateOnly -SelfTest` 复核已提交遮罩，去掉 `-ValidateOnly` 离线重建。该脚本只支持受限 SVG 子集，不是任意 SVG 渲染器；正常构建和运行不需要执行脚本，详见 [导航资源说明](assets/navigation/README.md)。打包仅纳入白名单文件，不包含旧脚本、配置、密钥、日志或数据库；静态CRT+PE导入检查不能代替干净系统、签名和许可证验收。
+
+## GitHub 公开前检查
+
+- 全部历史提交作者/提交者统一为 `rachpt <rachpt@126.com>`；本地身份配置一致。历史重写改变提交哈希，旧克隆不要合并回新历史。
+- 旧参考脚本、真实配置/密钥、日志、PID、`target/` 与 `dist/` 不纳入源码发布；`.gitignore` 不等于历史清洗。扫描方法和边界见 [开发指南](docs/DEVELOPMENT.md#公开前的历史检查)。
+- **项目许可证尚未选择**：公开可见不等于授予开源许可。公开前需维护者确定 LICENSE、对应 Cargo 元数据并核对第三方许可证/发行包 notices；本次没有擅自选择许可证，也没有推送远端。
+- 历史扫描无法证明绝对无泄露。旧部署使用过的 Key 建议轮换；不要把仓库外恢复备份、旧克隆或未审查的预览产物上传到 GitHub。
 
 ## 文档
 
