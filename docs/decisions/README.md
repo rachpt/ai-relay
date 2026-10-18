@@ -20,6 +20,8 @@
 
 - [0009：原生标题栏紧凑菜单入口](0009-native-caption-menu.md)
 
+- [0010：SVG设计源与内嵌原生导航图标](0010-native-navigation-assets.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

@@ -2,9 +2,12 @@
 use super::*;
 use windows_sys::Win32::UI::Controls::*;
 
+mod icons;
+
 pub(super) const ID: u32 = 2100;
 pub(super) const START: u32 = 2102;
 pub(super) const STOP: u32 = 2103;
+pub(super) const LABELS: [&str; 4] = ["概览", "统计分析", "实时日志", "设置"];
 
 #[derive(Default)]
 pub(super) struct Tabs {
@@ -12,8 +15,22 @@ pub(super) struct Tabs {
     pub active: usize,
     pub start: HWND,
     pub stop: HWND,
+    icons: icons::Cache,
 }
 impl Tabs {
+    pub fn icon_size(dpi: u32) -> i32 {
+        icons::icon_size(dpi)
+    }
+    pub fn draw_icon(
+        &mut self,
+        index: usize,
+        dc: windows_sys::Win32::Graphics::Gdi::HDC,
+        rect: &RECT,
+        dpi: u32,
+        color: u32,
+    ) -> bool {
+        self.icons.draw(index, dc, rect, dpi, color)
+    }
     pub fn create(&mut self, parent: HWND) -> Result<(), String> {
         let init = INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -41,8 +58,7 @@ impl Tabs {
             if self.handle.is_null() {
                 return Err(last_error("创建原生分页控件"));
             }
-            for (index, title) in ["概览", "统计分析", "实时日志", "设置"].iter().enumerate()
-            {
+            for (index, title) in LABELS.iter().enumerate() {
                 let mut title = wide(title);
                 let item = TCITEMW {
                     mask: TCIF_TEXT,
@@ -103,23 +119,28 @@ impl Tabs {
             }
         }
     }
-    pub fn layout(&self, dpi: u32, width: i32) {
+    pub fn layout(&self, dpi: u32, width: i32, left: i32) {
         // SAFETY: Live sibling controls; Tab occupies only the header, so it cannot cover page controls.
         unsafe {
             SendMessageW(
                 self.handle,
                 TCM_SETITEMSIZE,
                 0,
-                (scale(108, dpi) | (scale(34, dpi) << 16)) as isize,
+                (scale(112, dpi) | (scale(36, dpi) << 16)) as isize,
             );
             MoveWindow(
                 self.handle,
-                scale(24, dpi),
-                scale(12, dpi),
-                width - scale(48, dpi),
-                scale(36, dpi),
+                left,
+                0,
+                (width - left - scale(24, dpi)).max(1),
+                scale(44, dpi),
                 1,
             );
+        }
+    }
+    pub fn layout_actions(&self, dpi: u32, width: i32) {
+        // SAFETY: Live overview-only children; positioned before that page's arrange pass.
+        unsafe {
             MoveWindow(
                 self.start,
                 scale(24, dpi),

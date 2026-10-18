@@ -1,6 +1,7 @@
 //! Presentation-only clipping for closed native controls. Call after native theme
 //! selection, and repeat on theme/DPI changes; values and input remain native.
-//! Edit 保留原生边框绘制，仅裁剪窗口外形，不保证像素级完整的圆角弧线。
+//! Edit keeps its native rectangular border: clipping cannot paint a complete arc
+//! and must not interfere with native text, caret, IME or accessibility behavior.
 #![cfg(windows)]
 
 use super::theme::{self, Palette};
@@ -25,7 +26,6 @@ unsafe extern "system" {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Control {
     Button,
-    Edit { border: bool },
     Combo,
     Date,
 }
@@ -41,10 +41,6 @@ fn identify(class: &str, style: u32) -> Option<Control> {
             }
             _ => None,
         }
-    } else if class.eq_ignore_ascii_case("Edit") {
-        (style & (ES_MULTILINE as u32 | WS_HSCROLL | WS_VSCROLL) == 0).then_some(Control::Edit {
-            border: style & WS_BORDER != 0,
-        })
     } else if class.eq_ignore_ascii_case("ComboBox") {
         (style & 3 == CBS_DROPDOWNLIST as u32).then_some(Control::Combo)
     } else if class.eq_ignore_ascii_case("SysDateTimePick32") {
@@ -112,6 +108,8 @@ unsafe fn detach(hwnd: HWND, state: &State) {
         }
         value.busy = true;
         state.set(value);
+        // Only a retained instance of our subclass reaches this path. In particular,
+        // an excluded Edit without our state may have a foreign region: leave it alone.
         let cleared = SetWindowRgn(hwnd, null_mut(), 1) != 0;
         value = state.get();
         value.busy = false;
@@ -190,6 +188,7 @@ unsafe fn apply_geometry(hwnd: HWND, state: &State) {
 }
 
 /// Apply only to supported native controls; repeat after theme/DPI changes.
+/// Edits remain native rectangles; any existing module-owned clipping is detached.
 ///
 /// # Safety
 /// `hwnd` must be a live native control on the calling UI thread. This module
@@ -379,12 +378,16 @@ mod tests {
         for style in [BS_CHECKBOX, BS_AUTOCHECKBOX, BS_RADIOBUTTON, BS_GROUPBOX] {
             assert!(identify("Button", style as u32).is_none());
         }
-        assert_eq!(
-            identify("Edit", WS_BORDER),
-            Some(Control::Edit { border: true })
-        );
-        for style in [ES_MULTILINE as u32, WS_VSCROLL, WS_HSCROLL] {
-            assert!(identify("Edit", style | WS_BORDER).is_none());
+        for style in [
+            0,
+            WS_BORDER,
+            ES_PASSWORD as u32,
+            ES_MULTILINE as u32,
+            WS_VSCROLL,
+            WS_HSCROLL,
+        ] {
+            assert!(identify("Edit", style).is_none());
+            assert!(identify("EDIT", style | WS_BORDER).is_none());
         }
         assert_eq!(
             identify("ComboBox", CBS_DROPDOWNLIST as u32),
@@ -442,6 +445,87 @@ mod tests {
     }
 
     #[test]
+    fn excluded_edits_leave_foreign_regions_untouched() {
+        // SAFETY: all HWNDs and scratch regions belong to this test thread. A
+        // successful SetWindowRgn transfers ownership; scratch copies stay ours.
+        unsafe {
+            let parent = window("STATIC", WS_POPUP, null_mut());
+            for style in [0, ES_MULTILINE as u32, ES_PASSWORD as u32] {
+                let edit = window("EDIT", WS_CHILD | WS_BORDER | style, parent);
+                let foreign = CreateRectRgn(2, 3, 180, 60);
+                assert!(!foreign.is_null());
+                let applied = SetWindowRgn(edit, foreign, 0);
+                if applied == 0 {
+                    DeleteObject(foreign);
+                }
+                assert_ne!(applied, 0);
+                let expected = CreateRectRgn(2, 3, 180, 60);
+                let copy = CreateRectRgn(0, 0, 0, 0);
+                assert!(!expected.is_null() && !copy.is_null());
+                for kind in [
+                    theme::Resolved::Light,
+                    theme::Resolved::Dark,
+                    theme::Resolved::Contrast,
+                ] {
+                    apply(edit, kind, palette(), 192);
+                    assert!(state(edit).is_none());
+                    assert_ne!(GetWindowRgn(edit, copy), ERROR);
+                    assert_ne!(EqualRgn(copy, expected), 0);
+                }
+                let style = GetWindowLongPtrW(edit, GWL_STYLE);
+                SetWindowLongPtrW(edit, GWL_STYLE, style ^ WS_TABSTOP as isize);
+                assert!(state(edit).is_none());
+                assert_ne!(GetWindowRgn(edit, copy), ERROR);
+                assert_ne!(EqualRgn(copy, expected), 0);
+                assert_ne!(DeleteObject(copy), 0);
+                assert_ne!(DeleteObject(expected), 0);
+            }
+            assert_ne!(DestroyWindow(parent), 0);
+        }
+    }
+
+    // Recreate a region/subclass left by the former Edit eligibility policy. The
+    // cleanup rechecks the HWND class, so no obsolete Edit tag is needed.
+    unsafe fn legacy_edit_region(hwnd: HWND) -> State {
+        // SAFETY: test-owned HWND on this thread; one owning Rc is transferred to
+        // the real subclass, and a successful SetWindowRgn transfers its HRGN to OS.
+        unsafe {
+            assert!(state(hwnd).is_none());
+            assert!(region_bounds(hwnd).is_none());
+            let mut rect = RECT::default();
+            assert_ne!(GetWindowRect(hwnd, &mut rect), 0);
+            let next = geometry(rect.right - rect.left, rect.bottom - rect.top, 96);
+            let region = CreateRoundRectRgn(0, 0, next.0 + 1, next.1 + 1, next.2, next.2);
+            assert!(!region.is_null());
+            let state = Rc::new(Cell::new(Appearance {
+                kind: theme::Resolved::Dark,
+                palette: palette(),
+                dpi: 96,
+                control: Control::Button,
+                geometry: Some(next),
+                busy: true,
+                attached: true,
+            }));
+            let data = Rc::into_raw(state.clone());
+            if SetWindowSubclass(hwnd, Some(procedure), SUBCLASS_ID, data as usize) == 0 {
+                drop(Rc::from_raw(data));
+                DeleteObject(region);
+                panic!("cannot install legacy Edit subclass");
+            }
+            let applied = SetWindowRgn(hwnd, region, 1);
+            if applied == 0 {
+                DeleteObject(region);
+            }
+            assert_ne!(applied, 0);
+            let mut value = state.get();
+            value.busy = false;
+            state.set(value);
+            assert!(region_bounds(hwnd).is_some());
+            state
+        }
+    }
+
+    #[test]
     fn native_values_focus_visibility_resize_contrast_and_gdi() {
         // SAFETY: temporary native windows, no application data, network or disk.
         unsafe {
@@ -456,6 +540,17 @@ mod tests {
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,
                 parent,
             );
+            let multiline = window(
+                "EDIT",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_MULTILINE as u32,
+                parent,
+            );
+            let password = window(
+                "EDIT",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_PASSWORD as u32,
+                parent,
+            );
+            let edits = [edit, multiline, password];
             let combo = window("COMBOBOX", WS_CHILD | CBS_DROPDOWNLIST as u32, parent);
             let button = window(
                 "BUTTON",
@@ -463,11 +558,21 @@ mod tests {
                 parent,
             );
             let date = window("SysDateTimePick32", WS_CHILD | DTS_SHORTDATEFORMAT, parent);
-            let controls = [edit, combo, button, date];
+            let controls = [edit, multiline, password, combo, button, date];
             let label = [b'A' as u16, 0];
             SendMessageW(combo, CB_ADDSTRING, 0, label.as_ptr() as LPARAM);
             SendMessageW(combo, CB_SETCURSEL, 0, 0);
-            SendMessageW(edit, EM_SETSEL, 2, 5);
+            for hwnd in edits {
+                SendMessageW(hwnd, EM_SETSEL, 2, 5);
+                SendMessageW(
+                    hwnd,
+                    EM_SETMARGINS,
+                    (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
+                    3 | (7 << 16),
+                );
+                SendMessageW(hwnd, EM_SETLIMITTEXT, 128, 0);
+            }
+            SendMessageW(password, EM_SETPASSWORDCHAR, b'*' as usize, 0);
             SendMessageW(button, BM_SETSTATE, 1, 0);
             SetFocus(edit);
             assert_eq!(GetFocus(), edit);
@@ -476,9 +581,15 @@ mod tests {
             let visible = controls.map(|hwnd| IsWindowVisible(hwnd));
             let enabled = controls.map(|hwnd| IsWindowEnabled(hwnd));
             let button_state = SendMessageW(button, BM_GETSTATE, 0, 0);
-            let margins = SendMessageW(edit, EM_GETMARGINS, 0, 0);
-            let mut content = RECT::default();
-            SendMessageW(edit, EM_GETRECT, 0, (&mut content as *mut RECT) as LPARAM);
+            let margins = edits.map(|hwnd| SendMessageW(hwnd, EM_GETMARGINS, 0, 0));
+            let masks = edits.map(|hwnd| SendMessageW(hwnd, EM_GETPASSWORDCHAR, 0, 0));
+            let limits = edits.map(|hwnd| SendMessageW(hwnd, EM_GETLIMITTEXT, 0, 0));
+            assert_eq!(masks[2], b'*' as isize);
+            let content = edits.map(|hwnd| {
+                let mut rect = RECT::default();
+                SendMessageW(hwnd, EM_GETRECT, 0, (&mut rect as *mut RECT) as LPARAM);
+                (rect.left, rect.top, rect.right, rect.bottom)
+            });
             let mut dropped = RECT::default();
             SendMessageW(
                 combo,
@@ -504,12 +615,30 @@ mod tests {
                     theme::Resolved::Contrast,
                 ] {
                     for hwnd in controls {
+                        if edits.contains(&hwnd) {
+                            apply(hwnd, kind, p, dpi);
+                            assert!(state(hwnd).is_none());
+                            assert!(region_bounds(hwnd).is_none());
+                        }
+                        let legacy = edits.contains(&hwnd).then(|| legacy_edit_region(hwnd));
                         apply(hwnd, kind, p, dpi);
-                        if kind == theme::Resolved::Contrast {
+                        if let Some(legacy) = legacy {
+                            assert!(!legacy.get().attached);
+                            assert!(legacy.get().geometry.is_none());
+                            assert_eq!(Rc::strong_count(&legacy), 1);
+                        }
+                        if kind == theme::Resolved::Contrast || edits.contains(&hwnd) {
                             assert!(state(hwnd).is_none());
                             assert!(region_bounds(hwnd).is_none());
                         } else {
+                            assert!(state(hwnd).is_some());
+                            let probe = CreateRectRgn(0, 0, 0, 0);
+                            assert!(!probe.is_null());
+                            assert_eq!(GetWindowRgn(hwnd, probe), COMPLEXREGION);
+                            assert_eq!(PtInRegion(probe, 0, 0), 0);
                             let bounds = region_bounds(hwnd).expect("rounded window region");
+                            assert_ne!(PtInRegion(probe, bounds.right / 2, bounds.bottom / 2), 0);
+                            assert_ne!(DeleteObject(probe), 0);
                             let mut native = RECT::default();
                             assert_ne!(GetWindowRect(hwnd, &mut native), 0);
                             assert_eq!((bounds.left, bounds.top), (0, 0));
@@ -518,6 +647,18 @@ mod tests {
                                 (native.right - native.left, native.bottom - native.top)
                             );
                         }
+                    }
+                    for hwnd in edits {
+                        let legacy = legacy_edit_region(hwnd);
+                        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                        // Exercise a real native WM_STYLECHANGED, not a synthetic
+                        // message with a missing STYLESTRUCT pointer.
+                        SetWindowLongPtrW(hwnd, GWL_STYLE, style ^ WS_TABSTOP as isize);
+                        assert!(state(hwnd).is_none());
+                        assert!(region_bounds(hwnd).is_none());
+                        assert!(!legacy.get().attached);
+                        assert_eq!(Rc::strong_count(&legacy), 1);
+                        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
                     }
                     assert_eq!(controls.map(|h| GetWindowLongPtrW(h, GWL_STYLE)), styles);
                     assert_eq!(
@@ -528,21 +669,25 @@ mod tests {
                     assert_eq!(controls.map(|h| IsWindowEnabled(h)), enabled);
                     assert_eq!(GetFocus(), edit);
                     assert_eq!(SendMessageW(combo, CB_GETCURSEL, 0, 0), 0);
-                    assert_eq!(SendMessageW(edit, EM_GETSEL, 0, 0), 2 | (5 << 16));
                     assert_eq!(SendMessageW(button, BM_GETSTATE, 0, 0), button_state);
-                    assert_eq!(SendMessageW(edit, EM_GETMARGINS, 0, 0), margins);
-                    let mut current = RECT::default();
-                    SendMessageW(edit, EM_GETRECT, 0, (&mut current as *mut RECT) as LPARAM);
-                    assert_eq!(
-                        (current.left, current.top, current.right, current.bottom),
-                        (content.left, content.top, content.right, content.bottom)
-                    );
-                    let mut text = [0u16; 32];
-                    let len = GetWindowTextW(edit, text.as_mut_ptr(), text.len() as i32);
-                    assert_eq!(
-                        String::from_utf16_lossy(&text[..len as usize]),
-                        "Native value"
-                    );
+                    for (index, hwnd) in edits.into_iter().enumerate() {
+                        assert_eq!(SendMessageW(hwnd, EM_GETSEL, 0, 0), 2 | (5 << 16));
+                        assert_eq!(SendMessageW(hwnd, EM_GETMARGINS, 0, 0), margins[index]);
+                        assert_eq!(SendMessageW(hwnd, EM_GETPASSWORDCHAR, 0, 0), masks[index]);
+                        assert_eq!(SendMessageW(hwnd, EM_GETLIMITTEXT, 0, 0), limits[index]);
+                        let mut current = RECT::default();
+                        SendMessageW(hwnd, EM_GETRECT, 0, (&mut current as *mut RECT) as LPARAM);
+                        assert_eq!(
+                            (current.left, current.top, current.right, current.bottom),
+                            content[index]
+                        );
+                        let mut text = [0u16; 32];
+                        let len = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
+                        assert_eq!(
+                            String::from_utf16_lossy(&text[..len as usize]),
+                            "Native value"
+                        );
+                    }
                 }
             }
             let mut date_after = windows_sys::Win32::Foundation::SYSTEMTIME::default();
@@ -562,18 +707,32 @@ mod tests {
 
             apply(edit, theme::Resolved::Dark, p, 96);
             assert_ne!(MoveWindow(edit, 0, 0, 210, 36, 0), 0);
-            let resized = region_bounds(edit).unwrap();
+            assert!(state(edit).is_none());
+            assert!(region_bounds(edit).is_none());
+            // Resize/DPI tracking still belongs to the supported rounded controls.
+            apply(button, theme::Resolved::Dark, p, 96);
+            assert_ne!(MoveWindow(button, 0, 0, 210, 36, 0), 0);
+            let resized = region_bounds(button).unwrap();
             assert_eq!((resized.right, resized.bottom), (210, 36));
-            apply(edit, theme::Resolved::Dark, p, 192);
-            assert_eq!(state(edit).unwrap().get().geometry, Some((210, 36, 24)));
-            SendMessageW(edit, WM_DPICHANGED, 144 | (144 << 16), 0);
-            assert_eq!(state(edit).unwrap().get().geometry, Some((210, 36, 18)));
-            SendMessageW(edit, WM_DPICHANGED_AFTERPARENT, 0, 0);
-            assert_eq!(state(edit).unwrap().get().dpi, GetDpiForWindow(edit));
-            SendMessageW(edit, WM_NCPAINT, 1, 0);
+            apply(button, theme::Resolved::Dark, p, 192);
+            assert_eq!(state(button).unwrap().get().geometry, Some((210, 36, 24)));
+            SendMessageW(button, WM_DPICHANGED, 144 | (144 << 16), 0);
+            assert_eq!(state(button).unwrap().get().geometry, Some((210, 36, 18)));
+            SendMessageW(button, WM_DPICHANGED_AFTERPARENT, 0, 0);
+            assert_eq!(state(button).unwrap().get().dpi, GetDpiForWindow(button));
+            for hwnd in edits {
+                SendMessageW(hwnd, WM_DPICHANGED, 144 | (144 << 16), 0);
+                SendMessageW(hwnd, WM_DPICHANGED_AFTERPARENT, 0, 0);
+                SendMessageW(hwnd, WM_NCPAINT, 1, 0);
+                assert!(state(hwnd).is_none());
+                assert!(region_bounds(hwnd).is_none());
+            }
             // Warm native theme/DC caches before resource accounting.
             for _ in 0..20 {
                 for hwnd in controls {
+                    if edits.contains(&hwnd) {
+                        drop(legacy_edit_region(hwnd));
+                    }
                     apply(hwnd, theme::Resolved::Dark, p, 96);
                 }
                 SendMessageW(edit, WM_NCPAINT, 1, 0);
@@ -589,9 +748,17 @@ mod tests {
                     theme::Resolved::Dark
                 };
                 for hwnd in controls {
+                    if edits.contains(&hwnd) {
+                        drop(legacy_edit_region(hwnd));
+                    }
                     apply(hwnd, kind, p, [96, 144, 192][index % 3]);
+                    if edits.contains(&hwnd) {
+                        assert!(state(hwnd).is_none());
+                        assert!(region_bounds(hwnd).is_none());
+                    }
                 }
                 MoveWindow(edit, 0, 0, 210 + (index % 2) as i32, 36, 0);
+                MoveWindow(button, 0, 0, 210 + (index % 2) as i32, 36, 0);
                 SendMessageW(edit, WM_NCPAINT, 1, 0);
             }
             for hwnd in controls {
@@ -600,18 +767,18 @@ mod tests {
             let after = GetGuiResources(process, GR_GDIOBJECTS);
             assert_eq!(
                 before, after,
-                "repeated apply/resize/NC paint leaked GDI objects"
+                "repeated legacy Edit detach/apply/resize/NC paint leaked GDI objects"
             );
             println!("GDI objects over 600 apply cycles: {before} -> {after}");
 
-            // A later incompatible style must restore the native rectangular edge.
+            // A later incompatible button style must restore its native edge.
             SetWindowLongPtrW(
-                edit,
+                button,
                 GWL_STYLE,
-                (styles[0] as u32 | ES_MULTILINE as u32) as isize,
+                ((styles[4] as u32 & !(BS_TYPEMASK as u32)) | BS_CHECKBOX as u32) as isize,
             );
-            assert!(state(edit).is_none());
-            assert!(region_bounds(edit).is_none());
+            assert!(state(button).is_none());
+            assert!(region_bounds(button).is_none());
             // Retain a reference to prove destruction marks data dead before freeing.
             let retained = state(combo).unwrap();
             assert_ne!(DestroyWindow(parent), 0);

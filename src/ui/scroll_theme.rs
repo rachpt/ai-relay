@@ -10,6 +10,7 @@
 #![cfg(windows)]
 
 use super::theme::{Palette, Resolved};
+use crate::windows::scale;
 use std::{cell::Cell, mem::size_of, ptr::null, rc::Rc};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -306,43 +307,60 @@ fn component_color(states: u32, scrollable: bool, palette: Palette) -> u32 {
         palette.disabled
     }
 }
-unsafe fn arrow(dc: HDC, rect: RECT, vertical: bool, end: bool, color: u32, dpi: u32) {
-    // SAFETY: caller clips to the bar. Pixel rectangles need no selected pen/font.
+unsafe fn capsule(dc: HDC, rect: RECT, color: u32) {
+    // SAFETY: caller clips to the bar; stock brush/pen are borrowed and restored.
     unsafe {
-        let radius = ((3 * dpi / 96) as i32)
-            .min((rect.right - rect.left) / 4)
-            .min((rect.bottom - rect.top) / 4);
-        if radius < 1 {
+        let brush = GetStockObject(DC_BRUSH);
+        let pen = GetStockObject(NULL_PEN);
+        if brush.is_null() || pen.is_null() || rect.right <= rect.left || rect.bottom <= rect.top {
             return;
         }
-        let x = (rect.left + rect.right) / 2;
-        let y = (rect.top + rect.bottom) / 2;
-        let thickness = (dpi / 96).max(1) as i32;
-        for step in 0..=radius {
-            let side = if end {
-                radius / 2 - step
-            } else {
-                step - radius / 2
-            };
-            let rect = if vertical {
-                RECT {
-                    left: x - step,
-                    right: x + step + 1,
-                    top: y + side,
-                    bottom: y + side + thickness,
-                }
-            } else {
-                RECT {
-                    left: x + side,
-                    right: x + side + thickness,
-                    top: y - step,
-                    bottom: y + step + 1,
-                }
-            };
-            fill(dc, rect, color);
-        }
+        let old_brush = SelectObject(dc, brush);
+        let old_pen = SelectObject(dc, pen);
+        SetDCBrushColor(dc, color);
+        let radius = ((rect.right - rect.left).min(rect.bottom - rect.top) / 2).max(1);
+        RoundRect(
+            dc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius,
+            radius,
+        );
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
     }
 }
+
+fn slim_thumb(bar: Bar, dpi: u32) -> Option<RECT> {
+    let hidden = STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_OFFSCREEN;
+    if bar.states[3] & hidden != 0 || !bar.scrollable {
+        return None;
+    }
+    let top = bar.thumb_top.max(bar.button);
+    let bottom = bar.thumb_bottom.min(bar.length() - bar.button);
+    if top >= bottom {
+        return None;
+    }
+    let mut thumb = bar.segment(top, bottom);
+    let thickness = scale(6, dpi).max(3);
+    if bar.vertical {
+        let available = (thumb.right - thumb.left).max(1);
+        let thickness = thickness.min((available - 2).max(1));
+        let center = (thumb.left + thumb.right) / 2;
+        thumb.left = center - thickness / 2;
+        thumb.right = thumb.left + thickness;
+    } else {
+        let available = (thumb.bottom - thumb.top).max(1);
+        let thickness = thickness.min((available - 2).max(1));
+        let center = (thumb.top + thumb.bottom) / 2;
+        thumb.top = center - thickness / 2;
+        thumb.bottom = thumb.top + thickness;
+    }
+    Some(thumb)
+}
+
 unsafe fn draw_bar(dc: HDC, bar: Bar, appearance: Appearance) {
     // SAFETY: saved clip is narrowed to the exact native bar rectangle. No pixels
     // outside it (including the native client edge) are intentionally modified.
@@ -361,47 +379,18 @@ unsafe fn draw_bar(dc: HDC, bar: Bar, appearance: Appearance) {
             return;
         }
         let p = appearance.palette;
-        fill(dc, bar.rect, p.surface);
+        // Blend the native 17-DIP scrollbar strip into the page and paint only a
+        // slim capsule thumb. Native hit testing, arrows, wheel and keyboard remain.
+        fill(dc, bar.rect, p.background);
         let hidden = STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_OFFSCREEN;
-        let global = bar.states[0];
-        for (index, start, end, last) in [
-            (1, 0, bar.button, false),
-            (5, bar.length() - bar.button, bar.length(), true),
-        ] {
-            if bar.states[index] & hidden != 0 {
-                continue;
-            }
-            let rect = bar.segment(start, end);
-            if bar.states[index] & (STATE_SYSTEM_PRESSED | STATE_SYSTEM_HOTTRACKED) != 0 {
-                fill(dc, rect, p.border);
-            }
-            arrow(
-                dc,
-                rect,
-                bar.vertical,
-                last,
-                component_color(global | bar.states[index], bar.scrollable, p),
-                appearance.dpi,
-            );
+        if bar.states[0] & hidden != 0 {
+            return;
         }
-        let top = bar.thumb_top.max(bar.button);
-        let bottom = bar.thumb_bottom.min(bar.length() - bar.button);
-        if bar.states[3] & hidden == 0 && top < bottom {
-            let mut thumb = bar.segment(top, bottom);
-            let inset = (2 * appearance.dpi / 96).max(1) as i32;
-            if bar.vertical {
-                let inset = inset.min((thumb.right - thumb.left - 1).max(0) / 2);
-                thumb.left += inset;
-                thumb.right -= inset;
-            } else {
-                let inset = inset.min((thumb.bottom - thumb.top - 1).max(0) / 2);
-                thumb.top += inset;
-                thumb.bottom -= inset;
-            }
-            fill(
+        if let Some(thumb) = slim_thumb(bar, appearance.dpi) {
+            capsule(
                 dc,
                 thumb,
-                component_color(global | bar.states[3], bar.scrollable, p),
+                component_color(bar.states[0] | bar.states[3], bar.scrollable, p),
             );
         }
     }
@@ -842,13 +831,13 @@ mod tests {
                 if kind == Resolved::Dark {
                     assert_eq!(
                         GetPixel(bitmap.dc, x, y),
-                        p.surface,
+                        p.background,
                         "PrintWindow missed NC overlay"
                     );
                 } else {
                     assert_ne!(
                         GetPixel(bitmap.dc, x, y),
-                        p.surface,
+                        p.background,
                         "native frame was not restored"
                     );
                 }
@@ -875,7 +864,7 @@ mod tests {
                 assert_eq!(
                     GetPixel(bitmap.dc, x, y),
                     if message == WM_PRINT {
-                        p.surface
+                        p.background
                     } else {
                         sentinel
                     }
@@ -926,7 +915,7 @@ mod tests {
             let dc = GetWindowDC(hwnd);
             assert_eq!(
                 GetPixel(dc, x, y),
-                p.surface,
+                p.background,
                 "WM_PAINT overwrote the NC overlay"
             );
             ReleaseDC(hwnd, dc);
@@ -1099,5 +1088,46 @@ mod tests {
             apply(parent.0, Resolved::Dark, palette(), 96);
             assert!(state(parent.0).is_none());
         }
+    }
+
+    #[test]
+    fn slim_thumb_is_narrow_centered_and_keeps_native_track() {
+        let bar = |vertical| Bar {
+            rect: RECT {
+                left: 0,
+                top: 0,
+                right: 200,
+                bottom: 200,
+            },
+            vertical,
+            button: 17,
+            thumb_top: 30,
+            thumb_bottom: 90,
+            states: [0; 6],
+            scrollable: true,
+        };
+        let vertical = slim_thumb(bar(true), 96).unwrap();
+        assert_eq!(vertical.right - vertical.left, scale(6, 96));
+        assert_eq!((vertical.left + vertical.right) / 2, 100);
+        assert_eq!(vertical.top, 30);
+        let horizontal = slim_thumb(
+            Bar {
+                thumb_top: 80,
+                thumb_bottom: 120,
+                ..bar(false)
+            },
+            192,
+        )
+        .unwrap();
+        assert_eq!(horizontal.bottom - horizontal.top, scale(6, 192));
+        assert_eq!((horizontal.top + horizontal.bottom) / 2, 100);
+        assert_eq!(horizontal.left, 80);
+        assert_eq!(horizontal.right, 120);
+        let mut hidden = bar(true);
+        hidden.states[3] = STATE_SYSTEM_INVISIBLE;
+        assert!(slim_thumb(hidden, 96).is_none());
+        let mut fixed = bar(true);
+        fixed.scrollable = false;
+        assert!(slim_thumb(fixed, 96).is_none());
     }
 }

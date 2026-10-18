@@ -163,7 +163,7 @@ public static class CompactNative {
         uint dpi=ClarityNative.GetDpiForWindow(main);
         var c=StatusBarNative.Client(main,pid); var h=StatusBarNative.InParent(host,main,pid);
         var t=StatusBarNative.InParent(tab,main,pid); var f=StatusBarNative.InParent(footer,main,pid);
-        int top=(int)((48L*dpi+48)/96),foot=(int)((56L*dpi+48)/96);
+        int top=(int)((44L*dpi+48)/96),foot=(int)((40L*dpi+48)/96);
         if(StatusBarNative.GetParent(host)!=main || StatusBarNative.GetParent(tab)!=main || StatusBarNative.GetParent(footer)!=main ||
            h.Left!=0 || h.Top!=top || h.Right!=c.Width || h.Bottom!=c.Height-foot ||
            f.Left!=0 || f.Right!=c.Width || f.Top!=h.Bottom || f.Bottom!=c.Height || t.Bottom>h.Top ||
@@ -602,9 +602,31 @@ try {
         return ([ClarityNative]::Text($h,[uint32]$ownedPid)).StartsWith('idle=1;') -and [ProxyUiSmoke]::IsWindowEnabled((Control 2002))
     } 8000
     $hostWindow=Control 2400
-    $footers=@([ModernNative]::DirectChildren($window,[uint32]$ownedPid) | Where-Object { [ProxyUiSmoke]::Class($_) -eq 'Static' -and $_ -ne $hostWindow })
-    if ($footers.Count -ne 1) { throw 'Expected ONLY main Tab, viewport and one fixed status Static; build compact reparenting first' }
+    $mainChildren=@([ModernNative]::DirectChildren($window,[uint32]$ownedPid))
+    $client=[StatusBarNative]::Client($window,[uint32]$ownedPid)
+    $dpi=[ClarityNative]::GetDpiForWindow($window)
+    $footerHeight=[int][Math]::Floor((40L*$dpi+48)/96)
+    $headerHeight=[int][Math]::Floor((44L*$dpi+48)/96)
+    # Branding/menu are also fixed Static children. Identify the footer by its
+    # entire expected client-bottom strip, never by text or first Static found.
+    $footers=@($mainChildren | Where-Object {
+        if ([ProxyUiSmoke]::Class($_) -ne 'Static' -or $_ -eq $hostWindow) { return $false }
+        $r=[StatusBarNative]::InParent($_,$window,[uint32]$ownedPid)
+        [ProxyUiSmoke]::IsWindowVisible($_) -and $r.Left -eq 0 -and $r.Right -eq $client.Width -and
+            $r.Top -eq $client.Height-$footerHeight -and $r.Bottom -eq $client.Height
+    })
+    if ($footers.Count -ne 1) { throw 'Expected exactly one full-width fixed footer at the client bottom' }
     $footer=$footers[0]
+    $headerStatics=@($mainChildren | Where-Object { $_ -ne $hostWindow -and $_ -ne $footer -and $_ -ne (Control 2100) })
+    if ($mainChildren.Count -ne 6 -or $headerStatics.Count -ne 3) { throw 'Expected only Tab, viewport, footer, menu and two branding controls on main' }
+    foreach ($h in $headerStatics) {
+        $r=[StatusBarNative]::InParent($h,$window,[uint32]$ownedPid)
+        if ([ProxyUiSmoke]::Class($h) -ne 'Static' -or -not [ProxyUiSmoke]::IsWindowVisible($h) -or
+            $r.Left -lt 0 -or $r.Top -lt 0 -or $r.Right -gt $client.Width -or $r.Bottom -gt $headerHeight) {
+            throw 'Unexpected main child outside the fixed branding/menu header'
+        }
+    }
+    if ([StatusBarNative]::GetParent((Control 2110)) -ne $window) { throw 'Menu must remain a fixed main child' }
     if ((Message 2039 0x1304) -ne 6) { throw 'Settings 2039 is not the six-item native direct segment' }
     Record 'owned child + recursive controls + fixed-only main children' @{ PID=$ownedPid; Exe=$exe; Host=$hostWindow.ToInt64(); Footer=$footer.ToInt64(); Layout=(Layout) }
     Config-Unchanged

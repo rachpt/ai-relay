@@ -88,15 +88,31 @@ struct IconKey {
     color: u32,
 }
 
-#[derive(Default)]
 pub(super) struct TitleMenu {
     hwnd: HWND,
     icon: Option<CaptionIcon>,
     original_small: HICON,
     key: Option<IconKey>,
+    install_caption_icon: bool,
+}
+impl Default for TitleMenu {
+    fn default() -> Self {
+        Self {
+            hwnd: std::ptr::null_mut(),
+            icon: None,
+            original_small: std::ptr::null_mut(),
+            key: None,
+            // Unit tests exercise the caption-icon path; the app disables it and
+            // uses a client-side menu button so taskbar keeps the product icon.
+            install_caption_icon: true,
+        }
+    }
 }
 
 impl TitleMenu {
+    pub(super) fn set_install_caption_icon(&mut self, install: bool) {
+        self.install_caption_icon = install;
+    }
     /// Attach once per window. Only our own insertions are removed on failure;
     /// GetSystemMenu(hwnd, TRUE) is never used to reset somebody else's entries.
     ///
@@ -129,8 +145,12 @@ impl TitleMenu {
                 return Err("窗口已经包含标题菜单命令。".into());
             }
             // Allocate everything before changing the borrowed root.
-            let key = icon_key(dpi, kind, palette);
-            let icon = CaptionIcon::new(key)?;
+            let caption = if self.install_caption_icon {
+                let key = icon_key(dpi, kind, palette);
+                Some((key, CaptionIcon::new(key)?))
+            } else {
+                None
+            };
             let menus = [
                 (
                     "文件(&F)",
@@ -144,18 +164,18 @@ impl TitleMenu {
                 (
                     "代理(&P)",
                     submenu(&[
-                        (START, "启动代理(&S)"),
-                        (STOP, "停止代理(&T)"),
-                        (RESTART, "重启代理(&R)"),
+                        (START, "▶ 启动代理(&S)"),
+                        (STOP, "■ 停止代理(&T)"),
+                        (RESTART, "↻ 重启代理(&R)"),
                     ])?,
                 ),
                 (
                     "视图(&V)",
                     submenu(&[
-                        (VIEW_OVERVIEW, "概览(&O)"),
-                        (VIEW_HISTORY, "统计分析(&H)"),
-                        (VIEW_LOGS, "实时日志(&L)"),
-                        (VIEW_SETTINGS, "设置(&S)"),
+                        (VIEW_OVERVIEW, "● 概览(&O)"),
+                        (VIEW_HISTORY, "▥ 统计分析(&H)"),
+                        (VIEW_LOGS, "≡ 实时日志(&L)"),
+                        (VIEW_SETTINGS, "◆ 设置(&S)"),
                     ])?,
                 ),
                 ("帮助(&H)", submenu(&[(ABOUT, "关于 AI Relay(&A)…")])?),
@@ -187,13 +207,14 @@ impl TitleMenu {
             }
             insertion.committed = true;
             self.hwnd = hwnd;
-            // WM_SETICON has no failure return; its result is the previous icon,
-            // which remains borrowed, not something we may DestroyIcon.
-            self.original_small =
-                SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon.0 as isize) as HICON;
-            self.icon = Some(icon);
-            self.key = Some(key);
-            // ICON_BIG is deliberately untouched: taskbar / Alt+Tab keep the app icon.
+            if let Some((key, icon)) = caption {
+                // WM_SETICON has no failure return; its result is the previous icon,
+                // which remains borrowed, not something we may DestroyIcon.
+                self.original_small =
+                    SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon.0 as isize) as HICON;
+                self.icon = Some(icon);
+                self.key = Some(key);
+            }
             DrawMenuBar(hwnd);
             Ok(())
         }
@@ -213,6 +234,9 @@ impl TitleMenu {
     ) -> Result<(), String> {
         if self.hwnd.is_null() || self.hwnd != hwnd {
             return Err("标题菜单尚未附加到此窗口。".into());
+        }
+        if !self.install_caption_icon {
+            return Ok(());
         }
         let key = icon_key(dpi, kind, palette);
         if self.key == Some(key) {
@@ -753,6 +777,45 @@ mod tests {
             assert_eq!(GetSubMenu(root.0, 0), original_handle);
             assert!(!command_menu(root.0, SC_CLOSE).is_null());
             assert!(command_menu(root.0, OPEN_DIR).is_null());
+        }
+    }
+
+    #[test]
+    fn client_menu_mode_keeps_window_and_taskbar_icons() {
+        let window = Window::new();
+        let mut title = TitleMenu::default();
+        title.set_install_caption_icon(false);
+        // SAFETY: Test-owned hidden window; all calls stay on its thread.
+        unsafe {
+            let original = LoadIconW(null_mut(), IDI_APPLICATION);
+            assert!(!original.is_null());
+            SendMessageW(window.0, WM_SETICON, ICON_SMALL as usize, original as isize);
+            SendMessageW(window.0, WM_SETICON, ICON_BIG as usize, original as isize);
+            title
+                .attach(window.0, 96, Resolved::Light, palette(0x202020))
+                .unwrap();
+            assert!(title.icon.is_none());
+            assert_eq!(
+                SendMessageW(window.0, WM_GETICON, ICON_SMALL as usize, 0) as HICON,
+                original
+            );
+            assert_eq!(
+                SendMessageW(window.0, WM_GETICON, ICON_BIG as usize, 0) as HICON,
+                original
+            );
+            title
+                .refresh(window.0, 192, Resolved::Dark, palette(0xf0f0f0))
+                .unwrap();
+            assert!(title.icon.is_none());
+            drop(title);
+            assert_eq!(
+                SendMessageW(window.0, WM_GETICON, ICON_SMALL as usize, 0) as HICON,
+                original
+            );
+            assert_eq!(
+                SendMessageW(window.0, WM_GETICON, ICON_BIG as usize, 0) as HICON,
+                original
+            );
         }
     }
 }

@@ -89,18 +89,18 @@ impl Overview {
         Ok(())
     }
     pub fn show(&self, visible: bool) {
+        let mut shows = ShowBatch::with_capacity(6);
         for control in [
+            self.details,
             self.summary,
             self.dashboard,
             self.restart,
             self.copy_url,
             self.directory,
         ] {
-            // SAFETY: Live UI-owned child controls.
-            unsafe {
-                ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
-            }
+            shows.add(control, visible);
         }
+        shows.commit();
     }
     pub fn set_font(&self, font: windows_sys::Win32::Graphics::Gdi::HFONT) {
         for control in [
@@ -118,40 +118,36 @@ impl Overview {
         }
     }
     pub fn layout(&self, dpi: u32, width: i32, height: i32) {
-        // SAFETY: Live sibling controls; no parent resizing or modal dispatch.
-        unsafe {
-            MoveWindow(
-                self.summary,
-                scale(24, dpi),
-                scale(108, dpi),
-                (width - scale(48, dpi)).max(1),
-                scale(100, dpi),
-                1,
-            );
-            for (control, x, y, w) in [
-                (self.restart, 292, 220, 132),
-                (self.copy_url, 432, 220, 140),
-                (self.directory, 580, 220, 140),
-            ] {
-                MoveWindow(
-                    control,
-                    scale(24, dpi)
-                        + (width - scale(48, dpi)) * (x - 24) / overview_dashboard::MIN_WIDTH_DIP,
-                    scale(y, dpi),
-                    ((width - scale(48, dpi)) * w / overview_dashboard::MIN_WIDTH_DIP).max(1),
-                    scale(36, dpi),
-                    1,
-                );
-            }
-            MoveWindow(
-                self.dashboard,
-                scale(24, dpi),
-                scale(282, dpi),
-                (width - scale(48, dpi)).max(1),
-                (height - scale(282 + 84, dpi)).max(1),
-                1,
+        let mut moves = MoveBatch::with_capacity(5);
+        moves.add(
+            self.summary,
+            scale(24, dpi),
+            scale(108, dpi),
+            (width - scale(48, dpi)).max(1),
+            scale(100, dpi),
+        );
+        for (control, x, y, w) in [
+            (self.restart, 292, 220, 132),
+            (self.copy_url, 432, 220, 140),
+            (self.directory, 580, 220, 140),
+        ] {
+            moves.add(
+                control,
+                scale(24, dpi)
+                    + (width - scale(48, dpi)) * (x - 24) / overview_dashboard::MIN_WIDTH_DIP,
+                scale(y, dpi),
+                ((width - scale(48, dpi)) * w / overview_dashboard::MIN_WIDTH_DIP).max(1),
+                scale(36, dpi),
             );
         }
+        moves.add(
+            self.dashboard,
+            scale(24, dpi),
+            scale(282, dpi),
+            (width - scale(48, dpi)).max(1),
+            (height - scale(282 + 84, dpi)).max(1),
+        );
+        moves.commit();
     }
     fn render(&mut self) {
         if !self.dirty {
@@ -366,7 +362,18 @@ pub(super) unsafe fn command(hwnd: HWND, state: *mut State, id: u32) {
                     None => Err("当前没有实际运行的监听地址。".into()),
                 }
             }
-            OPEN_DIRECTORY => (*state).controller.send(Command::OpenDataDirectory),
+            OPEN_DIRECTORY => {
+                if !(*state).settings.data_directory_available() {
+                    Err("数据目录尚未初始化或后台操作未完成；请先完成配置并稍后重试。".into())
+                } else {
+                    (*state).controller.send(Command::OpenDataDirectory).inspect(|()| {
+                        settings::set_text(
+                            (*state).status_label,
+                            "正在打开数据目录……\r\n请求由后台提交给资源管理器；请留意返回结果。",
+                        );
+                    })
+                }
+            }
             _ => Ok(()),
         };
         if let Err(error) = result {
@@ -569,7 +576,9 @@ pub(super) unsafe fn poll(hwnd: HWND, state: *mut State) {
             );
             settings::EnableWindow(
                 (*state).overview.directory,
-                i32::from((*state).settings.scope().is_some() && (*state).exiting.is_none()),
+                i32::from(
+                    (*state).settings.data_directory_available() && (*state).exiting.is_none(),
+                ),
             );
         }
         let scope = (*state).settings.scope().cloned();

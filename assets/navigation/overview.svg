@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+  <title>Overview dashboard</title>
+  <desc>Original AI Relay navigation artwork; four balanced dashboard panels.</desc>
+  <rect x="3.5" y="3.5" width="7" height="10" />
+  <rect x="13.5" y="3.5" width="7" height="6" />
+  <rect x="3.5" y="16.5" width="7" height="4" />
+  <rect x="13.5" y="12.5" width="7" height="8" />
+</svg>

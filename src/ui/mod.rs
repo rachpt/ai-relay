@@ -54,10 +54,147 @@ const EXIT_COMMAND: u32 = 1002;
 const WINDOW_CLASS: &str = "AIRelay.Window.v1";
 const PLACEMENT_CHANGED: u32 = WM_APP + 21;
 const OPEN_TITLE_MENU: u32 = WM_APP + 22;
+// Client header identity strip: menu button, app icon + product name, then tabs.
+const SS_ICON: u32 = 0x0000_0003;
+const SS_CENTER: u32 = 0x0000_0001;
+const SS_CENTERIMAGE: u32 = 0x0000_0200;
+const SS_NOTIFY: u32 = 0x0000_0100;
+const STM_SETICON: u32 = 0x0170;
+const MENU_BUTTON: u32 = 2110;
+const HEADER_HEIGHT: i32 = 44;
+const BRAND_LEFT: i32 = 64;
+const BRAND_ICON_SIZE: i32 = 32;
+const BRAND_TEXT_LEFT: i32 = 104;
+const BRAND_TEXT_WIDTH: i32 = 130;
+const TAB_LEFT: i32 = 244;
+
+/// Batches page-layout moves. Page layouts only establish document coordinates;
+/// `Viewport::arrange` performs the final moved-and-painted pass. Suppressing
+/// per-control repaint here avoids N synchronous paint/layout notifications.
+pub(super) struct MoveBatch {
+    entries: Vec<(HWND, i32, i32, i32, i32)>,
+}
+impl MoveBatch {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+    pub(super) fn add(&mut self, hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
+        self.entries.push((hwnd, x, y, width, height));
+    }
+    pub(super) fn commit(self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        // SAFETY: All handles are live children on this UI thread. A failed batch
+        // falls back to the same geometry with per-window SetWindowPos calls.
+        unsafe {
+            let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
+            let mut hdwp = BeginDeferWindowPos(self.entries.len() as i32);
+            if hdwp.is_null() {
+                for &(hwnd, x, y, width, height) in &self.entries {
+                    SetWindowPos(hwnd, null_mut(), x, y, width, height, flags);
+                }
+                return;
+            }
+            for &(hwnd, x, y, width, height) in &self.entries {
+                hdwp = DeferWindowPos(hdwp, hwnd, null_mut(), x, y, width, height, flags);
+                if hdwp.is_null() {
+                    for &(hwnd, x, y, width, height) in &self.entries {
+                        SetWindowPos(hwnd, null_mut(), x, y, width, height, flags);
+                    }
+                    return;
+                }
+            }
+            EndDeferWindowPos(hdwp);
+        }
+    }
+}
 
 #[link(name = "user32")]
 unsafe extern "system" {
     fn SetFocus(hwnd: HWND) -> HWND;
+}
+
+/// Batches visibility without painting intermediate document/stale coordinates.
+/// The caller finishes with layout/arrange or refresh, which redraws the host tree.
+pub(super) struct ShowBatch {
+    entries: Vec<(HWND, bool)>,
+}
+impl ShowBatch {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+    pub(super) fn add(&mut self, hwnd: HWND, visible: bool) {
+        self.entries.push((hwnd, visible));
+    }
+    pub(super) fn commit(self) {
+        // SAFETY: All handles are live children on this UI thread. The batch only
+        // changes WS_VISIBLE; failure uses the same no-redraw flags per window.
+        unsafe {
+            let base = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
+            let mut hdwp = BeginDeferWindowPos(self.entries.len().max(1) as i32);
+            if hdwp.is_null() {
+                for &(hwnd, visible) in &self.entries {
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        base | if visible {
+                            SWP_SHOWWINDOW
+                        } else {
+                            SWP_HIDEWINDOW
+                        },
+                    );
+                }
+                return;
+            }
+            for &(hwnd, visible) in &self.entries {
+                if (GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0) == visible {
+                    continue;
+                }
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    base | if visible {
+                        SWP_SHOWWINDOW
+                    } else {
+                        SWP_HIDEWINDOW
+                    },
+                );
+                if hdwp.is_null() {
+                    for &(hwnd, visible) in &self.entries {
+                        SetWindowPos(
+                            hwnd,
+                            null_mut(),
+                            0,
+                            0,
+                            0,
+                            0,
+                            base | if visible {
+                                SWP_SHOWWINDOW
+                            } else {
+                                SWP_HIDEWINDOW
+                            },
+                        );
+                    }
+                    return;
+                }
+            }
+            EndDeferWindowPos(hdwp);
+        }
+    }
 }
 
 struct State {
@@ -68,6 +205,9 @@ struct State {
     title_menu: title_menu::TitleMenu,
     labels: Vec<HWND>,
     status_label: HWND,
+    menu_button: HWND,
+    brand_icon: HWND,
+    brand_label: HWND,
     viewport: viewport::Viewport,
     settings: settings::Settings,
     tabs: tabs::Tabs,
@@ -78,6 +218,11 @@ struct State {
     controller: Controller,
     exiting: Option<Instant>,
     dpi: u32,
+    page_initialized: bool,
+    page_geometry: [bool; 4],
+    page_positioned: [bool; 4],
+    pages_prelaid: bool,
+    layout_size: (i32, i32, u32),
     taskbar_created: u32,
     tray_present: bool,
     close_notice_shown: bool,
@@ -126,61 +271,169 @@ impl State {
         }
     }
 
-    fn layout(&self, hwnd: HWND) {
+    fn layout(&mut self, hwnd: HWND, force: bool) {
+        // Creation can deliver WM_SIZE before the page tree exists. Do not cache
+        // a successful prelayout of null HWNDs before initial control creation.
+        if self.viewport.handle.is_null() {
+            return;
+        }
         let mut rect = RECT::default();
         // SAFETY: hwnd is live and rect is a writable RECT.
         if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
             return;
         }
+        let size = (rect.right, rect.bottom, self.dpi);
+        if size != self.layout_size {
+            self.layout_size = size;
+            self.page_geometry = [false; 4];
+            self.page_positioned = [false; 4];
+        }
+        let active = self.tabs.active;
+        let virtual_height = viewport::page_height(self.dpi, rect.bottom, active);
+        let session = active == 1 && self.history.session;
+        if !force && !session && self.page_positioned[active] && self.page_geometry[active] {
+            // Fast path for an already-positioned page: no header/control geometry
+            // changed, only the viewport's active page and scroll metadata.
+            self.viewport.refresh(self.dpi, virtual_height, active);
+            return;
+        }
         let (page_width, page_height) =
             self.viewport
-                .layout(self.dpi, rect.right, rect.bottom, self.tabs.active);
+                .layout(self.dpi, rect.right, rect.bottom, active);
         let margin = scale(24, self.dpi);
         let width = (page_width - margin * 2).max(1);
-        let rows = [(64, 28)];
-        for (label, (top, height)) in self.labels.iter().zip(rows) {
-            // SAFETY: Each handle is a live child STATIC; this moves only the child,
-            // not the parent, so it cannot recursively resize the parent.
-            unsafe {
-                MoveWindow(
-                    *label,
-                    margin,
-                    scale(top, self.dpi),
-                    width,
-                    scale(height, self.dpi),
-                    1,
-                )
-            };
+        if !self.pages_prelaid {
+            // Pay the first native-layout cost once, while the window is still
+            // hidden. Every page then only needs one arrange pass on first show.
+            let heights = std::array::from_fn::<_, 4, _>(|page| {
+                viewport::page_height(self.dpi, rect.bottom, page)
+            });
+            self.overview.layout(self.dpi, page_width, heights[0]);
+            self.history.layout(self.dpi, page_width, heights[1]);
+            self.logs.layout(self.dpi, page_width, heights[2]);
+            self.settings.layout(self.dpi, width, heights[3]);
+            self.page_geometry = [true; 4];
+            self.page_positioned = [false; 4];
+            self.pages_prelaid = true;
         }
-        self.tabs.layout(self.dpi, page_width);
-        // Header is outside the viewport; only its buttons scroll with the page.
+        self.tabs
+            .layout(self.dpi, page_width, scale(TAB_LEFT, self.dpi));
+        let header = scale(HEADER_HEIGHT, self.dpi);
+        let icon_size = scale(BRAND_ICON_SIZE, self.dpi);
+        // SAFETY: Fixed header children are outside the scrolling viewport.
         unsafe {
             MoveWindow(
-                self.tabs.handle,
+                self.menu_button,
                 scale(24, self.dpi),
-                scale(12, self.dpi),
-                rect.right - scale(48, self.dpi),
-                scale(36, self.dpi),
+                0,
+                scale(32, self.dpi),
+                header,
+                1,
+            );
+            MoveWindow(
+                self.brand_icon,
+                scale(BRAND_LEFT, self.dpi),
+                (header - icon_size) / 2,
+                icon_size,
+                icon_size,
+                1,
+            );
+            MoveWindow(
+                self.brand_label,
+                scale(BRAND_TEXT_LEFT, self.dpi),
+                0,
+                scale(BRAND_TEXT_WIDTH, self.dpi),
+                header,
                 1,
             );
         }
-        self.overview.layout(self.dpi, page_width, page_height);
-        self.settings.layout(self.dpi, width, page_height);
-        self.logs.layout(self.dpi, page_width, page_height);
-        self.history.layout(self.dpi, page_width, page_height);
-        self.viewport
-            .arrange(self.dpi, page_height, self.tabs.active);
+        if session {
+            // The session view reuses the settings usage editor. Lay out both
+            // owners at document coordinates, then position the visible union once.
+            self.history.layout(self.dpi, page_width, page_height);
+            self.page_geometry[1] = true;
+            self.page_positioned[1] = false;
+            self.settings.layout(self.dpi, width, page_height);
+            self.page_geometry[3] = true;
+            self.page_positioned[3] = false;
+        } else if force || !self.page_geometry[active] {
+            match active {
+                1 => self.history.layout(self.dpi, page_width, page_height),
+                2 => self.logs.layout(self.dpi, page_width, page_height),
+                3 => self.settings.layout(self.dpi, width, page_height),
+                _ => self.overview.layout(self.dpi, page_width, page_height),
+            }
+            self.page_geometry[active] = true;
+            self.page_positioned[active] = false;
+        }
+        if session || !self.page_positioned[active] {
+            if active == 0 && !self.page_positioned[0] {
+                if let Some(title) = self.labels.first() {
+                    // SAFETY: fixed overview heading reparented with the page; the
+                    // following arrange pass moves it into the viewport coordinates.
+                    unsafe {
+                        MoveWindow(
+                            *title,
+                            margin,
+                            scale(64, self.dpi),
+                            width,
+                            scale(28, self.dpi),
+                            0,
+                        );
+                    }
+                }
+                self.tabs.layout_actions(self.dpi, page_width);
+            }
+            self.viewport.arrange(self.dpi, page_height, active);
+            self.page_positioned[active] = true;
+            if session {
+                // Only the usage editor was visible from the settings owner; its
+                // other controls remain at document coordinates for a later layout.
+                self.page_positioned[3] = false;
+                self.page_geometry[3] = false;
+            }
+        } else {
+            self.viewport.refresh(self.dpi, page_height, active);
+        }
         status_bar::layout(self.status_label, self.dpi, rect.right, rect.bottom);
+        // WM_SIZE, category changes and first-show layouts all finish here, not
+        // only interactive resize completion. Never paint while State is borrowed.
+        viewport::redraw(hwnd);
+    }
+
+    fn repaint_all(&mut self, hwnd: HWND) {
+        self.layout(hwnd, true);
     }
 
     fn show_page(&mut self, index: usize) {
+        let previous = self.tabs.active;
         self.tabs.select(index);
-        self.settings.show_page(index);
-        self.history.show(index == 1);
+        if !self.page_initialized {
+            // First pass: hide every inactive page; later switches touch only the
+            // outgoing and incoming page instead of all four control sets.
+            self.page_initialized = true;
+            self.settings.show_page(index);
+            self.history.show(index == 1);
+            self.logs.show(index == 2);
+            self.overview.show(index == 0);
+        } else if previous != index {
+            match previous {
+                0 => self.overview.show(false),
+                1 => self.history.show(false),
+                2 => self.logs.show(false),
+                3 => self.settings.show_page(index),
+                _ => {}
+            }
+            match index {
+                0 => self.overview.show(true),
+                1 => self.history.show(true),
+                2 => self.logs.show(true),
+                3 => self.settings.show_page(3),
+                _ => {}
+            }
+        }
         self.settings
             .show_session(index == 1 && self.history.session);
-        self.logs.show(index == 2);
-        self.overview.show(index == 0);
         for (i, label) in self.labels.iter().enumerate() {
             // SAFETY: Live STATIC controls. Status stays visible on every page.
             unsafe {
@@ -201,7 +454,7 @@ impl State {
         }
         // Every page preserves its own scroll offset; draft controls are not recreated.
         unsafe {
-            self.layout(GetParent(self.tabs.handle));
+            self.layout(GetParent(self.tabs.handle), false);
         }
     }
 
@@ -221,6 +474,14 @@ impl State {
         if let Some(label) = self.labels.first() {
             // SAFETY: Live STATIC; both fonts remain alive until replacement completes.
             unsafe { SendMessageW(*label, WM_SETFONT, heading.0 as WPARAM, 0) };
+        }
+        if !self.brand_label.is_null() {
+            // SAFETY: Live STATIC; same heading font lifetime as the first label.
+            unsafe { SendMessageW(self.brand_label, WM_SETFONT, heading.0 as WPARAM, 0) };
+        }
+        if !self.menu_button.is_null() {
+            // SAFETY: Live STATIC; same heading font lifetime as the brand label.
+            unsafe { SendMessageW(self.menu_button, WM_SETFONT, heading.0 as WPARAM, 0) };
         }
         self.heading_font = heading;
         self.font = font;
@@ -268,6 +529,9 @@ pub(crate) fn run(
         title_menu: title_menu::TitleMenu::default(),
         labels: Vec::new(),
         status_label: null_mut(),
+        menu_button: null_mut(),
+        brand_icon: null_mut(),
+        brand_label: null_mut(),
         viewport: viewport::Viewport::default(),
         settings: settings::Settings::default(),
         tabs: tabs::Tabs::default(),
@@ -279,6 +543,11 @@ pub(crate) fn run(
         signals,
         exiting: None,
         dpi,
+        page_initialized: false,
+        page_geometry: [false; 4],
+        page_positioned: [false; 4],
+        pages_prelaid: false,
+        layout_size: (0, 0, 0),
         taskbar_created,
         tray_present: false,
         close_notice_shown: false,
@@ -316,7 +585,7 @@ pub(crate) fn run(
             0,
             class_guard.name.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             scale(800, dpi),
@@ -362,19 +631,124 @@ pub(crate) fn run(
             state.labels.push(label);
         }
         state.status_label = state.labels[1];
+        let menu_text = wide("☰");
+        // SAFETY: STATIC copies the glyph; the client-side button replaces the
+        // caption-icon hamburger so WM_SETICON can keep the product icon.
+        unsafe {
+            state.menu_button = CreateWindowExW(
+                0,
+                static_class.as_ptr(),
+                menu_text.as_ptr(),
+                WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE | SS_NOTIFY,
+                scale(24, dpi),
+                0,
+                scale(32, dpi),
+                scale(HEADER_HEIGHT, dpi),
+                hwnd,
+                MENU_BUTTON as usize as HMENU,
+                instance,
+                null(),
+            );
+        }
+        if state.menu_button.is_null() {
+            return Err(last_error("创建程序菜单按钮"));
+        }
+        // SAFETY: Live STATIC; State retains the heading font until DPI replacement.
+        unsafe {
+            SendMessageW(
+                state.menu_button,
+                WM_SETFONT,
+                state.heading_font.0 as WPARAM,
+                0,
+            );
+        }
+        let icon_size = scale(BRAND_ICON_SIZE, dpi);
+        // SAFETY: STATIC copies its text/icon reference synchronously; State owns
+        // the HICON/font for the full lifetime of these child controls.
+        unsafe {
+            state.brand_icon = CreateWindowExW(
+                0,
+                static_class.as_ptr(),
+                null(),
+                WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
+                scale(BRAND_LEFT, dpi),
+                (scale(HEADER_HEIGHT, dpi) - icon_size) / 2,
+                icon_size,
+                icon_size,
+                hwnd,
+                null_mut(),
+                instance,
+                null(),
+            );
+        }
+        if state.brand_icon.is_null() {
+            return Err(last_error("创建程序图标"));
+        }
+        // SAFETY: Live STATIC and process-owned icon; the control does not destroy it.
+        unsafe {
+            SendMessageW(
+                state.brand_icon,
+                STM_SETICON,
+                state.icon.handle as WPARAM,
+                0,
+            );
+        }
+        let brand_text = wide("AI Relay");
+        // SAFETY: Static class copies the label; State owns the selected font.
+        unsafe {
+            state.brand_label = CreateWindowExW(
+                0,
+                static_class.as_ptr(),
+                brand_text.as_ptr(),
+                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                scale(BRAND_TEXT_LEFT, dpi),
+                0,
+                scale(BRAND_TEXT_WIDTH, dpi),
+                scale(HEADER_HEIGHT, dpi),
+                hwnd,
+                null_mut(),
+                instance,
+                null(),
+            );
+        }
+        if state.brand_label.is_null() {
+            return Err(last_error("创建程序名称"));
+        }
+        // SAFETY: Live STATIC; State retains the heading font until DPI replacement.
+        unsafe {
+            SendMessageW(
+                state.brand_label,
+                WM_SETFONT,
+                state.heading_font.0 as WPARAM,
+                0,
+            );
+        }
         state.tabs.create(hwnd)?;
         // SAFETY: boxed State and native status STATIC outlive its subclass.
         unsafe {
             status_bar::attach(&mut *state)?;
+            // The caption uses a hamburger glyph, but the taskbar must keep the
+            // application icon. ICON_BIG is the taskbar/window-switcher image.
+            SendMessageW(
+                hwnd,
+                WM_SETICON,
+                ICON_BIG as usize,
+                state.icon.handle as isize,
+            );
         }
         state.overview.create(hwnd)?;
         state.settings.create(hwnd, instance)?;
         state.logs.create(hwnd, instance)?;
         state.history.create(hwnd)?;
         state.viewport.create(hwnd)?;
-        state
-            .viewport
-            .adopt(hwnd, &[state.tabs.handle, state.status_label])?;
+        let keep = vec![
+            state.tabs.handle,
+            state.status_label,
+            state.menu_button,
+            state.brand_icon,
+            state.brand_label,
+        ];
+        state.viewport.adopt(hwnd, &keep)?;
         state.show_page(0);
         state.update_dpi(hwnd, dpi)?;
         // Clamp the initial default as well as saved geometry before first showing.
@@ -400,6 +774,7 @@ pub(crate) fn run(
         // SAFETY: Owner thread and stable State; only native menu/icon messages
         // occur during attachment. Tracking starts later with no State borrow.
         unsafe {
+            state.title_menu.set_install_caption_icon(false);
             state
                 .title_menu
                 .attach(hwnd, state.dpi, state.theme.kind, state.theme.palette)?;
@@ -763,11 +1138,14 @@ unsafe extern "system" fn window_proc(
             }
             WM_MOUSEWHEEL => SendMessageW((*state).viewport.handle, message, wparam, lparam),
             WM_SIZE => {
-                (*state).layout(hwnd);
+                (*state).layout(hwnd, false);
                 0
             }
             WM_EXITSIZEMOVE | PLACEMENT_CHANGED => {
                 (*state).preferences.changed();
+                if message == WM_EXITSIZEMOVE {
+                    (*state).repaint_all(hwnd);
+                }
                 overview::flush(hwnd, state, message == WM_EXITSIZEMOVE);
                 0
             }
@@ -892,6 +1270,10 @@ unsafe extern "system" fn window_proc(
             }
             WM_COMMAND => {
                 let command = (wparam & 0xffff) as u32;
+                if command == MENU_BUTTON {
+                    PostMessageW(hwnd, OPEN_TITLE_MENU, 0, 0);
+                    return 0;
+                }
                 if command == EXIT_COMMAND && (*state).exiting.is_none() {
                     // Save before setting the controller's exit flag: send() rejects
                     // commands after request_exit. The timer waits for acknowledgement,
@@ -986,3 +1368,6 @@ unsafe extern "system" fn window_proc(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

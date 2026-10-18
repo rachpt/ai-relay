@@ -3,8 +3,8 @@
 use super::*;
 use windows_sys::Win32::{Graphics::Gdi::*, UI::Controls::SetScrollInfo};
 
-const TOP: i32 = 48;
-const FOOTER: i32 = 56;
+const TOP: i32 = 44;
+const FOOTER: i32 = super::status_bar::HEIGHT;
 const ID: usize = 2400;
 const REVEAL: u32 = WM_APP + 80;
 type Proc = Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
@@ -31,6 +31,28 @@ struct Page {
     extent: i32,
     dpi: u32,
 }
+pub(super) fn page_height(dpi: u32, height: i32, active: usize) -> i32 {
+    height.max(scale(if active == 2 { 848 } else { 820 }, dpi))
+}
+
+/// Finish a geometry/visibility transaction without dispatching paint callbacks.
+/// NOREDRAW also suppresses child and non-client damage, so invalidating only the
+/// clipped host background cannot repair moved edits, frames or nested headers.
+pub(super) fn redraw(hwnd: HWND) {
+    // SAFETY: Owner-thread live window (or null during initialization). No UPDATE
+    // or ERASE-NOW flags: paints run after the caller releases its State borrow.
+    unsafe {
+        if !hwnd.is_null() {
+            RedrawWindow(
+                hwnd,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+            );
+        }
+    }
+}
+
 fn limit(extent: i32, height: i32) -> i32 {
     (extent - height).max(0)
 }
@@ -108,7 +130,7 @@ impl Viewport {
                 scale(TOP, dpi),
                 width.max(1),
                 (height - scale(TOP + FOOTER, dpi)).max(1),
-                1,
+                0,
             );
         }
         let mut rect = RECT::default();
@@ -116,8 +138,7 @@ impl Viewport {
         unsafe {
             GetClientRect(self.handle, &mut rect);
         }
-        let minimum = if active == 2 { 848 } else { 820 };
-        (rect.right.max(1), (height).max(scale(minimum, dpi)))
+        (rect.right.max(1), page_height(dpi, height, active))
     }
     pub fn arrange(&self, dpi: u32, virtual_height: i32, active: usize) {
         // SAFETY: This private message passes scalars only. Every caller first
@@ -127,7 +148,107 @@ impl Viewport {
             SendMessageW(self.handle, WM_APP + 82, virtual_height as usize, 0);
         }
     }
+    pub fn refresh(&self, dpi: u32, virtual_height: i32, active: usize) {
+        // SAFETY: scalar-only private messages. Controls were already positioned
+        // for this page's stored offset; only the scroll metadata is refreshed.
+        unsafe {
+            SendMessageW(self.handle, WM_APP + 81, active, dpi as isize);
+            SendMessageW(self.handle, WM_APP + 83, virtual_height as usize, 0);
+        }
+    }
 }
+unsafe fn shown(hwnd: HWND) -> bool {
+    // SAFETY: scalar style query on a live child; parent visibility is irrelevant.
+    unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0 }
+}
+
+unsafe fn move_children_direct(hwnd: HWND, delta: i32) {
+    // SAFETY: host callback owns the child tree; copied scalar state only.
+    unsafe {
+        let mut child = GetWindow(hwnd, GW_CHILD);
+        while !child.is_null() {
+            let after = GetWindow(child, GW_HWNDNEXT);
+            if shown(child) {
+                let mut r = RECT::default();
+                GetWindowRect(child, &mut r);
+                let mut p = POINT {
+                    x: r.left,
+                    y: r.top,
+                };
+                ScreenToClient(hwnd, &mut p);
+                SetWindowPos(
+                    child,
+                    null_mut(),
+                    p.x,
+                    p.y + delta,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                );
+            }
+            child = after;
+        }
+    }
+}
+
+unsafe fn move_children(hwnd: HWND, delta: i32) {
+    // SAFETY: host callback owns the child tree. DeferWindowPos batches all
+    // visible moves into one redraw transaction instead of one repaint per
+    // control; hidden pages are skipped until show_page/arrange positions them.
+    unsafe {
+        if delta == 0 {
+            return;
+        }
+        let mut count = 0;
+        let mut child = GetWindow(hwnd, GW_CHILD);
+        while !child.is_null() {
+            if shown(child) {
+                count += 1;
+            }
+            child = GetWindow(child, GW_HWNDNEXT);
+        }
+        if count == 0 {
+            return;
+        }
+        let mut hdwp = BeginDeferWindowPos(count);
+        if hdwp.is_null() {
+            move_children_direct(hwnd, delta);
+            return;
+        }
+        child = GetWindow(hwnd, GW_CHILD);
+        while !child.is_null() {
+            let after = GetWindow(child, GW_HWNDNEXT);
+            if shown(child) {
+                let mut r = RECT::default();
+                GetWindowRect(child, &mut r);
+                let mut p = POINT {
+                    x: r.left,
+                    y: r.top,
+                };
+                ScreenToClient(hwnd, &mut p);
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    child,
+                    null_mut(),
+                    p.x,
+                    p.y + delta,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                );
+                if hdwp.is_null() {
+                    // A partially prepared batch is abandoned; move the remainder
+                    // directly so no control keeps a stale position.
+                    move_children_direct(hwnd, delta);
+                    return;
+                }
+            }
+            child = after;
+        }
+        EndDeferWindowPos(hdwp);
+    }
+}
+
 unsafe fn scroll(hwnd: HWND, page: *mut Page, target: i32) {
     // SAFETY: host callback owns Page, only copied scalar state crosses child moves.
     unsafe {
@@ -135,27 +256,7 @@ unsafe fn scroll(hwnd: HWND, page: *mut Page, target: i32) {
         let old = (*page).offsets[active];
         let next = target.clamp(0, limit((*page).extent, (*page).height));
         (*page).offsets[active] = next;
-        let mut child = GetWindow(hwnd, GW_CHILD);
-        while !child.is_null() {
-            let after = GetWindow(child, GW_HWNDNEXT);
-            let mut r = RECT::default();
-            GetWindowRect(child, &mut r);
-            let mut p = POINT {
-                x: r.left,
-                y: r.top,
-            };
-            ScreenToClient(hwnd, &mut p);
-            SetWindowPos(
-                child,
-                null_mut(),
-                p.x,
-                p.y + old - next,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            child = after;
-        }
+        move_children(hwnd, old - next);
         let info = SCROLLINFO {
             cbSize: size_of::<SCROLLINFO>() as u32,
             fMask: SIF_POS,
@@ -163,7 +264,7 @@ unsafe fn scroll(hwnd: HWND, page: *mut Page, target: i32) {
             ..Default::default()
         };
         SetScrollInfo(hwnd, SB_VERT, &info, 1);
-        InvalidateRect(hwnd, null(), 1);
+        redraw(hwnd);
     }
 }
 unsafe extern "system" fn procedure(
@@ -204,32 +305,12 @@ unsafe extern "system" fn procedure(
                 0
             }
             x if x == WM_APP + 82 => {
-                (*page).extent = (w as i32 - scale(TOP + 84, (*page).dpi)).max(0);
+                (*page).extent = (w as i32 - scale(TOP + FOOTER + 28, (*page).dpi)).max(0);
                 let active = (*page).active;
                 (*page).offsets[active] =
                     (*page).offsets[active].clamp(0, limit((*page).extent, (*page).height));
                 let offset = (*page).offsets[active] + scale(TOP, (*page).dpi);
-                let mut child = GetWindow(hwnd, GW_CHILD);
-                while !child.is_null() {
-                    let next = GetWindow(child, GW_HWNDNEXT);
-                    let mut r = RECT::default();
-                    GetWindowRect(child, &mut r);
-                    let mut p = POINT {
-                        x: r.left,
-                        y: r.top,
-                    };
-                    ScreenToClient(hwnd, &mut p);
-                    SetWindowPos(
-                        child,
-                        null_mut(),
-                        p.x,
-                        p.y - offset,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                    child = next;
-                }
+                move_children(hwnd, -offset);
                 let info = SCROLLINFO {
                     cbSize: size_of::<SCROLLINFO>() as u32,
                     fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -240,6 +321,28 @@ unsafe extern "system" fn procedure(
                     ..Default::default()
                 };
                 SetScrollInfo(hwnd, SB_VERT, &info, 1);
+                // All geometry is final; include children and their native frames.
+                redraw(hwnd);
+                0
+            }
+            x if x == WM_APP + 83 => {
+                (*page).extent = (w as i32 - scale(TOP + FOOTER + 28, (*page).dpi)).max(0);
+                let active = (*page).active;
+                let old = (*page).offsets[active];
+                let next = old.clamp(0, limit((*page).extent, (*page).height));
+                (*page).offsets[active] = next;
+                move_children(hwnd, old - next);
+                let info = SCROLLINFO {
+                    cbSize: size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                    nMin: 0,
+                    nMax: (*page).extent.saturating_sub(1),
+                    nPage: (*page).height.max(1) as u32,
+                    nPos: (*page).offsets[active],
+                    ..Default::default()
+                };
+                SetScrollInfo(hwnd, SB_VERT, &info, 1);
+                redraw(hwnd);
                 0
             }
             WM_VSCROLL => {
@@ -552,7 +655,7 @@ mod tests {
             let tops = [
                 scale(64, dpi),
                 scale(320, dpi),
-                virtual_height - scale(84 + 24, dpi),
+                virtual_height - scale(FOOTER + 28 + 24, dpi),
             ];
             for (control, y) in self.controls.into_iter().zip(tops) {
                 // SAFETY: Reset live children to original page coordinates before
@@ -583,7 +686,10 @@ mod tests {
         for dpi in [96, 144, 192] {
             assert!(scale(560 - TOP - FOOTER, dpi) > 0);
             assert_eq!(
-                limit(scale(848 - TOP - 84, dpi), scale(560 - TOP - FOOTER, dpi)),
+                limit(
+                    scale(848 - TOP - FOOTER - 28, dpi),
+                    scale(560 - TOP - FOOTER, dpi)
+                ),
                 scale(260, dpi)
             );
         }
@@ -622,7 +728,10 @@ mod tests {
             );
             let before = scroll_info(native.viewport.handle);
             assert_eq!(before.nPos, 0);
-            assert_eq!(before.nMax + 1, virtual_height - scale(TOP + 84, dpi));
+            assert_eq!(
+                before.nMax + 1,
+                virtual_height - scale(TOP + FOOTER + 28, dpi)
+            );
             assert_eq!(before.nPage as i32, scale(360 - TOP - FOOTER, dpi));
             assert!(rect_in(native.controls[2], native.viewport.handle).top >= before.nPage as i32);
             scroll_command(native.viewport.handle, SB_BOTTOM);
@@ -713,5 +822,175 @@ mod tests {
         }
         assert_eq!(scroll_info(native.viewport.handle).nPos, before);
         assert_eq!(rect_in(last, native.viewport.handle).top, rect.top);
+    }
+
+    unsafe extern "system" fn paint_probe(
+        hwnd: HWND,
+        message: u32,
+        w: WPARAM,
+        l: LPARAM,
+        id: usize,
+        data: usize,
+    ) -> LRESULT {
+        // SAFETY: Test-owned heap-stable Cell outlives this subclass. Consume
+        // paint probes without forwarding to the fixture's dummy color brush.
+        unsafe {
+            let counts = &*(data as *const Cell<(u32, u32)>);
+            let (client, frame) = counts.get();
+            match message {
+                WM_PAINT => {
+                    counts.set((client + 1, frame));
+                    let mut paint = PAINTSTRUCT::default();
+                    BeginPaint(hwnd, &mut paint);
+                    EndPaint(hwnd, &paint);
+                    return 0;
+                }
+                WM_ERASEBKGND => return 1,
+                WM_NCPAINT => {
+                    counts.set((client, frame + 1));
+                    return 0;
+                }
+                WM_NCDESTROY => {
+                    RemoveWindowSubclass(hwnd, Some(paint_probe), id);
+                }
+                _ => {}
+            }
+            DefSubclassProc(hwnd, message, w, l)
+        }
+    }
+
+    #[test]
+    fn native_arrange_and_cached_refresh_queue_child_tree_and_frames_without_painting() {
+        // Declared before the HWND owner so the probe data also survives an
+        // assertion unwinding through DestroyWindow/WM_NCDESTROY.
+        let counts = Box::new(Cell::new((0u32, 0u32)));
+        let native = NativeViewport::new();
+        native.layout_reset_arrange(96, 0);
+        let edit = native.controls[0];
+        let nested = child(edit, 17, 0);
+        // SAFETY: Test-owned off-screen HWND tree. Probe data is removed before
+        // its Box drops. All production redraw calls must remain asynchronous.
+        unsafe {
+            SetWindowPos(
+                native.parent.0,
+                null_mut(),
+                -4000,
+                -4000,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            ShowWindow(native.parent.0, SW_SHOWNOACTIVATE);
+            SetWindowLongPtrW(
+                edit,
+                GWL_STYLE,
+                (GetWindowLongPtrW(edit, GWL_STYLE) as u32 | WS_BORDER) as isize,
+            );
+            SetWindowPos(
+                edit,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_FRAMECHANGED
+                    | SWP_NOREDRAW,
+            );
+            assert_ne!(
+                SetWindowSubclass(
+                    edit,
+                    Some(paint_probe),
+                    19,
+                    counts.as_ref() as *const _ as usize
+                ),
+                0
+            );
+            for refresh in [false, true] {
+                for h in [native.viewport.handle, edit, nested] {
+                    ValidateRect(h, null());
+                }
+                counts.set((0, 0));
+                if refresh {
+                    let mut show = ShowBatch::with_capacity(1);
+                    show.add(edit, false);
+                    show.commit();
+                    let mut show = ShowBatch::with_capacity(1);
+                    show.add(edit, true);
+                    show.commit();
+                    native.viewport.refresh(96, 820, 0);
+                } else {
+                    native.layout_reset_arrange(96, 0);
+                }
+                assert_eq!(counts.get(), (0, 0), "redraw must not dispatch paint");
+                for h in [native.viewport.handle, edit, nested] {
+                    assert_ne!(
+                        GetUpdateRect(h, null_mut(), 0),
+                        0,
+                        "final transaction damages host and visible descendants"
+                    );
+                }
+                UpdateWindow(edit);
+                assert!(counts.get().0 > 0, "deferred client repaint");
+                assert!(counts.get().1 > 0, "deferred non-client frame repaint");
+            }
+            RemoveWindowSubclass(edit, Some(paint_probe), 19);
+            ShowWindow(native.parent.0, SW_HIDE);
+        }
+    }
+
+    #[test]
+    fn native_cached_refresh_clamps_offset_and_moves_positioned_children_once() {
+        let native = NativeViewport::new();
+        native.layout_reset_arrange(96, 0);
+        scroll_command(native.viewport.handle, SB_BOTTOM);
+        native.viewport.refresh(96, 360, 0);
+        assert_eq!(scroll_info(native.viewport.handle).nPos, 0);
+        assert_eq!(
+            rect_in(native.controls[0], native.viewport.handle).top,
+            64 - TOP
+        );
+        native.viewport.refresh(96, 360, 0);
+        assert_eq!(
+            rect_in(native.controls[0], native.viewport.handle).top,
+            64 - TOP
+        );
+    }
+
+    #[test]
+    fn native_arrange_invalidates_host_after_position_pass() {
+        let native = NativeViewport::new();
+        native.layout_reset_arrange(96, 0);
+        // SAFETY: The test owns this window. It is moved off-screen before being
+        // shown so USER32 tracks a real update region without flashing on the desktop.
+        unsafe {
+            assert_ne!(
+                SetWindowPos(
+                    native.parent.0,
+                    null_mut(),
+                    -4000,
+                    -4000,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                ),
+                0
+            );
+            ShowWindow(native.parent.0, SW_SHOWNOACTIVATE);
+            assert_ne!(ValidateRect(native.viewport.handle, null()), 0);
+            SendMessageW(
+                native.viewport.handle,
+                WM_APP + 82,
+                scale(360, 96) as usize,
+                0,
+            );
+            let mut rect = RECT::default();
+            assert_ne!(GetUpdateRect(native.viewport.handle, &mut rect, 0), 0);
+            assert!(rect.left < rect.right && rect.top < rect.bottom);
+            ShowWindow(native.parent.0, SW_HIDE);
+        }
     }
 }

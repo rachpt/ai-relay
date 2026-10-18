@@ -421,7 +421,7 @@ pub(super) unsafe fn paint(
                         palette.text
                     },
                 );
-                let title = wide(["概览", "统计分析", "实时日志", "设置"][item.itemID as usize]);
+                let title = wide(tabs::LABELS[item.itemID as usize]);
                 let mut rect = item.rcItem;
                 DrawTextW(
                     item.hDC,
@@ -526,8 +526,7 @@ unsafe extern "system" fn tab_proc(
                 let font = SelectObject(dc, (*state).font.0);
                 SetBkMode(dc, TRANSPARENT as i32);
                 let selected = SendMessageW(hwnd, TCM_GETCURSEL, 0, 0);
-                for (index, title) in ["概览", "统计分析", "实时日志", "设置"].iter().enumerate()
-                {
+                for (index, title) in tabs::LABELS.iter().enumerate() {
                     let mut rect = RECT::default();
                     if SendMessageW(
                         hwnd,
@@ -542,13 +541,47 @@ unsafe extern "system" fn tab_proc(
                     if active && let Ok(brush) = Brush::new(palette.accent_surface) {
                         FillRect(dc, &rect, brush.0);
                     }
-                    SetTextColor(dc, if active { palette.accent } else { palette.text });
+                    let color = if active { palette.accent } else { palette.text };
+                    SetTextColor(dc, color);
+                    let title = wide(title);
+                    let mut measured = RECT::default();
                     DrawTextW(
                         dc,
-                        wide(title).as_ptr(),
+                        title.as_ptr(),
                         -1,
-                        &mut rect,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                        &mut measured,
+                        DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                    let dpi = (*state).dpi;
+                    let icon_size = tabs::Tabs::icon_size(dpi);
+                    let gap = scale(6, dpi);
+                    let text_width = measured.right - measured.left;
+                    let content_width = icon_size + gap + text_width;
+                    let mut text_rect = rect;
+                    // Keep the native item rectangle for hit testing, underline and focus.
+                    // If resources or width are insufficient, center the full text instead.
+                    if content_width <= rect.right - rect.left - scale(8, dpi)
+                        && icon_size <= rect.bottom - rect.top
+                    {
+                        let left = rect.left + (rect.right - rect.left - content_width) / 2;
+                        let top = rect.top + (rect.bottom - rect.top - icon_size) / 2;
+                        let icon_rect = RECT {
+                            left,
+                            top,
+                            right: left + icon_size,
+                            bottom: top + icon_size,
+                        };
+                        if (*state).tabs.draw_icon(index, dc, &icon_rect, dpi, color) {
+                            text_rect.left = left + icon_size + gap;
+                            text_rect.right = text_rect.left + text_width;
+                        }
+                    }
+                    DrawTextW(
+                        dc,
+                        title.as_ptr(),
+                        -1,
+                        &mut text_rect,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                     );
                     if active {
                         let mut line = rect;

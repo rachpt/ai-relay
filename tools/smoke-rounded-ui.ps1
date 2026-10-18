@@ -2,7 +2,8 @@
 # 仅本脚本固定句柄的子进程；不构建、不联网、不启动代理、不保存设置。
 # 先运行：powershell.exe -NoProfile -File tools\smoke-rounded-ui.ps1 -ValidateOnly
 # 收到构建完成通知后再去掉 -ValidateOnly；不会执行其他 smoke 脚本的 body。
-# 高对比度移除 region 由 rounded/theme 的隔离测试负责；本脚本不切换系统设置。
+# Edit 使用可靠的原生矩形边框；仅按钮/闭合 Combo/日期框要求圆角 region。
+# 高对比度及旧 Edit 自有 region 清理由原生测试负责；本脚本不切换系统设置。
 [CmdletBinding()]
 param(
     [string]$ExePath,
@@ -114,6 +115,21 @@ public static class RoundedNative {
             if(!ok) throw new Exception("Local GDI region release failed");
         }
     }
+    public static string NativeEdit(IntPtr pinned,uint pid,IntPtr edit) {
+        Guard(pinned,pid,edit);
+        if(!String.Equals(ProxyUiSmoke.Class(edit),"Edit",StringComparison.OrdinalIgnoreCase))
+            throw new Exception("Expected a native Edit HWND");
+        IntPtr copy=CreateRectRgn(0,0,0,0);
+        if(copy==IntPtr.Zero) throw new Exception("Cannot allocate local Edit HRGN probe");
+        try {
+            Guard(pinned,pid,edit);
+            if(GetWindowRgn(edit,copy)!=0)
+                throw new Exception("Edit must retain its native rectangular border without a clipping region");
+            return "Native rectangular Edit; no window region";
+        } finally {
+            if(!DeleteObject(copy)) throw new Exception("Local Edit HRGN probe release failed");
+        }
+    }
     public static bool Caret(IntPtr pinned,uint pid,IntPtr edit) {
         Guard(pinned,pid,edit); uint actual;
         uint thread=GetWindowThreadProcessId(edit,out actual);
@@ -199,7 +215,8 @@ public static class RoundedNative {
     }
     public static CropProof Crop(string parentPath,StatusBarNative.Rect r,string path,string corners,uint dpi) {
         // Crop a physical parent-client screenshot: unlike a control-only PrintWindow,
-        // this includes the parent actually exposed by the clipped nonclient corners.
+        // this includes native rectangular Edit borders and the parent actually
+        // exposed by the other controls' clipped nonclient corners.
         using(var parent=new Bitmap(parentPath)) {
             if(r.Left<0 || r.Top<0 || r.Right>parent.Width || r.Bottom>parent.Height || r.Width<4 || r.Height<4)
                 throw new Exception("Control/corner evidence clipped by parent client: "+r);
@@ -354,11 +371,12 @@ function Edit-State([IntPtr]$Handle) {
     $password=($style -band 0x20) -ne 0
     $value=if ($password) { $null } else { [ClarityNative]::Text($Handle,[uint32]$ownedPid) }
     return [pscustomobject]@{
-        Handle=$Handle; Password=$password; Text=$value; NativeStyle=($style -band 0x0000FFFF)
+        Handle=$Handle; Password=$password; Text=$value; NativeStyle=($style -band 0x00FFFFFF)
         Length=[ModernNative]::Message($Handle,[uint32]$ownedPid,0xE,0,0)
         Selection=[ProxyUiSmoke]::Selection($Handle,[uint32]$ownedPid)
         Mask=[ModernNative]::Message($Handle,[uint32]$ownedPid,0xD2,0,0)
         Limit=[ModernNative]::Message($Handle,[uint32]$ownedPid,0xD5,0,0)
+        Margins=[ModernNative]::Message($Handle,[uint32]$ownedPid,0xD4,0,0)
     }
 }
 function Settings-State {
@@ -367,6 +385,7 @@ function Settings-State {
     foreach ($h in [ModernNative]::DirectChildren($window,[uint32]$ownedPid)) {
         $id=[ClarityNative]::GetDlgCtrlID($h)
         if ([ProxyUiSmoke]::Class($h) -eq 'Edit' -and ($id -eq 0 -or ($id -ge 2040 -and $id -le 2061))) {
+            [RoundedNative]::NativeEdit($childHandle,[uint32]$ownedPid,$h) | Out-Null
             $state=Edit-State $h
             # Private config contains no credentials. Do not bypass Windows password
             # read protection, log content, or claim nonempty-secret retention here.
@@ -380,19 +399,23 @@ function Settings-State {
 function Assert-Settings {
     foreach ($old in $settingsBaseline) {
         $now=Edit-State $old.Handle
-        foreach ($key in @('Password','Text','NativeStyle','Length','Selection','Mask','Limit')) {
+        [RoundedNative]::NativeEdit($childHandle,[uint32]$ownedPid,$old.Handle) | Out-Null
+        foreach ($key in @('Password','Text','NativeStyle','Length','Selection','Mask','Limit','Margins')) {
             if ($now.$key -cne $old.$key) { throw "Settings field changed during rounded presentation: $key" }
         }
     }
 }
 function Assert-Edit {
     $now=Edit-State (Control 2304)
-    foreach ($key in @('Text','NativeStyle','Length','Selection','Mask','Limit')) {
+    [RoundedNative]::NativeEdit($childHandle,[uint32]$ownedPid,$now.Handle) | Out-Null
+    foreach ($key in @('Text','NativeStyle','Length','Selection','Mask','Limit','Margins')) {
         if ($now.$key -cne $editBaseline.$key) { throw "History Edit text/selection/native semantics changed: $key" }
     }
 }
 function Regions([switch]$Log) {
-    foreach ($id in @(2320,2304,2310,2302)) {
+    $editProof=[RoundedNative]::NativeEdit($childHandle,[uint32]$ownedPid,(Control 2304))
+    if ($Log) { Record '2304 native rectangular Edit without clipping region' $editProof }
+    foreach ($id in @(2320,2310,2302)) {
         $proof=[RoundedNative]::Region($childHandle,[uint32]$ownedPid,(Control $id))
         if ($Log) { Record "region $id full-window/corners/middle/6-DIP" $proof }
     }
@@ -524,7 +547,7 @@ try {
     $large=Resize $false
     $small=Resize $true
     if ($large.Width -eq $small.Width -and $large.Height -eq $small.Height) { throw 'Monitor clamped both sizes; region resize acceptance not demonstrated' }
-    Record 'resized Edit full-window region in distinct physical sizes' @{ Large="$large"; Small="$small" }
+    Record 'resized native rectangular Edit without region in distinct physical sizes' @{ Large="$large"; Small="$small" }
     if (-not [DatePickerNative]::SetISO($childHandle,[uint32]$ownedPid,(Control 2302),'2024-02-29')) { throw 'Private date fixture rejected' }
     $dateText=Text 2302
 
@@ -680,11 +703,11 @@ try {
         Passed=($null -eq $failure -and $cleanupErrors.Count -eq 0); Exe=$exe; PID=$ownedPid; Failure=$detail
         CleanupErrors=@($cleanupErrors.ToArray()); Checks=@($checks.ToArray()); Screenshots=@($shots.ToArray()); GDI=@($gdiSamples.ToArray())
         Seconds=[Math]::Round($overall.Elapsed.TotalSeconds,2)
-        Limits='Only current physical monitor DPI; no multi-monitor/DPI matrix, physical keyboard/SendInput, screen reader or system high-contrast switch. High-contrast detach/region-removal tests are NOT run here. Targeted native key/character messages are not physical keyboard acceptance. Password settings are initially empty: mask/length/selection/style retention only, not proof for nonempty secrets. Corner crops are visual evidence, not automated pixel-perfect surface/caret rendering proof; local GDI region geometry is checked independently. Native focused date/month-calendar visual styles may remain light in dark mode. Empty private history only; no record-boundary membership/performance/load acceptance. No Cargo, mock, network requests, config Save, Startup/firewall changes, global input, other-instance IPC or kill.'
+        Limits='Only current physical monitor DPI; no multi-monitor/DPI matrix, physical keyboard/SendInput, screen reader or system high-contrast switch. High-contrast detach/region-removal tests are NOT run here. Targeted native key/character messages are not physical keyboard acceptance. Password settings are initially empty: mask/length/selection/style retention only, not proof for nonempty secrets. Corner crops are visual evidence, not automated pixel-perfect border/surface/caret rendering proof; Edit is checked for NO window region, while button/combo/date GDI rounded region geometry is checked independently. Legacy module-owned Edit detach, IME and accessibility acceptance are NOT exercised by this script. Native focused date/month-calendar visual styles may remain light in dark mode. Empty private history only; no record-boundary membership/performance/load acceptance. No Cargo, mock, network requests, config Save, Startup/firewall changes, global input, other-instance IPC or kill.'
     }
     [IO.File]::WriteAllText((Join-Path $output 'results.json'),($report | ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($true))
     Write-Output "Rounded UI artifacts: $output"
 }
 if ($null -ne $failure) { throw $failure }
 if ($cleanupErrors.Count -gt 0) { throw ($cleanupErrors -join '; ') }
-Write-Output 'PASS: 6-DIP rounded native regions/full-window resize, Edit text/selection/caret, unchanged empty masked settings, native combo/calendar popup, observed real pending/completion with zero records, disabled buttons, light/dark physical corner/overview/history evidence, 100 bounded GDI theme+resize cycles and byte-identical config.'
+Write-Output 'PASS: native rectangular Edits without clipping regions, 6-DIP rounded button/combo/date regions and resize, Edit text/margins/selection/caret, unchanged empty masked settings, native combo/calendar popup, observed real pending/completion with zero records, disabled buttons, light/dark physical corner/overview/history evidence, 100 bounded GDI theme+resize cycles and byte-identical config.'

@@ -3,7 +3,7 @@
 use super::*;
 use windows_sys::Win32::{Graphics::Gdi::*, UI::Controls::*};
 
-const HEIGHT: i32 = 56;
+pub(super) const HEIGHT: i32 = 40;
 // Public winuser.h STATIC style, not exposed by the enabled windows-sys features.
 const SS_NOTIFY: isize = 0x0100;
 const SUBCLASS_ID: usize = 0x5354;
@@ -229,6 +229,92 @@ unsafe extern "system" fn procedure(
     }
 }
 
+unsafe fn status_icon(
+    dc: HDC,
+    left: i32,
+    top: i32,
+    size: i32,
+    kind: StatusKind,
+    ink: u32,
+    surface: u32,
+) {
+    // SAFETY: The caller's saved DC owns all state. Only stock GDI objects are
+    // selected; they are restored before returning and never deleted.
+    unsafe {
+        let brush = GetStockObject(DC_BRUSH);
+        let pen = GetStockObject(DC_PEN);
+        let no_pen = GetStockObject(NULL_PEN);
+        if brush.is_null() || pen.is_null() || no_pen.is_null() {
+            return;
+        }
+        let old_brush = SelectObject(dc, brush);
+        let old_pen = SelectObject(dc, pen);
+        SetDCBrushColor(dc, surface);
+        SetDCPenColor(dc, ink);
+        Ellipse(dc, left, top, left + size, top + size);
+        SetDCBrushColor(dc, ink);
+        SetDCPenColor(dc, ink);
+        SelectObject(dc, no_pen);
+        match kind {
+            StatusKind::Running => {
+                let points = [
+                    POINT {
+                        x: left + size * 36 / 100,
+                        y: top + size * 28 / 100,
+                    },
+                    POINT {
+                        x: left + size * 36 / 100,
+                        y: top + size * 72 / 100,
+                    },
+                    POINT {
+                        x: left + size * 72 / 100,
+                        y: top + size * 50 / 100,
+                    },
+                ];
+                Polygon(dc, points.as_ptr(), points.len() as i32);
+            }
+            StatusKind::Stopped => {
+                let inset = size / 4;
+                Rectangle(
+                    dc,
+                    left + inset,
+                    top + inset,
+                    left + size - inset,
+                    top + size - inset,
+                );
+            }
+            StatusKind::Busy => {
+                let radius = (size / 8).max(1);
+                let cy = top + size / 2;
+                for offset in [-size / 4, 0, size / 4] {
+                    let cx = left + size / 2 + offset;
+                    Ellipse(dc, cx - radius, cy - radius, cx + radius, cy + radius);
+                }
+            }
+            StatusKind::Error => {
+                let bar = (size / 8).max(1);
+                let cx = left + size / 2;
+                Rectangle(
+                    dc,
+                    cx - bar / 2,
+                    top + size / 4,
+                    cx + bar - bar / 2,
+                    top + size * 62 / 100,
+                );
+                Ellipse(
+                    dc,
+                    cx - bar / 2,
+                    top + size * 72 / 100,
+                    cx + bar - bar / 2,
+                    top + size * 72 / 100 + bar,
+                );
+            }
+        }
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+    }
+}
+
 unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
     // SAFETY: live paint DC/native control and UI-owned fonts/State. SaveDC must
     // succeed before changing DC state; stock brush is borrowed, never deleted.
@@ -263,6 +349,8 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
         let text = settings::text(hwnd);
         let (status, message) = lines(&text);
         let padding = scale(12, dpi);
+        let icon_size = scale(16, dpi);
+        let icon_top = rect.top + ((rect.bottom - rect.top - icon_size) / 2).max(0);
         // COLORREF is BGR; text shades also remain legible on each theme's surface.
         let ink = if contrast {
             palette.text
@@ -277,42 +365,80 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
                 (StatusKind::Stopped, _) => palette.disabled,
             }
         };
-        if !brush.is_null() {
-            SelectObject(dc, brush);
-            SelectObject(dc, GetStockObject(NULL_PEN));
-            SetDCBrushColor(dc, ink);
-            Ellipse(
-                dc,
-                padding,
-                scale(13, dpi),
-                padding + scale(8, dpi),
-                scale(21, dpi),
-            );
+        status_icon(
+            dc,
+            padding,
+            icon_top,
+            icon_size,
+            status_kind(status),
+            ink,
+            background,
+        );
+        let text_left = padding + icon_size + scale(8, dpi);
+        let text_right = (rect.right - padding).max(text_left);
+        if text_right <= text_left {
+            RestoreDC(dc, saved);
+            return;
         }
         let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+        let mut measured = RECT {
+            left: 0,
+            top: 0,
+            right: text_right - text_left,
+            bottom: rect.bottom - rect.top,
+        };
+        DrawTextW(
+            dc,
+            wide(status).as_ptr(),
+            -1,
+            &mut measured,
+            DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let status_limit = if message.is_empty() {
+            text_right - text_left
+        } else {
+            ((text_right - text_left) * 3 / 5).max(1)
+        };
+        let status_width = (measured.right - measured.left).clamp(0, status_limit);
         let mut top = RECT {
-            left: padding + scale(16, dpi),
-            top: scale(6, dpi),
-            right: (rect.right - padding).max(padding),
-            bottom: scale(28, dpi),
+            left: text_left,
+            right: text_left + status_width,
+            top: rect.top,
+            bottom: rect.bottom,
         };
         SetTextColor(dc, ink);
         DrawTextW(dc, wide(status).as_ptr(), -1, &mut top, flags);
-        let mut bottom = RECT {
-            left: padding,
-            top: scale(28, dpi),
-            bottom: rect.bottom - scale(5, dpi),
-            ..top
-        };
-        SetTextColor(
-            dc,
-            if contrast {
-                palette.text
-            } else {
-                palette.disabled
-            },
-        );
-        DrawTextW(dc, wide(&message).as_ptr(), -1, &mut bottom, flags);
+        if !message.is_empty() {
+            let separator = text_left + status_width + scale(8, dpi);
+            let message_left = separator + scale(9, dpi);
+            if message_left < text_right {
+                if !brush.is_null() {
+                    let line = RECT {
+                        left: separator,
+                        right: separator + scale(1, dpi),
+                        top: rect.top + scale(10, dpi),
+                        bottom: rect.bottom - scale(10, dpi),
+                    };
+                    SetDCBrushColor(dc, palette.border);
+                    FillRect(dc, &line, brush);
+                }
+                let mut detail = RECT {
+                    left: message_left,
+                    right: text_right,
+                    top: rect.top,
+                    bottom: rect.bottom,
+                };
+                SetTextColor(
+                    dc,
+                    if contrast {
+                        palette.text
+                    } else {
+                        palette.disabled
+                    },
+                );
+                DrawTextW(dc, wide(&message).as_ptr(), -1, &mut detail, flags);
+            }
+        }
         RestoreDC(dc, saved);
     }
 }
@@ -389,8 +515,9 @@ mod tests {
             assert_eq!(rect.right, scale(800, dpi));
             assert_eq!(rect.bottom, scale(820, dpi));
             assert_eq!(rect.bottom - rect.top, scale(HEIGHT, dpi));
-            // Existing pages reserve at least 84 DIP for their footer.
-            assert!(rect.top > scale(820 - 84, dpi));
+            assert_eq!(rect.top, scale(820 - HEIGHT, dpi));
+            // Page bodies reserve at least this one-line footer plus their own padding.
+            assert!(rect.top > scale(820 - 92, dpi));
             assert_eq!(bounds(0, 0, dpi).top, 0);
             assert_eq!(bounds(20, 10, dpi).top, 0);
         }
