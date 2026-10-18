@@ -1,4 +1,4 @@
-# AI Relay Windows x64 便携预览
+# AI Relay 2026.10.18 Windows x64 便携预览
 
 当前为开发预览，不是完成全部验收的正式发行版。
 
@@ -26,6 +26,10 @@
 ## 命令行
 
 `start`、`restart`、`status`、`stop`、`show`、`quit`；支持 `--background` 和 `--config-dir <绝对目录>`。退出码0成功、1未运行/监听、2参数配置错误、3操作失败。
+
+## 许可证
+
+AI Relay 采用 MIT 许可证，Copyright (c) 2026 rachpt。完整条款见随包 `LICENSE`，复制或分发全部或重要部分时须保留该声明。第三方组件的许可条款独立适用，随包 `THIRD-PARTY-NOTICES.txt` 收集当前Windows构建依赖的原始许可/版权文本；其保守清单也包含构建期依赖，不代表全部链接入EXE。项目MIT不替代第三方及工具链许可审核。
 
 ## 限制
 

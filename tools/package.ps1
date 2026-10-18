@@ -7,7 +7,12 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$license = Join-Path $root 'LICENSE'
+if (-not [IO.File]::Exists($license)) { throw 'Missing project LICENSE; refusing to package.' }
+$notices = Join-Path $root 'THIRD-PARTY-NOTICES.txt'
+if (-not [IO.File]::Exists($notices)) { throw 'Missing THIRD-PARTY-NOTICES.txt; refusing to package.' }
 $cargo = (Get-Command $CargoPath -ErrorAction Stop).Source
 $oldFlags = [Environment]::GetEnvironmentVariable('RUSTFLAGS', 'Process')
 $oldEncoded = [Environment]::GetEnvironmentVariable('CARGO_ENCODED_RUSTFLAGS', 'Process')
@@ -47,7 +52,15 @@ function Imports([string]$Path) {
 }
 Push-Location $root
 try {
-    $env:RUSTFLAGS = (($oldFlags + ' -C target-feature=+crt-static').Trim())
+    # Encoded arguments preserve spaces in resolved home/project paths. Remapping
+    # affects embedded compiler paths only, never runtime configuration discovery.
+    $flags = @()
+    if ($oldFlags) { $flags += @($oldFlags -split '\s+' | Where-Object { $_ }) }
+    $flags += @('-C', 'target-feature=+crt-static')
+    $homePath = [Environment]::GetFolderPath('UserProfile')
+    if ($homePath) { $flags += ('--remap-path-prefix=' + $homePath + '=/build/user') }
+    $flags += ('--remap-path-prefix=' + $root + '=/build/ai-relay')
+    $env:CARGO_ENCODED_RUSTFLAGS = [string]::Join([char]31, [string[]]$flags)
     & $cargo build --release --locked --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'Portable build failed.' }
     $exe = Join-Path $root 'target\x86_64-pc-windows-msvc\release\ai-relay.exe'
@@ -61,12 +74,14 @@ try {
     [void][IO.Directory]::CreateDirectory($stage)
     Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'ai-relay.exe')
     Copy-Item -LiteralPath (Join-Path $root 'docs\PORTABLE.md') -Destination (Join-Path $stage 'README.md')
+    Copy-Item -LiteralPath $license -Destination (Join-Path $stage 'LICENSE')
+    Copy-Item -LiteralPath $notices -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.txt')
     [IO.File]::WriteAllLines((Join-Path $stage 'IMPORTS.txt'),$imports,[Text.Encoding]::UTF8)
     $dist = Join-Path $root 'dist'
     [void][IO.Directory]::CreateDirectory($dist)
     $zip = Join-Path $dist ($name + '.zip')
     if ([IO.File]::Exists($zip)) { throw ('Package already exists; refusing to overwrite: ' + $zip) }
-    Compress-Archive -LiteralPath @((Join-Path $stage 'ai-relay.exe'),(Join-Path $stage 'README.md'),(Join-Path $stage 'IMPORTS.txt')) -DestinationPath $zip
+    Compress-Archive -LiteralPath @((Join-Path $stage 'ai-relay.exe'),(Join-Path $stage 'README.md'),(Join-Path $stage 'IMPORTS.txt'),(Join-Path $stage 'LICENSE'),(Join-Path $stage 'THIRD-PARTY-NOTICES.txt')) -DestinationPath $zip
     Write-Output ('Preview ZIP: ' + $zip)
     Write-Output ('EXE bytes: ' + (Get-Item -LiteralPath $exe).Length)
     Write-Output ('SHA256: ' + (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash)

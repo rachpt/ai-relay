@@ -61,7 +61,7 @@ cargo build --release --target x86_64-pc-windows-msvc
 - 2026-10-18 用户为公开准备明确授权移除根目录旧参考 JS/CMD/PowerShell 和关联日志/PID；默认保护其他用户数据，保留原生版 `tools/` 脚本。
 - 旧实现含敏感部署配置；禁止恢复到公开仓库或把其密钥复制进测试、文档、示例。仓库外受限恢复备份不属于源码发布内容。
 - `.gitignore` 仅避免后续误加入部分本地数据，不会自动脱敏源码，也不能清除版本历史。
-- 旧脚本本来就在忽略列表，历史审计未发现这些路径。仍保留忽略规则，防止以后误加入。
+- 历史审计未发现旧参考脚本路径；文件及专用忽略条目已移除，仅保留配置、日志、PID和环境秘密等通用忽略规则。
 
 ### 公开前的历史检查
 
@@ -77,7 +77,20 @@ detect-secrets scan --no-verify
 - 检查全部 refs、旧提交对象和 reflog，清理可恢复的旧身份/敏感对象时先做仓库外受限备份；备份及 filter-repo 审计映射都不发布。
 - 全部 author/committer 应为 `rachpt <rachpt@126.com>`；本地 user.name/email 设为同一身份，不改全局配置。历史重写使哈希变化；任何旧克隆或外部副本仍独立存在，不由本地清理撤回。
 - 发布前再扫描新提交并启用 GitHub secret scanning/push protection（适用时）；本项目目前没有自动秘密扫描 CI，不把一次检查当作长期保证。
-- 尚无 LICENSE：由维护者选择后添加完整许可证、Cargo license元数据，审查依赖的第三方声明，并更新打包白名单。不要把“可以公开仓库”误写成“已完成开源许可/正式发行审核”。
+- 项目按用户选择采用MIT，根目录LICENSE及Cargo `license = "MIT"` 一致。发布脚本在构建前检查LICENSE存在，将原文加入ZIP白名单；不得据此声称第三方依赖声明/许可证或正式发行审核已完成。第三方notices已从当前Windows目标锁定依赖的原始许可/版权文本收集，包含构建期依赖的保守清单并加入发行包；完整法律及SDK/CRT/工具链许可审核仍需单独完成。
+
+### 日期版本与第三方声明
+
+当前版本为 `2026.10.18`，对应标签 `v2026.10.18`；日期号不改变开发预览的验收状态。修改Cargo版本后由Cargo自然更新应用锁文件，不手工编造锁文件。
+
+```text
+python tools/generate-third-party-notices.py --cargo <Cargo绝对路径>
+python tools/generate-third-party-notices.py --cargo <Cargo绝对路径> --check
+```
+
+生成器只在开发机运行，用Python标准库及离线锁定Cargo metadata读取本地registry源码，按Windows normal/build依赖闭包收集原始许可和署名，未知/缺失许可失败，不下载或编造法律文本。输出不含本机路径；manifest/lock快照SHA按UTF-8去BOM、LF规范化，跨Git换行设置可复核。Cargo依赖变化后必须重新生成并审查。
+
+发布脚本检查LICENSE与THIRD-PARTY-NOTICES存在，ZIP白名单仅含EXE、README、IMPORTS、LICENSE和第三方声明。静态CRT编译通过编码的RUSTFLAGS传入当前home/项目路径映射，避免编译器路径泄露本机目录；不会改变运行时数据目录定位。禁用非交互进度条以兼容编辑器终端。实际Release验证须针对解压后的二进制；物理截图被其他窗口遮挡时标为跳过，不能用offscreen绘制冒充实际屏幕无残影。
 
 ## 开发记录
 

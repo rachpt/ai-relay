@@ -15,15 +15,34 @@
 /.ai-relay-migration-*/
 /.ai-relay-*.tmp
 
-# Retired legacy files may contain deployment credentials; never reintroduce them.
-/ai-proxy.js
-/allow-firewall.cmd
-/install-shortcut.ps1
-/proxy.cmd
-/start-proxy.cmd
+# Local logs, process state, and environment secrets.
 *.log
 *.pid
 .env
 .env.*
+
+# macOS filesystem metadata and Finder files.
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+__MACOSX/
+
+# Windows Explorer metadata and recycle bin.
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Editor swap files and temporary backups.
+*.swp
+*.swo
+*~
+*.orig
 
 # Keep Cargo.lock tracked for this application.

@@ -24,6 +24,8 @@
 
 - [0011：公开准备与历史卫生](0011-publication-history-hygiene.md)
 
+- [0012：采用MIT项目许可证](0012-mit-license.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

@@ -1,7 +1,8 @@
 [package]
 name = "ai-relay"
-version = "0.1.0"
+version = "2026.10.18"
 edition = "2024"
+license = "MIT"
 publish = false
 description = "AI Relay: Windows-native AI provider traffic proxy with a Win32 GUI"
 

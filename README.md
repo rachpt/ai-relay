@@ -7,8 +7,9 @@ Windows 原生 AI Provider 流量转发工具，**Rust + Win32**，支持托盘�
 ## 运行
 
 - 开发构建：`cargo run`。
-- Release：`target/release/ai-relay.exe`。
-- 静态 CRT 便携预览包：`dist/ai-relay-0.1.0-windows-x64-preview.zip`（构建后生成）。
+- 日期版本：`2026.10.18`，Git 标签 `v2026.10.18`；同日后续构建可用发布脚本的 `-BuildLabel` 区分。
+- Release：`target/release/ai-relay.exe`；静态 CRT 打包使用 `target/x86_64-pc-windows-msvc/release/ai-relay.exe`。
+- 静态 CRT 便携预览包：`dist/ai-relay-2026.10.18-windows-x64-preview.zip`（构建后生成）。
 - 普通双击不创建控制台；关闭主窗口隐藏至托盘，双击托盘恢复。再次启动唤醒同一用户会话的原实例。
 - 客户端顶部左侧 **☰** 打开“文件／代理／视图／帮助”；支持 F10、Alt+M，Alt+Space 保留系统菜单。文件菜单可打开数据目录、导入/导出配置及退出，代理菜单沿用原有启停规则；弹出菜单使用系统样式，不额外占一行高度。
 - 默认窗口800×680 DIP，最小800×560 DIP（受显示器工作区限制）；顶部导航和底部状态栏固定，页面内容可滚动，各页独立保留位置。Tab聚焦到屏外控件时自动滚动揭示，不丢未保存输入。
@@ -118,8 +119,12 @@ Windows PowerShell 冒烟使用临时目录、本地mock和虚构凭据，不产
 
 - 全部历史提交作者/提交者统一为 `rachpt <rachpt@126.com>`；本地身份配置一致。历史重写改变提交哈希，旧克隆不要合并回新历史。
 - 旧参考脚本、真实配置/密钥、日志、PID、`target/` 与 `dist/` 不纳入源码发布；`.gitignore` 不等于历史清洗。扫描方法和边界见 [开发指南](docs/DEVELOPMENT.md#公开前的历史检查)。
-- **项目许可证尚未选择**：公开可见不等于授予开源许可。公开前需维护者确定 LICENSE、对应 Cargo 元数据并核对第三方许可证/发行包 notices；本次没有擅自选择许可证，也没有推送远端。
+- 项目采用 [MIT 许可证](LICENSE)，Cargo 元数据与发布脚本已同步；[第三方声明](THIRD-PARTY-NOTICES.txt) 收集当前 Windows 构建依赖的原始许可/版权文本并随包附带，不因项目使用 MIT 而改变其条款，也不代替完整法律/工具链许可审核。
 - 历史扫描无法证明绝对无泄露。旧部署使用过的 Key 建议轮换；不要把仓库外恢复备份、旧克隆或未审查的预览产物上传到 GitHub。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)，Copyright (c) 2026 rachpt。复制或分发软件的全部或重要部分时，须保留版权及许可声明；软件按原样提供，不作担保。第三方组件仍遵循各自许可证，见 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)。维护依赖后通过 `python tools/generate-third-party-notices.py --cargo <Cargo绝对路径> --check` 复核，未安装开发工具的最终用户无需执行。
 
 ## 文档
 

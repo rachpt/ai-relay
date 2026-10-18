@@ -1,0 +1,2 @@
+# Preserve upstream legal-text spacing; normalize only line endings.
+/THIRD-PARTY-NOTICES.txt text eol=lf whitespace=-blank-at-eol
