@@ -18,7 +18,15 @@ public static class LogsUiRegression {
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc callback, IntPtr parameter);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
-    [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
+    [DllImport("user32.dll", EntryPoint="GetDlgItem")] static extern IntPtr NativeGetDlgItem(IntPtr hwnd, int id);
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr hwnd);
+    static IntPtr GetDlgItem(IntPtr parent, int id) {
+        var found=NativeGetDlgItem(parent,id);
+        if(found!=IntPtr.Zero) return found;
+        EnumChildWindows(parent,delegate(IntPtr h, IntPtr p) { if(GetDlgCtrlID(h)==id) { found=h; return false; } return true; },IntPtr.Zero);
+        return found;
+    }
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int length);
     static string Class(IntPtr hwnd) { var b=new StringBuilder(256); GetClassNameW(hwnd,b,b.Capacity); return b.ToString(); }
     static void CheckOwner(IntPtr hwnd, uint pid) {
@@ -32,6 +40,13 @@ public static class LogsUiRegression {
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint msg, UIntPtr wp, StringBuilder lp, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint msg, UIntPtr wp, string lp, uint flags, uint timeout, out UIntPtr result);
+    public static bool SetTextRaw(IntPtr hwnd, uint pid, string text) {
+        CheckOwner(hwnd,pid); UIntPtr result;
+        if(SendMessageTimeoutW(hwnd,12,UIntPtr.Zero,text,2,1000,out result)==IntPtr.Zero) throw new Exception("WM_SETTEXT timed out/failed");
+        return result!=UIntPtr.Zero;
+    }
     public static string Read(IntPtr hwnd, uint pid) {
         CheckOwner(hwnd,pid);
         var buffer = new StringBuilder(262145); UIntPtr result;
@@ -48,19 +63,22 @@ public static class LogsUiRegression {
     public static void CheckLayout(IntPtr window, uint pid) {
         CheckOwner(window,pid); Rect client;
         if(!GetClientRect(window,out client)) throw new Exception("Missing client bounds");
-        var screen=Bounds(window); // Compare child screen rectangles to each other.
+        var host=GetDlgItem(window,2400);
+        CheckOwner(host,pid);
+        var screen=Bounds(host); // Page children may extend vertically beyond the scroll viewport.
         uint dpi=GetDpiForWindow(window);
         var all=new System.Collections.Generic.List<IntPtr>();
-        EnumChildWindows(window, delegate(IntPtr h, IntPtr parameter) {
+        EnumChildWindows(host, delegate(IntPtr h, IntPtr parameter) {
             CheckOwner(h,pid);
             string kind=Class(h);
-            if(IsWindowVisible(h) && (kind.Equals("Edit",StringComparison.OrdinalIgnoreCase) || kind.Equals("Button",StringComparison.OrdinalIgnoreCase) || kind.Equals("Static",StringComparison.OrdinalIgnoreCase) || kind.Equals("ComboBox",StringComparison.OrdinalIgnoreCase))) all.Add(h);
+            if(GetParent(h)==host && IsWindowVisible(h) && (kind.Equals("Edit",StringComparison.OrdinalIgnoreCase) || kind.Equals("Button",StringComparison.OrdinalIgnoreCase) || kind.Equals("Static",StringComparison.OrdinalIgnoreCase) || kind.Equals("ComboBox",StringComparison.OrdinalIgnoreCase) || kind.Equals("SysDateTimePick32",StringComparison.OrdinalIgnoreCase))) all.Add(h);
             return true;
         },IntPtr.Zero);
-        // Main status is outside this page. Check all named log controls against it.
+        // Compare virtual page siblings, not the viewport container or fixed footer.
         for(int id=2200;id<=2229;id++) {
             var h=GetDlgItem(window,id);
             if(h==IntPtr.Zero || !IsWindowVisible(h)) continue;
+            if(GetParent(h)!=host) throw new Exception("Log control outside page viewport "+id);
             var r=Bounds(h);
             if(r.Right-r.Left<1 || r.Bottom-r.Top<1) throw new Exception("Empty log control "+id);
             if(r.Right>screen.Right || r.Left<screen.Left) throw new Exception("Clipped log control "+id);
@@ -138,9 +156,6 @@ public static class LogsUiRegression {
     Set-LogFilter 2207 'runtime'
     Wait-Until 'live UTC date and Runtime metadata AND search' { (LogText).Contains($runtimeLine) -and -not (LogStatus).Contains('筛选无效') }
     if ((LogText).Contains('Access')) { throw 'Runtime category included Access' }
-    Set-LogFilter 2224 ([string]$runtimeEpoch)
-    Set-LogFilter 2225 ([string]$runtimeEpoch)
-    Wait-Until 'live inclusive epoch endpoints' { (LogText).Contains($runtimeLine) }
     Set-LogFilter 2227 '2xx'
     Wait-Until 'runtime has no HTTP status' { (LogText).Length -eq 0 -and -not (LogStatus).Contains('筛选无效') }
     Reset-LogFilters
@@ -163,13 +178,14 @@ public static class LogsUiRegression {
     Wait-Until 'live access batch frozen' { (LogStatus).Contains('已暂停') }
     $accessLine = @((LogText) -split "`n" | Where-Object { $_ -match '^\d+ #\d+ Access .*status: Some\(200\)' })[0].Trim()
     $accessEpoch = [long]([regex]::Match($accessLine, '^(\d+) ').Groups[1].Value)
-    Set-LogFilter 2224 ([string]$accessEpoch)
-    Set-LogFilter 2225 ([string]$accessEpoch)
+    $accessDay = [DateTimeOffset]::FromUnixTimeSeconds($accessEpoch).UtcDateTime.ToString('yyyy-MM-dd')
+    Set-LogFilter 2224 $accessDay
+    Set-LogFilter 2225 $accessDay
     Select-LogFilter 2226 2
     Select-LogFilter 2208 3
     Set-LogFilter 2227 '200'
     Set-LogFilter 2207 'access'
-    Wait-Until 'live Access/time/exact-status/level/text AND' { (LogText).Contains($accessLine) -and -not (LogText).Contains('Runtime') -and -not (LogStatus).Contains('筛选无效') }
+    Wait-Until 'live Access/UTC-same-day/exact-status/level/text AND' { (LogText).Contains($accessLine) -and -not (LogText).Contains('Runtime') -and -not (LogStatus).Contains('筛选无效') }
     Set-LogFilter 2227 '2xx'
     Wait-Until 'live status class' { (LogText).Contains($accessLine) }
     $frozenLive = LogText
@@ -195,7 +211,7 @@ public static class LogsUiRegression {
     Set-LogFilter 2227 '200'
     Wait-Until 'paused filters still use frozen success entry' { (LogText).Contains($accessLine) }
     $validLive = LogText
-    Set-LogFilter 2224 ([string]($accessEpoch + 1))
+    Set-LogFilter 2224 ([DateTimeOffset]::FromUnixTimeSeconds($accessEpoch).UtcDateTime.AddDays(1).ToString('yyyy-MM-dd'))
     Wait-Until 'live inverted range visible' { (LogStatus).Contains('不得晚于') }
     if ((LogText) -cne $validLive) { throw 'Invalid live range changed display' }
     Reset-LogFilters
@@ -265,9 +281,9 @@ public static class LogsUiRegression {
     LogClick 2228
     Wait-Until 'all metadata conditions AND while paused' { (LogText).Contains('"sequence":3') -and @((LogText) -split "`n" | Where-Object { $_.Trim() }).Count -eq 1 }
     Assert-Sequences @(3)
-    Set-LogFilter 2224 '1704067202'
-    Set-LogFilter 2225 '1704067202'
-    Start-Sleep -Milliseconds 400
+    Set-LogFilter 2224 '2024-01-01'
+    Set-LogFilter 2225 '2024-01-01'
+    Wait-Until 'UTC same-day range retains metadata AND result' { (LogText).Contains('"sequence":3') -and -not (LogStatus).Contains('筛选无效') }
     Assert-Sequences @(3)
     Set-LogFilter 2207 'started'
     Wait-Until 'text is AND not OR' { (LogText).Length -eq 0 }
@@ -289,9 +305,19 @@ public static class LogsUiRegression {
         if ((LogText) -cne $validDisplay) { throw 'Invalid status silently changed display' }
     }
     Set-LogFilter 2227 '400-599'
-    Set-LogFilter 2224 '2023-02-29'
-    Wait-Until 'invalid date is visible' { (LogStatus).Contains('时间须为') }
-    if ((LogText) -cne $validDisplay) { throw 'Invalid date silently changed display' }
+    foreach ($id in @(2224,2225)) {
+        Set-LogFilter $id '2024-01-01'
+        Wait-Until 'valid UTC date filter applied before rejection checks' { (LogText).Contains('"sequence":3') -and -not (LogStatus).Contains('筛选无效') }
+        Assert-Sequences @(3)
+        $validDate = [ProxyUiSmoke]::ReadText((Button $id), [uint32]$child.Id)
+        $validDisplay = LogText
+        # Epoch remains covered by pure utc_bound tests; GUI pickers accept only ISO/empty.
+        foreach ($invalid in @('2023-02-29','2024-13-01','2024-1-1','1704067202')) {
+            if ([LogsUiRegression]::SetTextRaw((Button $id), [uint32]$child.Id, $invalid)) { throw "Date picker $id accepted invalid text: $invalid" }
+            if ([ProxyUiSmoke]::ReadText((Button $id), [uint32]$child.Id) -cne $validDate) { throw "Rejected date changed picker $id value" }
+            if ((LogText) -cne $validDisplay) { throw 'Rejected date changed display' }
+        }
+    }
     Set-LogFilter 2224 '2024-01-02'
     Set-LogFilter 2225 '2024-01-01'
     Wait-Until 'inverted UTC range is visible' { (LogStatus).Contains('不得晚于') }

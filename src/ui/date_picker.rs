@@ -24,6 +24,7 @@ const PROPERTY: &[u16] = &[
     65, 73, 82, 101, 108, 97, 121, 46, 68, 97, 116, 101, 80, 105, 99, 107, 101, 114, 46, 118, 49, 0,
 ]; // AIRelay.DatePicker.v1
 const SUBCLASS_ID: usize = 0x4454_5031;
+const REFRESH_POPUP: u32 = WM_APP + 60;
 type SubclassProc =
     Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
 #[link(name = "comctl32")]
@@ -317,15 +318,11 @@ unsafe fn popup_colors(hwnd: HWND) {
             .filter(|_| !high_contrast() && IsWindowEnabled(hwnd) != 0);
         let calendar = SendMessageW(hwnd, DTM_GETMONTHCAL, 0, 0) as HWND;
         if !calendar.is_null() {
-            let empty = [0u16];
-            let theme = if dark.is_some() {
-                empty.as_ptr()
-            } else {
-                null()
-            };
-            // Disable visual styles only for the dark popup so documented colors
-            // can take effect. Restore system styles in light/high contrast.
-            SetWindowTheme(calendar, theme, theme);
+            // Preserve native popup styles. Disabling them at dropdown time can
+            // break its DPI-dependent layout/painting on current Common Controls.
+            // Documented colors below are best effort; a system-colored calendar
+            // is preferable to clipped days or an unreliable selection surface.
+            SetWindowTheme(calendar, null(), null());
         }
         let colors = if let Some(a) = dark {
             [
@@ -367,9 +364,8 @@ unsafe fn popup_colors(hwnd: HWND) {
         };
         SendMessageW(hwnd, DTM_SETMCFONT, font, 1);
         if !calendar.is_null() {
-            // Switching the popup from visual styles to classic colors changes
-            // its minimum geometry. The picker sized it before DTN_DROPDOWN;
-            // recompute after both the theme and DPI-scaled font are installed.
+            // Recompute after the DPI-scaled font is installed so native day
+            // columns and the footer fit without inventing pixel dimensions.
             let mut minimum = RECT::default();
             let mut outer = RECT::default();
             let mut client = RECT::default();
@@ -418,6 +414,9 @@ pub(super) unsafe fn notify(l: LPARAM) -> bool {
             return false;
         }
         popup_colors(hwnd);
+        // The native picker can overwrite the popup size after the synchronous
+        // dropdown notification returns. Finalize sizing on the next UI turn.
+        PostMessageW(hwnd, REFRESH_POPUP, 0, 0);
         true
     }
 }
@@ -509,8 +508,7 @@ unsafe fn draw_closed(hwnd: HWND, dc: HDC, value: Appearance, label: &str) {
         }
         let p = value.palette;
         let date = current(hwnd);
-        fill(dc, &client, p.surface, false);
-        fill(dc, &client, p.border, true);
+        super::rounded::surface(dc, &client, value.dpi, p.background, p.surface, p.border);
         fill(dc, &info.rcCheck, p.disabled, true);
         SelectObject(dc, GetStockObject(DC_PEN));
         if date.is_some() {
@@ -607,6 +605,10 @@ unsafe extern "system" fn procedure(
     // No reference to it survives native calls, which may reenter or destroy it.
     unsafe {
         match message {
+            REFRESH_POPUP => {
+                popup_colors(hwnd);
+                return 0;
+            }
             WM_NCDESTROY => {
                 RemoveWindowSubclass(hwnd, Some(procedure), id);
                 RemovePropW(hwnd, PROPERTY.as_ptr());

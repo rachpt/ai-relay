@@ -14,6 +14,8 @@ const EM_GETFIRSTVISIBLELINE: u32 = 0x00ce;
 #[link(name = "user32")]
 unsafe extern "system" {
     pub(super) fn EnableWindow(hwnd: HWND, enable: i32) -> i32;
+    #[link_name = "IsWindowEnabled"]
+    pub(super) fn is_enabled(hwnd: HWND) -> i32;
 }
 
 const SAVE: u32 = 2001;
@@ -131,11 +133,11 @@ pub(super) fn text(hwnd: HWND) -> String {
     }
 }
 fn select(hwnd: HWND, index: usize) {
-    // SAFETY: Live COMBOBOX and valid item index, no pointer arguments.
+    // SAFETY: Live COMBOBOX or fixed Choices control and valid item index; no pointers.
     unsafe { SendMessageW(hwnd, CB_SETCURSEL, index, 0) };
 }
 pub(super) fn selected(hwnd: HWND) -> usize {
-    // SAFETY: Live COMBOBOX, no pointer arguments.
+    // SAFETY: Live COMBOBOX or fixed Choices control; no pointer arguments.
     unsafe { SendMessageW(hwnd, CB_GETCURSEL, 0, 0).max(0) as usize }
 }
 pub(super) fn confirm(hwnd: HWND, message: &str) -> bool {
@@ -358,7 +360,7 @@ impl Settings {
             "登录 Windows 后自动启动（当前用户，非系统服务）",
             WS_TABSTOP | BS_AUTOCHECKBOX as u32,
             LOGIN,
-            (24, 646, 550, 28),
+            (24, 646, 540, 28),
         )?;
         self.login_status = self.control(
             hwnd,
@@ -370,7 +372,7 @@ impl Settings {
             (24, 680, 706, 28),
         )?;
         for (caption, id, x, y, w) in [
-            ("查询实际状态", LOGIN_QUERY, 576, 646, 148),
+            ("查询实际状态", LOGIN_QUERY, 576, 646, 144),
             ("回滚上次应用…", ROLLBACK, 24, 718, 164),
             ("导出脱敏配置…", EXPORT, 200, 718, 164),
             ("导入配置…", IMPORT, 376, 718, 164),
@@ -469,7 +471,23 @@ impl Settings {
             );
         }
     }
+    fn actions_y(&self) -> i32 {
+        let category = selected(self.category);
+        self.controls
+            .iter()
+            .filter(|(control, ..)| {
+                self.groups
+                    .iter()
+                    .any(|(handle, group)| handle == control && *group == category)
+            })
+            // Combo rows reserve dropdown space, not the closed control's height.
+            .map(|&(_, _, y, _, h)| y + if h == 180 { 30 } else { h })
+            .max()
+            .unwrap_or(142)
+            + 24
+    }
     pub fn layout(&self, dpi: u32, width: i32, height: i32) {
+        let actions_y = self.actions_y();
         for &(control, x, y, w, h) in &self.controls {
             if control == self.usage {
                 // SAFETY: Live EDIT, kept intact across page switches.
@@ -479,13 +497,20 @@ impl Settings {
                         scale(24, dpi),
                         scale(110, dpi),
                         width,
-                        (height - scale(176, dpi)).max(scale(120, dpi)),
+                        (height - scale(194, dpi)).max(scale(120, dpi)),
                         1,
                     );
                 }
                 continue;
             }
-            let w = if w == 550 || w == 706 {
+            // SAFETY: Owned live child; querying its ID neither dispatches nor mutates state.
+            let id = unsafe { GetDlgCtrlID(control) as u32 };
+            let y = if matches!(id, SAVE | START | STOP | LOAD) {
+                actions_y
+            } else {
+                y
+            };
+            let w = if control == self.port || w == 550 || w == 706 {
                 (width - scale(x - 24, dpi)).max(1)
             } else {
                 scale(w, dpi)
@@ -507,7 +532,7 @@ impl Settings {
         for &(control, ..) in &self.controls {
             // SAFETY: Font remains owned by parent State until replaced/destroyed.
             unsafe {
-                SendMessageW(control, WM_SETFONT, font as usize, 1);
+                SendMessageW(control, WM_SETFONT, font as usize, 0);
             }
         }
     }
@@ -633,33 +658,19 @@ impl Settings {
                 self.groups.push((control, category));
             }
         }
-        self.category = self.control(
+        self.category = choices::create(
             hwnd,
-            instance,
-            "COMBOBOX",
-            "",
-            WS_TABSTOP | CBS_DROPDOWNLIST as u32,
             CATEGORY,
-            (180, 108, 550, 220),
+            &[
+                "上游监听",
+                "访问控制",
+                "代理CORS",
+                "网络上限",
+                "启动存储",
+                "外观日志",
+            ],
         )?;
-        for caption in [
-            "上游与监听",
-            "访问控制",
-            "代理模式与 CORS",
-            "网络与资源上限",
-            "启动、存储与配置文件",
-            "外观与日志",
-        ] {
-            // SAFETY: Native combo copies each terminated string synchronously.
-            unsafe {
-                SendMessageW(
-                    self.category,
-                    CB_ADDSTRING,
-                    0,
-                    wide(caption).as_ptr() as isize,
-                );
-            }
-        }
+        self.controls.push((self.category, 24, 108, 706, 34));
         select(self.category, 0);
         for row in &mut self.controls {
             if row.0 == self.category || row.0 == self.usage {
@@ -692,10 +703,6 @@ impl Settings {
                 .any(|(h, group)| *h == row.0 && *group == 5)
             {
                 row.2 -= 380;
-            }
-            // Common actions stay below all category content.
-            if row.2 == 486 {
-                row.2 = 700;
             }
         }
         for (group, fields) in [
@@ -821,7 +828,8 @@ impl Settings {
                 "正向代理与 CONNECT 默认关闭。关闭改写时不向非可信目标注入上游 Key；CONNECT 不解密 TLS、不注入 Key。CORS 请限制 Origin，不能同时使用 * 和凭据许可。",
             ),
         ] {
-            let note = self.control(hwnd, instance, "STATIC", caption, 0, 0, (24, 548, 706, 84))?;
+            let y = if group == 1 { 324 } else { 548 };
+            let note = self.control(hwnd, instance, "STATIC", caption, 0, 0, (24, y, 706, 84))?;
             self.groups.push((note, group));
         }
         let note = self.control(
@@ -965,6 +973,7 @@ pub(super) unsafe fn handle_command(hwnd: HWND, state: *mut State, id: u32) {
         if id == CATEGORY {
             let page = (*state).settings.page;
             (*state).settings.show_page(page);
+            (*state).layout(hwnd);
             return;
         }
         if id == THEME {
@@ -1517,6 +1526,267 @@ pub(super) unsafe fn poll(hwnd: HWND, state: *mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::{
+        Graphics::Gdi::ClientToScreen,
+        System::LibraryLoader::GetModuleHandleW,
+        UI::Controls::{TCM_GETITEMCOUNT, TCM_GETITEMRECT},
+    };
+
+    struct NativeSettings {
+        parent: HWND,
+        settings: Settings,
+    }
+    impl NativeSettings {
+        fn new() -> Self {
+            static REGISTER: std::sync::Once = std::sync::Once::new();
+            // SAFETY: This test creates/destroys its own hidden windows on this thread.
+            // The process-lifetime class has no state; its procedure only routes Choices.
+            unsafe {
+                let instance = GetModuleHandleW(null());
+                let class = windows_sys::w!("AIRelay.Settings.Tests");
+                REGISTER.call_once(|| {
+                    let class = WNDCLASSW {
+                        lpfnWndProc: Some(settings_test_proc),
+                        hInstance: instance,
+                        lpszClassName: class,
+                        ..Default::default()
+                    };
+                    assert_ne!(RegisterClassW(&class), 0);
+                });
+                let parent = CreateWindowExW(
+                    0,
+                    class,
+                    null(),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    1600,
+                    1800,
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!parent.is_null());
+                let mut native = Self {
+                    parent,
+                    settings: Settings::default(),
+                };
+                native.settings.create(parent, instance).unwrap();
+                native.settings.populate(Config::default());
+                native.settings.busy = false;
+                native.settings.enable();
+                native.settings.show_page(3);
+                native
+            }
+        }
+    }
+    impl Drop for NativeSettings {
+        fn drop(&mut self) {
+            // SAFETY: Parent and all children belong to this test's creating thread.
+            unsafe { DestroyWindow(self.parent) };
+        }
+    }
+    unsafe extern "system" fn settings_test_proc(
+        hwnd: HWND,
+        message: u32,
+        w: WPARAM,
+        l: LPARAM,
+    ) -> LRESULT {
+        // SAFETY: The window manager supplies the live notification for this call.
+        unsafe {
+            if message == WM_NOTIFY && choices::notify(l) {
+                return 0;
+            }
+            DefWindowProcW(hwnd, message, w, l)
+        }
+    }
+    fn native_rect(control: HWND) -> RECT {
+        let mut rect = RECT::default();
+        // SAFETY: The test owns this live child and provides a writable rectangle.
+        assert_ne!(unsafe { GetWindowRect(control, &mut rect) }, 0);
+        rect
+    }
+    fn visible(control: HWND) -> bool {
+        // Parent stays hidden to avoid affecting the desktop; inspect the child's own style.
+        // SAFETY: The test owns this live child on the current thread.
+        unsafe { GetWindowLongPtrW(control, GWL_STYLE) as u32 & WS_VISIBLE != 0 }
+    }
+
+    #[test]
+    fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
+        let mut native = NativeSettings::new();
+        let settings = &mut native.settings;
+        set_text(settings.url, "https://draft.invalid/v1");
+        let token = settings
+            .fields
+            .iter()
+            .find(|(_, _, field)| *field == "client_token")
+            .unwrap()
+            .0;
+        set_text(token, "synthetic-unsaved-client-token");
+        select(settings.theme, 2);
+        let appearance = theme::Theme::new(ThemeMode::Light).unwrap();
+        // SAFETY: All controls/rectangles belong to this test thread; no State or modal calls.
+        unsafe {
+            for dpi in [96, 144, 192] {
+                choices::apply(settings.category, appearance.kind, appearance.palette, dpi);
+                choices::apply(settings.theme, appearance.kind, appearance.palette, dpi);
+                for content_width in [696, 952] {
+                    for category in 0..6 {
+                        select(settings.category, category);
+                        settings.show_page(3);
+                        settings.layout(dpi, scale(content_width, dpi), scale(820, dpi));
+                        let actions_y = settings.actions_y();
+                        assert_eq!(actions_y, [342, 432, 656, 480, 610, 552][category]);
+
+                        let mut origin = windows_sys::Win32::Foundation::POINT::default();
+                        assert_ne!(ClientToScreen(native.parent, &mut origin), 0);
+                        let category_rect = native_rect(settings.category);
+                        assert_eq!(category_rect.left - origin.x, scale(24, dpi));
+                        assert_eq!(category_rect.top - origin.y, scale(60, dpi));
+                        assert_eq!(
+                            category_rect.right - category_rect.left,
+                            scale(content_width, dpi)
+                        );
+                        assert_eq!(category_rect.bottom - category_rect.top, scale(34, dpi));
+                        let controls: Vec<_> = settings
+                            .controls
+                            .iter()
+                            .filter(|(control, ..)| visible(*control))
+                            .map(|&(control, ..)| (control, native_rect(control)))
+                            .collect();
+                        for (index, &(control, rect)) in controls.iter().enumerate() {
+                            let id = GetDlgCtrlID(control) as u32;
+                            assert!(rect.right > rect.left && rect.bottom > rect.top);
+                            assert!(rect.left >= origin.x + scale(24, dpi));
+                            assert!(rect.right <= origin.x + scale(24 + content_width, dpi));
+                            assert!(rect.bottom <= origin.y + scale(820 - 56, dpi));
+                            if matches!(id, SAVE | START | STOP | LOAD) {
+                                assert_eq!(rect.top - origin.y, scale(actions_y - 48, dpi));
+                            }
+                            for &(other, other_rect) in &controls[index + 1..] {
+                                assert!(
+                                    rect.right <= other_rect.left
+                                        || other_rect.right <= rect.left
+                                        || rect.bottom <= other_rect.top
+                                        || other_rect.bottom <= rect.top,
+                                    "DPI {dpi}, category {category}: {id} overlaps {}",
+                                    GetDlgCtrlID(other)
+                                );
+                            }
+                        }
+                        for &(control, group) in &settings.groups {
+                            assert_eq!(visible(control), group == category);
+                        }
+                        assert_eq!(text(settings.url), "https://draft.invalid/v1");
+                        assert_eq!(text(token), "synthetic-unsaved-client-token");
+                        assert_eq!(selected(settings.theme), 2);
+                    }
+                }
+            }
+            settings.show_page(0);
+            assert!(
+                settings
+                    .controls
+                    .iter()
+                    .all(|(control, ..)| !visible(*control))
+            );
+            settings.show_page(3);
+            assert!(visible(settings.category));
+            assert_eq!(selected(settings.category), 5);
+        }
+    }
+
+    #[test]
+    fn native_category_selection_keeps_original_command_and_combo_compatibility() {
+        let native = NativeSettings::new();
+        let category = native.settings.category;
+        let appearance = theme::Theme::new(ThemeMode::Light).unwrap();
+        // SAFETY: Owner-thread native controls and writable message/item buffers.
+        unsafe {
+            assert_eq!(GetDlgCtrlID(category) as u32, CATEGORY);
+            assert_eq!(SendMessageW(category, CB_GETCOUNT, 0, 0), 6);
+            assert_eq!(SendMessageW(category, TCM_GETITEMCOUNT, 0, 0), 6);
+            let mut class = [0u16; 32];
+            let count = GetClassNameW(category, class.as_mut_ptr(), class.len() as i32);
+            assert_eq!(
+                String::from_utf16_lossy(&class[..count as usize]),
+                "SysTabControl32"
+            );
+            for dpi in [96, 144, 192] {
+                choices::apply(category, appearance.kind, appearance.palette, dpi);
+                native
+                    .settings
+                    .layout(dpi, scale(696, dpi), scale(820, dpi));
+                let mut previous_right = 0;
+                let mut row_top = None;
+                for index in 0..6 {
+                    let mut item = RECT::default();
+                    assert_ne!(
+                        SendMessageW(
+                            category,
+                            TCM_GETITEMRECT,
+                            index,
+                            (&mut item as *mut RECT) as LPARAM
+                        ),
+                        0
+                    );
+                    assert!(item.left >= previous_right);
+                    assert!(item.right <= scale(696, dpi));
+                    assert!(item.top >= 0 && item.bottom <= scale(34, dpi));
+                    assert_eq!(*row_top.get_or_insert(item.top), item.top);
+                    previous_right = item.right;
+                    select(category, (index + 1) % 6);
+                    let mut message = MSG::default();
+                    assert_eq!(
+                        PeekMessageW(
+                            &mut message,
+                            native.parent,
+                            WM_COMMAND,
+                            WM_COMMAND,
+                            PM_REMOVE
+                        ),
+                        0
+                    );
+                    let point = (((item.left + item.right) / 2) as u32
+                        | ((((item.top + item.bottom) / 2) as u32) << 16))
+                        as LPARAM;
+                    SendMessageW(category, WM_LBUTTONDOWN, 1, point);
+                    SendMessageW(category, WM_LBUTTONUP, 0, point);
+                    assert_eq!(selected(category), index);
+                    assert_ne!(
+                        PeekMessageW(
+                            &mut message,
+                            native.parent,
+                            WM_COMMAND,
+                            WM_COMMAND,
+                            PM_REMOVE
+                        ),
+                        0
+                    );
+                    assert_eq!(message.wParam, (CATEGORY | (CBN_SELCHANGE << 16)) as WPARAM);
+                    assert_eq!(message.lParam, category as LPARAM);
+                }
+                select(category, 0);
+                SendMessageW(category, WM_KEYDOWN, 0x27, 0);
+                assert_eq!(selected(category), 1);
+                let mut message = MSG::default();
+                assert_ne!(
+                    PeekMessageW(
+                        &mut message,
+                        native.parent,
+                        WM_COMMAND,
+                        WM_COMMAND,
+                        PM_REMOVE
+                    ),
+                    0
+                );
+                assert_eq!(message.wParam, (CATEGORY | (CBN_SELCHANGE << 16)) as WPARAM);
+                assert_eq!(message.lParam, category as LPARAM);
+            }
+        }
+    }
 
     #[test]
     fn access_and_protocol_fields_round_trip_without_losing_secrets() {

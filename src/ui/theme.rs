@@ -184,6 +184,10 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
         let Ok(theme) = Theme::new(mode) else { return };
         let kind = theme.kind;
         (*state).theme = theme;
+        let dpi = (*state).dpi;
+        let palette = (*state).theme.palette;
+        // Optional icon refresh failure leaves the prior valid caption icon.
+        let _ = (*state).title_menu.refresh(hwnd, dpi, kind, palette);
         let tab = (*state).tabs.handle;
         SetWindowSubclass(tab, Some(tab_proc), 1, state as usize);
         // Native Tab still owns hit testing, selection, keyboard and accessibility.
@@ -204,9 +208,22 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
             (&corner as *const i32).cast(),
             size_of::<i32>() as u32,
         );
-        let mut child = GetWindow(hwnd, GW_CHILD);
-        while !child.is_null() {
-            let next = GetWindow(child, GW_HWNDNEXT);
+        let mut pending = Vec::new();
+        let mut first = GetWindow(hwnd, GW_CHILD);
+        while !first.is_null() {
+            pending.push(first);
+            first = GetWindow(first, GW_HWNDNEXT);
+        }
+        while let Some(child) = pending.pop() {
+            // Visit page-host children too; native subcontrols are themed by their
+            // owning control to avoid interpreting unrelated child styles.
+            if child == (*state).viewport.handle {
+                let mut nested = GetWindow(child, GW_CHILD);
+                while !nested.is_null() {
+                    pending.push(nested);
+                    nested = GetWindow(nested, GW_HWNDNEXT);
+                }
+            }
             // Keep Common Controls v6 in light/high-contrast mode. Disabling it
             // globally made native buttons, combo arrows and tabs look classic.
             // Dark mode uses only documented color/owner-draw fallbacks.
@@ -245,18 +262,19 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
                     child,
                     GWL_STYLE,
                     ((style & !(BS_TYPEMASK as u32))
-                        | if kind == Resolved::Dark {
-                            BS_OWNERDRAW as u32
-                        } else {
+                        | if kind == Resolved::Contrast {
                             BS_PUSHBUTTON as u32
+                        } else {
+                            BS_OWNERDRAW as u32
                         }) as isize,
                 );
             }
             control_theme::apply(child, kind, (*state).theme.palette, (*state).dpi);
             choices::apply(child, kind, (*state).theme.palette, (*state).dpi);
             date_picker::apply(child, kind, (*state).theme.palette, (*state).dpi);
+            rounded::apply(child, kind, (*state).theme.palette, (*state).dpi);
+            scroll_theme::apply(child, kind, (*state).theme.palette, (*state).dpi);
             InvalidateRect(child, null(), 1);
-            child = next;
         }
         RedrawWindow(
             hwnd,
@@ -317,28 +335,45 @@ pub(super) unsafe fn paint(
                 }
                 if item.CtlType == ODT_BUTTON {
                     let active = item.itemState & (ODS_FOCUS | ODS_SELECTED) != 0;
-                    let primary = [2001, tabs::START, 2320].contains(&item.CtlID)
+                    let primary = [2001, tabs::START, 2320, 2219].contains(&item.CtlID)
                         && item.itemState & ODS_DISABLED == 0;
-                    let fill = Brush::new(if primary || active {
-                        palette.accent_surface
-                    } else {
-                        palette.surface
-                    })
-                    .ok()?;
-                    FillRect(item.hDC, &item.rcItem, fill.0);
-                    let border = Brush::new(if active || primary {
-                        palette.accent
-                    } else {
-                        palette.border
-                    })
-                    .ok()?;
-                    FrameRect(item.hDC, &item.rcItem, border.0);
+                    let danger = [2210, 2211, 2350, 2352].contains(&item.CtlID)
+                        && item.itemState & ODS_DISABLED == 0;
+                    let mut palette = palette;
+                    if danger {
+                        palette.accent = if (*state).theme.kind == Resolved::Dark {
+                            0x009b9bff
+                        } else {
+                            0x003c36b4
+                        };
+                        palette.accent_surface = if (*state).theme.kind == Resolved::Dark {
+                            0x00332a40
+                        } else {
+                            0x00f5f3ff
+                        };
+                    }
+                    rounded::surface(
+                        item.hDC,
+                        &item.rcItem,
+                        (*state).dpi,
+                        palette.background,
+                        if primary || danger || active {
+                            palette.accent_surface
+                        } else {
+                            palette.surface
+                        },
+                        if active || primary || danger {
+                            palette.accent
+                        } else {
+                            palette.border
+                        },
+                    );
                     SetBkMode(item.hDC, TRANSPARENT as i32);
                     SetTextColor(
                         item.hDC,
                         if item.itemState & ODS_DISABLED != 0 {
                             palette.disabled
-                        } else if primary {
+                        } else if primary || danger {
                             palette.accent
                         } else {
                             palette.text

@@ -8,7 +8,8 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use windows_sys::Win32::{
     Foundation::GlobalFree,
     Graphics::Gdi::{
-        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow,
+        GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+        MonitorFromWindow,
     },
     System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
 };
@@ -17,10 +18,14 @@ pub(super) const RESTART: u32 = 2104;
 pub(super) const COPY_URL: u32 = 2105;
 pub(super) const OPEN_DIRECTORY: u32 = 2106;
 const DETAILS: u32 = 2107;
+const SUMMARY: u32 = 2108;
 
 #[derive(Default)]
 pub(super) struct Overview {
     details: HWND,
+    summary: HWND,
+    dashboard: HWND,
+    timeline: overview_dashboard::Timeline,
     pub restart: HWND,
     copy_url: HWND,
     directory: HWND,
@@ -39,7 +44,14 @@ impl Overview {
                     DETAILS,
                     &mut self.details,
                 ),
-                ("BUTTON", "重启已保存配置", RESTART, &mut self.restart),
+                ("STATIC", "等待运行状态……", SUMMARY, &mut self.summary),
+                (
+                    "STATIC",
+                    "等待实际采样……",
+                    overview_dashboard::CONTROL_ID,
+                    &mut self.dashboard,
+                ),
+                ("BUTTON", "↻ 重启代理", RESTART, &mut self.restart),
                 ("BUTTON", "复制 Base URL", COPY_URL, &mut self.copy_url),
                 (
                     "BUTTON",
@@ -52,7 +64,14 @@ impl Overview {
                     0,
                     wide(class).as_ptr(),
                     wide(title).as_ptr(),
-                    WS_CHILD | if id == DETAILS { 0 } else { WS_TABSTOP },
+                    WS_CHILD
+                        | if id == overview_dashboard::CONTROL_ID {
+                            0x000d // SS_OWNERDRAW; native text remains available to accessibility.
+                        } else if id == DETAILS || id == SUMMARY {
+                            0
+                        } else {
+                            WS_TABSTOP
+                        },
                     0,
                     0,
                     0,
@@ -70,7 +89,13 @@ impl Overview {
         Ok(())
     }
     pub fn show(&self, visible: bool) {
-        for control in [self.details, self.restart, self.copy_url, self.directory] {
+        for control in [
+            self.summary,
+            self.dashboard,
+            self.restart,
+            self.copy_url,
+            self.directory,
+        ] {
             // SAFETY: Live UI-owned child controls.
             unsafe {
                 ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
@@ -78,38 +103,54 @@ impl Overview {
         }
     }
     pub fn set_font(&self, font: windows_sys::Win32::Graphics::Gdi::HFONT) {
-        for control in [self.details, self.restart, self.copy_url, self.directory] {
+        for control in [
+            self.details,
+            self.summary,
+            self.dashboard,
+            self.restart,
+            self.copy_url,
+            self.directory,
+        ] {
             // SAFETY: State retains both fonts until controls have switched.
             unsafe {
-                SendMessageW(control, WM_SETFONT, font as usize, 1);
+                SendMessageW(control, WM_SETFONT, font as usize, 0);
             }
         }
     }
-    pub fn layout(&self, dpi: u32, width: i32) {
+    pub fn layout(&self, dpi: u32, width: i32, height: i32) {
         // SAFETY: Live sibling controls; no parent resizing or modal dispatch.
         unsafe {
             MoveWindow(
-                self.details,
+                self.summary,
                 scale(24, dpi),
-                scale(118, dpi),
+                scale(108, dpi),
                 (width - scale(48, dpi)).max(1),
-                scale(190, dpi),
+                scale(100, dpi),
                 1,
             );
             for (control, x, y, w) in [
-                (self.restart, 24, 360, 220),
-                (self.copy_url, 260, 360, 220),
-                (self.directory, 496, 360, 234),
+                (self.restart, 292, 220, 132),
+                (self.copy_url, 432, 220, 140),
+                (self.directory, 580, 220, 140),
             ] {
                 MoveWindow(
                     control,
-                    scale(x, dpi),
+                    scale(24, dpi)
+                        + (width - scale(48, dpi)) * (x - 24) / overview_dashboard::MIN_WIDTH_DIP,
                     scale(y, dpi),
-                    scale(w, dpi),
+                    ((width - scale(48, dpi)) * w / overview_dashboard::MIN_WIDTH_DIP).max(1),
                     scale(36, dpi),
                     1,
                 );
             }
+            MoveWindow(
+                self.dashboard,
+                scale(24, dpi),
+                scale(282, dpi),
+                (width - scale(48, dpi)).max(1),
+                (height - scale(282 + 84, dpi)).max(1),
+                1,
+            );
         }
     }
     fn render(&mut self) {
@@ -125,7 +166,65 @@ impl Overview {
             settings::set_text(self.details, &text);
             self.rendered = text;
         }
+        // Precise dashboard values/rates must not depend on the legacy summary's
+        // rounded byte display or whole-second uptime deduplication.
+        settings::set_text(self.summary, &format_header(snapshot));
+        settings::set_text(self.dashboard, &self.timeline.description());
+        // SAFETY: Queue drawing only while this page is visible; no I/O or
+        // controller lock is acquired by the subsequent paint callback.
+        unsafe {
+            InvalidateRect(self.dashboard, null(), 0);
+        }
     }
+}
+
+pub(super) unsafe fn draw(state: *mut State, l: LPARAM) -> bool {
+    // SAFETY: WM_DRAWITEM's live item/DC and owner-thread State. All fonts and
+    // report/timeline storage outlive this synchronous, read-only paint call.
+    unsafe {
+        let item = &*(l as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT);
+        if item.CtlID != overview_dashboard::CONTROL_ID {
+            return false;
+        }
+        overview_dashboard::draw(
+            item,
+            (*state).dpi,
+            (*state).font.0,
+            (*state).heading_font.0,
+            (*state).theme.palette,
+            (*state).theme.kind,
+            (*state).overview.snapshot.as_ref(),
+            &(*state).overview.timeline,
+        );
+        true
+    }
+}
+
+fn format_header(snapshot: &OverviewSnapshot) -> String {
+    let seconds = snapshot.metrics.uptime.as_secs();
+    format!(
+        "{}    ·    本次会话 {:02}:{:02}:{:02}（含停止时间）\r\n监听：{}\r\n上游：{}\r\n本机 Base URL：{}",
+        if snapshot.running {
+            "● 正在运行"
+        } else {
+            "○ 已停止"
+        },
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60,
+        snapshot
+            .listen
+            .map_or_else(|| "未监听".into(), |address| address.to_string()),
+        snapshot
+            .upstream
+            .as_deref()
+            .map(safe_upstream)
+            .unwrap_or_else(|| "未配置／不可用".into()),
+        snapshot
+            .listen
+            .filter(|_| snapshot.running)
+            .map_or_else(|| "不可用".into(), base_url),
+    )
 }
 
 fn base_url(mut address: SocketAddr) -> String {
@@ -447,6 +546,7 @@ pub(super) unsafe fn poll(hwnd: HWND, state: *mut State) {
     // SAFETY: Stable owner-thread state, short-lived borrows; resize may reenter the WndProc.
     unsafe {
         if let Ok(snapshot) = (*state).controller.overview_events.try_recv() {
+            (*state).overview.timeline.record(&snapshot.metrics);
             (*state).overview.snapshot = Some(snapshot);
             (*state).overview.dirty = true;
         }

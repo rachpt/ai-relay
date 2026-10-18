@@ -60,8 +60,8 @@ impl Tabs {
                 }
             }
             for (title, id, target) in [
-                ("启动已保存配置", START, &mut self.start),
-                ("停止代理", STOP, &mut self.stop),
+                ("▶ 启动代理", START, &mut self.start),
+                ("■ 停止代理", STOP, &mut self.stop),
             ] {
                 *target = CreateWindowExW(
                     0,
@@ -99,7 +99,7 @@ impl Tabs {
         for control in [self.handle, self.start, self.stop] {
             // SAFETY: Live controls; State retains the font.
             unsafe {
-                SendMessageW(control, WM_SETFONT, font as usize, 1);
+                SendMessageW(control, WM_SETFONT, font as usize, 0);
             }
         }
     }
@@ -123,16 +123,16 @@ impl Tabs {
             MoveWindow(
                 self.start,
                 scale(24, dpi),
-                scale(312, dpi),
-                scale(340, dpi),
+                scale(220, dpi),
+                ((width - scale(48, dpi)) * 140 / 696).max(1),
                 scale(36, dpi),
                 1,
             );
             MoveWindow(
                 self.stop,
-                scale(380, dpi),
-                scale(312, dpi),
-                scale(140, dpi),
+                scale(24, dpi) + (width - scale(48, dpi)) * 148 / 696,
+                scale(220, dpi),
+                ((width - scale(48, dpi)) * 112 / 696).max(1),
                 scale(36, dpi),
                 1,
             );

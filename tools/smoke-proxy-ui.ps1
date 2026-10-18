@@ -43,7 +43,14 @@ public static class ProxyUiSmoke {
         if(SendMessageTimeoutW(edit,0xB0,UIntPtr.Zero,IntPtr.Zero,2,1000,out result)==IntPtr.Zero) throw new Exception("Selection read failed");
         return result.ToUInt32();
     }
-    [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
+    [DllImport("user32.dll", EntryPoint="GetDlgItem")] static extern IntPtr NativeGetDlgItem(IntPtr parent, int id);
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr window);
+    public static IntPtr GetDlgItem(IntPtr parent, int id) {
+        var found=NativeGetDlgItem(parent,id);
+        if(found!=IntPtr.Zero) return found;
+        EnumChildWindows(parent,delegate(IntPtr h, IntPtr p) { if(GetDlgCtrlID(h)==id) { found=h; return false; } return true; },IntPtr.Zero);
+        return found;
+    }
     [DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr hwnd, int index);
     [DllImport("user32.dll", SetLastError=true)] static extern bool PostMessageW(IntPtr hwnd, uint message, UIntPtr wp, IntPtr lp);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]

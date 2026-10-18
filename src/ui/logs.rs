@@ -64,7 +64,8 @@ struct Filters {
     errors_only: bool,
 }
 
-// Dates are whole UTC days; numeric endpoints are inclusive UTC Unix seconds.
+// Dates are whole UTC days; numeric endpoints remain inclusive UTC Unix seconds
+// for parser/API callers. The GUI picker accepts only ISO dates or empty, not raw epoch.
 fn utc_bound(input: &str, end: bool) -> Result<Option<u64>, String> {
     let input = input.trim();
     if input.is_empty() {
@@ -460,6 +461,58 @@ mod tests {
     }
 
     #[test]
+    fn utc_date_filters_include_both_days_in_file_and_live_views() {
+        let start = utc_bound("2024-02-28", false).unwrap().unwrap();
+        let end = utc_bound("2024-02-29", true).unwrap().unwrap();
+        let filters = Filters {
+            start: Some(start),
+            end: Some(end),
+            ..Filters::default()
+        };
+        let entry = live_fixture()[0].clone();
+        let entries: Vec<_> = [start - 1, start, end - 43200, end, end + 1]
+            .into_iter()
+            .enumerate()
+            .map(|(i, timestamp)| LogEntry {
+                sequence: i as u64 + 1,
+                timestamp,
+                ..entry.clone()
+            })
+            .collect();
+        let file = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let live = debug_text(&entries);
+        let file_output = filter(&file, &filters).unwrap();
+        let live_output = filter_live(&live, &entries, 0, &filters).unwrap();
+        assert_eq!(file_output.lines().count(), 3);
+        assert_eq!(live_output.lines().count(), 3);
+        for sequence in 1..=5 {
+            let included = (2..=4).contains(&sequence);
+            assert_eq!(
+                file_output.contains(&format!("\"sequence\":{sequence},")),
+                included
+            );
+            assert_eq!(live_output.contains(&format!("#{sequence} ")), included);
+        }
+        assert_eq!(end - start, 2 * 86400 - 1);
+        let final_day = Filters {
+            start: utc_bound("2024-02-29", false).unwrap(),
+            ..filters
+        };
+        assert_eq!(filter(&file, &final_day).unwrap().lines().count(), 2);
+        assert_eq!(
+            filter_live(&live, &entries, 0, &final_day)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn status_syntax_is_validated_not_silently_empty() {
         for (input, expected) in [
             ("200", (200, 200)),
@@ -772,6 +825,14 @@ mod tests {
 
     #[test]
     fn native_controls_layout_filters_pause_and_invalid_preservation() {
+        use windows_sys::Win32::{
+            Foundation::SYSTEMTIME,
+            UI::Controls::{
+                DTM_GETRANGE, DTM_GETSYSTEMTIME, DTM_SETSYSTEMTIME, DTS_SHOWNONE, GDT_NONE,
+                GDT_VALID, GDTR_MAX, GDTR_MIN,
+            },
+        };
+
         struct Parent(HWND);
         impl Drop for Parent {
             fn drop(&mut self) {
@@ -802,6 +863,155 @@ mod tests {
             assert!(!parent.0.is_null());
             let mut logs = Logs::default();
             logs.create(parent.0, instance).unwrap();
+            for (id, x) in [(2224, 24), (2225, 372)] {
+                let picker = logs.control(id);
+                assert!(!picker.is_null());
+                assert_eq!(GetDlgCtrlID(picker), id as i32);
+                assert_eq!(GetParent(picker), parent.0);
+                assert!(logs.controls.contains(&(picker, x, 208, 336, 28)));
+                let mut class = [0u16; 32];
+                let count = GetClassNameW(picker, class.as_mut_ptr(), class.len() as i32);
+                assert_eq!(
+                    String::from_utf16(&class[..count as usize]).unwrap(),
+                    "SysDateTimePick32"
+                );
+                let style = GetWindowLongPtrW(picker, GWL_STYLE) as u32;
+                assert_ne!(style & DTS_SHOWNONE, 0);
+                assert_ne!(style & WS_TABSTOP, 0);
+                assert_eq!(settings::text(picker), "");
+                let mut native = SYSTEMTIME::default();
+                assert_eq!(
+                    SendMessageW(
+                        picker,
+                        DTM_GETSYSTEMTIME,
+                        0,
+                        (&mut native as *mut SYSTEMTIME) as LPARAM,
+                    ),
+                    GDT_NONE as LRESULT
+                );
+                let mut range = [SYSTEMTIME::default(); 2];
+                assert_eq!(
+                    SendMessageW(picker, DTM_GETRANGE, 0, range.as_mut_ptr() as LPARAM),
+                    (GDTR_MIN | GDTR_MAX) as LRESULT
+                );
+                assert_eq!(
+                    (range[0].wYear, range[0].wMonth, range[0].wDay),
+                    (1970, 1, 1)
+                );
+                assert_eq!(
+                    (range[1].wYear, range[1].wMonth, range[1].wDay),
+                    (9999, 12, 31)
+                );
+                for date in ["1970-01-01", "2024-02-29", "9999-12-31"] {
+                    assert_ne!(
+                        SendMessageW(picker, WM_SETTEXT, 0, wide(date).as_ptr() as LPARAM),
+                        0
+                    );
+                    assert_eq!(settings::text(picker), date);
+                    let filters = logs.filters().unwrap();
+                    assert_eq!(
+                        if id == 2224 {
+                            filters.start
+                        } else {
+                            filters.end
+                        },
+                        utc_bound(date, id == 2225).unwrap()
+                    );
+                }
+                // Strict picker writes reject raw epoch and malformed dates;
+                // they preserve the valid value instead of creating an invalid draft.
+                for invalid in [
+                    "102",
+                    "1969-12-31",
+                    "10000-01-01",
+                    "2023-02-29",
+                    "2024-2-29",
+                    "2024-02-29extra",
+                    " ",
+                ] {
+                    assert_eq!(
+                        SendMessageW(picker, WM_SETTEXT, 0, wide(invalid).as_ptr() as LPARAM),
+                        0,
+                        "{id}: {invalid}"
+                    );
+                    assert_eq!(settings::text(picker), "9999-12-31");
+                }
+                // Calendar/keyboard changes use native SYSTEMTIME; even a
+                // non-midnight value still maps to a whole UTC day, not local time.
+                native = SYSTEMTIME {
+                    wYear: 2024,
+                    wMonth: 2,
+                    wDay: 29,
+                    wHour: 18,
+                    ..Default::default()
+                };
+                assert_ne!(
+                    SendMessageW(
+                        picker,
+                        DTM_SETSYSTEMTIME,
+                        GDT_VALID as WPARAM,
+                        (&native as *const SYSTEMTIME) as LPARAM,
+                    ),
+                    0
+                );
+                assert_eq!(settings::text(picker), "2024-02-29");
+                let filters = logs.filters().unwrap();
+                assert_eq!(
+                    if id == 2224 {
+                        filters.start
+                    } else {
+                        filters.end
+                    },
+                    Some(1709164800 + if id == 2225 { 86399 } else { 0 })
+                );
+                assert_eq!(
+                    if id == 2224 {
+                        filters.end
+                    } else {
+                        filters.start
+                    },
+                    None
+                );
+                // Unchecking the native control also removes only this bound.
+                assert_ne!(
+                    SendMessageW(picker, DTM_SETSYSTEMTIME, GDT_NONE as WPARAM, 0),
+                    0
+                );
+                assert_eq!(settings::text(picker), "");
+                assert_eq!(logs.filters().unwrap(), Filters::default());
+                assert_ne!(
+                    SendMessageW(picker, WM_SETTEXT, 0, wide("2024-02-29").as_ptr() as LPARAM),
+                    0
+                );
+                assert_ne!(
+                    SendMessageW(picker, WM_SETTEXT, 0, wide("").as_ptr() as LPARAM),
+                    0
+                );
+                assert_eq!(settings::text(picker), "");
+                assert_eq!(logs.filters().unwrap(), Filters::default());
+                assert_eq!(
+                    SendMessageW(
+                        picker,
+                        DTM_GETSYSTEMTIME,
+                        0,
+                        (&mut native as *mut SYSTEMTIME) as LPARAM,
+                    ),
+                    GDT_NONE as LRESULT
+                );
+            }
+            let category = logs.control(2226);
+            assert!(logs.controls.contains(&(category, 24, 244, 156, 28)));
+            assert_eq!(SendMessageW(category, CB_GETCOUNT, 0, 0), 3);
+            for (index, label) in ["全部", "运行", "访问"].into_iter().enumerate() {
+                assert_eq!(
+                    SendMessageW(category, CB_SETCURSEL, index, 0),
+                    index as LRESULT
+                );
+                assert_eq!(SendMessageW(category, CB_GETCURSEL, 0, 0), index as LRESULT);
+                assert_eq!(settings::text(category), label);
+                assert_eq!(logs.filters().unwrap().category, index);
+            }
+            SendMessageW(category, CB_SETCURSEL, 0, 0);
             logs.visible = true;
             logs.file_mode = true;
             logs.paused = true;
@@ -821,7 +1031,7 @@ mod tests {
                         let mut rect = RECT::default();
                         assert_ne!(GetWindowRect(control, &mut rect), 0);
                         let id = GetDlgCtrlID(control);
-                        if [2208, 2209, 2226].contains(&id) {
+                        if [2208, 2209].contains(&id) {
                             rect.bottom = rect.bottom.min(rect.top + scale(30, dpi));
                         }
                         assert!(
@@ -840,7 +1050,7 @@ mod tests {
                             let mut other_rect = RECT::default();
                             assert_ne!(GetWindowRect(other, &mut other_rect), 0);
                             let other_id = GetDlgCtrlID(other);
-                            if [2208, 2209, 2226].contains(&other_id) {
+                            if [2208, 2209].contains(&other_id) {
                                 other_rect.bottom =
                                     other_rect.bottom.min(other_rect.top + scale(30, dpi));
                             }
@@ -857,8 +1067,8 @@ mod tests {
             }
             logs.render();
             assert_eq!(logs.rendered.lines().count(), 6);
-            settings::set_text(logs.control(2224), "102");
-            settings::set_text(logs.control(2225), "102");
+            settings::set_text(logs.control(2224), "1970-01-01");
+            settings::set_text(logs.control(2225), "1970-01-01");
             settings::set_text(logs.control(2227), "5xx");
             SendMessageW(logs.control(2226), CB_SETCURSEL, 2, 0);
             SendMessageW(logs.control(2208), CB_SETCURSEL, 4, 0);
@@ -868,6 +1078,23 @@ mod tests {
             assert_eq!(logs.rendered.lines().count(), 1);
             assert!(logs.rendered.contains("\"sequence\":3"));
             let valid = logs.rendered.clone();
+            for id in [2224, 2225] {
+                for invalid in ["102", "2023-02-29"] {
+                    assert_eq!(
+                        SendMessageW(
+                            logs.control(id),
+                            WM_SETTEXT,
+                            0,
+                            wide(invalid).as_ptr() as LPARAM
+                        ),
+                        0
+                    );
+                    assert_eq!(settings::text(logs.control(id)), "1970-01-01");
+                    logs.render();
+                    assert_eq!(logs.rendered, valid);
+                    assert!(!settings::text(logs.control(2220)).contains("筛选无效"));
+                }
+            }
             settings::set_text(logs.control(2227), "6xx");
             logs.render();
             assert_eq!(logs.rendered, valid);
@@ -896,11 +1123,11 @@ mod tests {
             let mut newer = live_fixture();
             for entry in &mut newer {
                 entry.sequence += 10;
-                entry.timestamp += 1000;
+                entry.timestamp += 86400;
             }
             logs.snapshot = Some(live_snapshot(newer));
-            settings::set_text(logs.control(2224), "103");
-            settings::set_text(logs.control(2225), "103");
+            settings::set_text(logs.control(2224), "1970-01-01");
+            settings::set_text(logs.control(2225), "1970-01-01");
             settings::set_text(logs.control(2227), "5xx");
             SendMessageW(logs.control(2226), CB_SETCURSEL, 2, 0);
             SendMessageW(logs.control(2208), CB_SETCURSEL, 4, 0);
@@ -911,7 +1138,7 @@ mod tests {
             assert_eq!(logs.live_text, frozen_text);
             assert_eq!(logs.live_entries[3].timestamp, 103);
             let valid = logs.rendered.clone();
-            settings::set_text(logs.control(2224), "104");
+            settings::set_text(logs.control(2224), "1970-01-02");
             logs.render();
             assert_eq!(logs.rendered, valid);
             assert!(settings::text(logs.control(2220)).contains("不得晚于"));
@@ -1075,7 +1302,7 @@ impl Logs {
             ("暂停显示", 2202, 132, 100),
             ("文件视图", 2203, 240, 100),
             ("清空视图", 2204, 348, 100),
-            ("刷新文件列表", 2205, 456, 132),
+            ("↻ 刷新文件列表", 2205, 456, 132),
             ("读取尾部", 2206, 596, 124),
         ] {
             self.add(
@@ -1136,42 +1363,17 @@ impl Logs {
             parent,
             instance,
             "STATIC",
-            "UTC 起（左）/ 止（右）：epoch 秒或 YYYY-MM-DD；含端点，日期含整日",
+            "UTC 日期：开始（左）/ 结束（右），含首尾整日；取消勾选不限",
             0,
             0,
             (24, 182, 696, 22),
         )?;
-        for (id, x) in [(2224, 24), (2225, 372)] {
-            let edit = self.add(
-                parent,
-                instance,
-                "EDIT",
-                "",
-                WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
-                id,
-                (x, 208, 336, 28),
-            )?;
-            // SAFETY: Live EDIT; bound user input before parsing it on timer ticks.
-            unsafe {
-                SendMessageW(edit, 0x00c5, 32, 0);
-            }
+        for (id, x, label) in [(2224, 24, "开始（含）"), (2225, 372, "结束（含）")] {
+            let picker = date_picker::create(parent, id, label)?;
+            self.controls.push((picker, x, 208, 336, 28));
         }
-        let category = self.add(
-            parent,
-            instance,
-            "COMBOBOX",
-            "",
-            WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
-            2226,
-            (24, 244, 156, 180),
-        )?;
-        // SAFETY: Live COMBOBOX copies the labels synchronously.
-        unsafe {
-            for label in ["全部类别", "Runtime", "Access"] {
-                SendMessageW(category, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
-            }
-            SendMessageW(category, CB_SETCURSEL, 0, 0);
-        }
+        let category = choices::create(parent, 2226, &["全部", "运行", "访问"])?;
+        self.controls.push((category, 24, 244, 156, 28));
         self.add(
             parent,
             instance,
@@ -1216,7 +1418,7 @@ impl Logs {
         for (title, id, x, w) in [
             ("删除历史日志…", 2210, 24, 180),
             ("清空全部应用日志…", 2211, 216, 220),
-            ("向前一页", 2222, 448, 124),
+            ("← 向前一页", 2222, 448, 124),
             ("打开日志目录", 2223, 584, 136),
         ] {
             self.add(
@@ -1769,7 +1971,7 @@ impl Logs {
         for &(control, ..) in &self.controls {
             // SAFETY: State owns the live font until controls are destroyed or updated.
             unsafe {
-                SendMessageW(control, WM_SETFONT, font as usize, 1);
+                SendMessageW(control, WM_SETFONT, font as usize, 0);
             }
         }
     }

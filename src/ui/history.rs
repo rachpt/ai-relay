@@ -797,7 +797,7 @@ impl History {
         for &(h, ..) in &self.controls {
             // SAFETY: State retains font through child lifetime.
             unsafe {
-                SendMessageW(h, WM_SETFONT, font as usize, 1);
+                SendMessageW(h, WM_SETFONT, font as usize, 0);
             }
         }
     }

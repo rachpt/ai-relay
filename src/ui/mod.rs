@@ -7,11 +7,16 @@ mod history;
 mod history_chart;
 mod logs;
 mod overview;
+mod overview_dashboard;
+mod rounded;
+mod scroll_theme;
 mod settings;
 mod status_bar;
 mod tabs;
 mod theme;
+mod title_menu;
 pub(crate) mod usage;
+mod viewport;
 use crate::app::instance::{Control, Signals};
 use crate::app::{Options, controller::Controller};
 use std::{
@@ -48,6 +53,7 @@ const SHOW_COMMAND: u32 = 1001;
 const EXIT_COMMAND: u32 = 1002;
 const WINDOW_CLASS: &str = "AIRelay.Window.v1";
 const PLACEMENT_CHANGED: u32 = WM_APP + 21;
+const OPEN_TITLE_MENU: u32 = WM_APP + 22;
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -59,8 +65,10 @@ struct State {
     font: Font,
     heading_font: Font,
     theme: theme::Theme,
+    title_menu: title_menu::TitleMenu,
     labels: Vec<HWND>,
     status_label: HWND,
+    viewport: viewport::Viewport,
     settings: settings::Settings,
     tabs: tabs::Tabs,
     overview: overview::Overview,
@@ -124,8 +132,11 @@ impl State {
         if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
             return;
         }
+        let (page_width, page_height) =
+            self.viewport
+                .layout(self.dpi, rect.right, rect.bottom, self.tabs.active);
         let margin = scale(24, self.dpi);
-        let width = (rect.right - margin * 2).max(1);
+        let width = (page_width - margin * 2).max(1);
         let rows = [(64, 28)];
         for (label, (top, height)) in self.labels.iter().zip(rows) {
             // SAFETY: Each handle is a live child STATIC; this moves only the child,
@@ -141,11 +152,24 @@ impl State {
                 )
             };
         }
-        self.tabs.layout(self.dpi, rect.right);
-        self.overview.layout(self.dpi, rect.right);
-        self.settings.layout(self.dpi, width, rect.bottom);
-        self.logs.layout(self.dpi, rect.right, rect.bottom);
-        self.history.layout(self.dpi, rect.right, rect.bottom);
+        self.tabs.layout(self.dpi, page_width);
+        // Header is outside the viewport; only its buttons scroll with the page.
+        unsafe {
+            MoveWindow(
+                self.tabs.handle,
+                scale(24, self.dpi),
+                scale(12, self.dpi),
+                rect.right - scale(48, self.dpi),
+                scale(36, self.dpi),
+                1,
+            );
+        }
+        self.overview.layout(self.dpi, page_width, page_height);
+        self.settings.layout(self.dpi, width, page_height);
+        self.logs.layout(self.dpi, page_width, page_height);
+        self.history.layout(self.dpi, page_width, page_height);
+        self.viewport
+            .arrange(self.dpi, page_height, self.tabs.active);
         status_bar::layout(self.status_label, self.dpi, rect.right, rect.bottom);
     }
 
@@ -175,6 +199,10 @@ impl State {
             ShowWindow(self.tabs.start, if index == 0 { SW_SHOW } else { SW_HIDE });
             ShowWindow(self.tabs.stop, if index == 0 { SW_SHOW } else { SW_HIDE });
         }
+        // Every page preserves its own scroll offset; draft controls are not recreated.
+        unsafe {
+            self.layout(GetParent(self.tabs.handle));
+        }
     }
 
     fn update_dpi(&mut self, hwnd: HWND, dpi: u32) -> Result<(), String> {
@@ -182,7 +210,7 @@ impl State {
         for label in &self.labels {
             // SAFETY: STATIC controls accept WM_SETFONT and do not call our parent
             // procedure for this message. Both the old and new fonts remain live.
-            unsafe { SendMessageW(*label, WM_SETFONT, font.0 as WPARAM, 1) };
+            unsafe { SendMessageW(*label, WM_SETFONT, font.0 as WPARAM, 0) };
         }
         self.settings.set_font(font.0);
         self.tabs.set_font(font.0);
@@ -197,7 +225,10 @@ impl State {
         self.heading_font = heading;
         self.font = font;
         self.dpi = dpi;
-        self.layout(hwnd);
+        // Defer layout/painting until the exclusive font-update borrow ends.
+        unsafe {
+            PostMessageW(hwnd, WM_SIZE, 0, 0);
+        }
         // SAFETY: Queue color/DPI refresh after replacing fonts; no reentrant
         // parent dispatch occurs while State is borrowed by this method.
         unsafe {
@@ -234,8 +265,10 @@ pub(crate) fn run(
         font: Font::new(dpi)?,
         heading_font: Font::heading(dpi)?,
         theme: theme::Theme::new(crate::config::ThemeMode::System)?,
+        title_menu: title_menu::TitleMenu::default(),
         labels: Vec::new(),
         status_label: null_mut(),
+        viewport: viewport::Viewport::default(),
         settings: settings::Settings::default(),
         tabs: tabs::Tabs::default(),
         overview: overview::Overview::default(),
@@ -287,7 +320,7 @@ pub(crate) fn run(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             scale(800, dpi),
-            scale(900, dpi),
+            scale(680, dpi),
             null_mut(),
             null_mut(),
             instance,
@@ -338,6 +371,10 @@ pub(crate) fn run(
         state.settings.create(hwnd, instance)?;
         state.logs.create(hwnd, instance)?;
         state.history.create(hwnd)?;
+        state.viewport.create(hwnd)?;
+        state
+            .viewport
+            .adopt(hwnd, &[state.tabs.handle, state.status_label])?;
         state.show_page(0);
         state.update_dpi(hwnd, dpi)?;
         // Clamp the initial default as well as saved geometry before first showing.
@@ -360,8 +397,14 @@ pub(crate) fn run(
                 }
             }
         }
-        // SAFETY: Stable boxed state; refresh holds no State reference across Win32 calls.
-        unsafe { theme::refresh(hwnd, &mut *state) };
+        // SAFETY: Owner thread and stable State; only native menu/icon messages
+        // occur during attachment. Tracking starts later with no State borrow.
+        unsafe {
+            state
+                .title_menu
+                .attach(hwnd, state.dpi, state.theme.kind, state.theme.palette)?;
+            theme::refresh(hwnd, &mut *state);
+        }
         // SAFETY: This live window owns timer 1; callbacks are dispatched on its UI thread.
         if unsafe { SetTimer(hwnd, 1, 100, None) } == 0 {
             return Err(last_error("创建后台事件轮询定时器"));
@@ -392,11 +435,40 @@ pub(crate) fn run(
                 unsafe extern "system" {
                     fn GetKeyState(key: i32) -> i16;
                 }
+                let title_shortcut =
+                    (message.wParam == 0x79 && GetKeyState(0x11) >= 0 && GetKeyState(0x10) >= 0)
+                        || (message.wParam == 0x4d && (message.lParam as usize & (1 << 29)) != 0);
+                if title_shortcut
+                    && matches!(
+                        message.message,
+                        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+                    )
+                {
+                    if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+                        && (message.lParam as usize & (1 << 30)) == 0
+                    {
+                        PostMessageW(hwnd, OPEN_TITLE_MENU, 0, 0);
+                    }
+                    // Consume the paired key-up too, so DefWindowProc does not
+                    // start a second SC_KEYMENU after our popup closes.
+                    continue;
+                }
                 if message.message == WM_KEYDOWN && message.wParam == 9 && GetKeyState(0x11) < 0 {
                     let direction = if GetKeyState(0x10) < 0 { 3 } else { 1 };
                     SetFocus(state.tabs.handle);
                     state.show_page((state.tabs.active + direction) % 4);
                     continue;
+                }
+                if message.message == WM_KEYDOWN && message.wParam == 9 && GetKeyState(0x12) >= 0 {
+                    // Read-only multiline controls may claim Tab themselves.
+                    // Keep form traversal explicit; native date/arrow editing
+                    // is untouched and the viewport reveals the new focus.
+                    let next =
+                        GetNextDlgTabItem(hwnd, message.hwnd, i32::from(GetKeyState(0x10) < 0));
+                    if !next.is_null() {
+                        SetFocus(next);
+                        continue;
+                    }
                 }
             }
             // SAFETY: The MSG was initialized by GetMessageW on this thread.
@@ -525,6 +597,95 @@ fn tray_menu(hwnd: HWND) -> Result<(), String> {
     Ok(())
 }
 
+unsafe fn update_title_menu(hwnd: HWND, state: *mut State) {
+    // SAFETY: Owner-thread State; IsWindowEnabled is a scalar native query, no
+    // borrowed state crosses a menu tracking loop or controller operation.
+    unsafe {
+        let enabled = |id| {
+            let handle = GetDlgItem((*state).viewport.handle, id);
+            !handle.is_null() && settings::is_enabled(handle) != 0
+        };
+        let ready = (*state).exiting.is_none();
+        let _ = title_menu::update(
+            hwnd,
+            title_menu::Availability {
+                start: ready && enabled(tabs::START as i32),
+                stop: ready && enabled(tabs::STOP as i32),
+                restart: ready && (*state).settings.overview_available(),
+                export: ready && enabled(2034),
+                import: ready && enabled(2035),
+                active_page: (*state).tabs.active,
+            },
+        );
+    }
+}
+
+unsafe fn dispatch_title_menu(hwnd: HWND, state: *mut State, action: title_menu::Action) {
+    use title_menu::Action;
+    // SAFETY: Menus reuse existing commands and confirmation paths. No State
+    // reference is held over a dialog, clipboard operation or async command.
+    unsafe {
+        if (*state).exiting.is_some() {
+            return;
+        }
+        let command = match action {
+            Action::OpenDir => overview::OPEN_DIRECTORY,
+            Action::ExportConfig => 2034,
+            Action::ImportConfig => 2035,
+            Action::Exit => EXIT_COMMAND,
+            Action::Start => tabs::START,
+            Action::Stop => tabs::STOP,
+            Action::Restart => overview::RESTART,
+            Action::ViewOverview
+            | Action::ViewHistory
+            | Action::ViewLogs
+            | Action::ViewSettings => {
+                let page = match action {
+                    Action::ViewOverview => 0,
+                    Action::ViewHistory => 1,
+                    Action::ViewLogs => 2,
+                    _ => 3,
+                };
+                SetFocus((*state).tabs.handle);
+                (*state).show_page(page);
+                return;
+            }
+            Action::About => {
+                let text = wide(concat!(
+                    "AI Relay ",
+                    env!("CARGO_PKG_VERSION"),
+                    " · 开发预览\nRust + Win32 原生流式代理\n\n标题栏 ☰：文件 / 代理 / 视图 / 帮助\nF10 或 Alt+M 打开；Alt+Space 保留系统菜单。\n关闭窗口依照设置隐藏到托盘或退出。\n统计与流量观测不是 Provider 账单。"
+                ));
+                MessageBoxW(
+                    hwnd,
+                    text.as_ptr(),
+                    wide("关于 AI Relay").as_ptr(),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+                return;
+            }
+        };
+        // Check live availability again; a stale menu selection cannot bypass a
+        // disabled command after background state changed during menu tracking.
+        if action == Action::Restart && !(*state).settings.overview_available() {
+            return;
+        }
+        if !matches!(action, Action::Exit | Action::OpenDir | Action::Restart) {
+            let id = match action {
+                Action::Start => tabs::START as i32,
+                Action::Stop => tabs::STOP as i32,
+                Action::Restart => overview::RESTART as i32,
+                _ => command as i32,
+            };
+            let target = GetDlgItem((*state).viewport.handle, id);
+            if target.is_null() || settings::is_enabled(target) == 0 {
+                return;
+            }
+        }
+        PostMessageW(hwnd, WM_COMMAND, command as usize, 0);
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -555,7 +716,9 @@ unsafe extern "system" fn window_proc(
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     // SAFETY: Valid WM_DRAWITEM payload, handled before theme's generic owner drawing.
-    if message == WM_DRAWITEM && unsafe { history::draw(state, lparam) } {
+    if message == WM_DRAWITEM
+        && unsafe { history::draw(state, lparam) || overview::draw(state, lparam) }
+    {
         return 1;
     }
     // SAFETY: Paint handlers access only copied values/raw fields, before mutable borrows.
@@ -598,6 +761,7 @@ unsafe extern "system" fn window_proc(
                 }
                 0
             }
+            WM_MOUSEWHEEL => SendMessageW((*state).viewport.handle, message, wparam, lparam),
             WM_SIZE => {
                 (*state).layout(hwnd);
                 0
@@ -607,7 +771,27 @@ unsafe extern "system" fn window_proc(
                 overview::flush(hwnd, state, message == WM_EXITSIZEMOVE);
                 0
             }
+            WM_INITMENUPOPUP => {
+                update_title_menu(hwnd, state);
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            }
+            WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if wparam as u32 == HTSYSMENU => {
+                // A menu-looking caption icon must not unexpectedly close the app.
+                PostMessageW(hwnd, OPEN_TITLE_MENU, 0, 0);
+                0
+            }
+            OPEN_TITLE_MENU => {
+                update_title_menu(hwnd, state);
+                if let Err(error) = title_menu::show(hwnd) {
+                    show_error(hwnd, &error);
+                }
+                0
+            }
             WM_SYSCOMMAND => {
+                if let Some(action) = title_menu::action(wparam as u32) {
+                    dispatch_title_menu(hwnd, state, action);
+                    return 0;
+                }
                 if matches!(
                     wparam as u32 & 0xfff0,
                     SC_MAXIMIZE | SC_RESTORE | SC_MINIMIZE
@@ -650,9 +834,9 @@ unsafe extern "system" fn window_proc(
                 let info = &mut *(lparam as *mut MINMAXINFO);
                 let work = overview::work_area(hwnd);
                 info.ptMinTrackSize.x =
-                    scale(760, (*state).dpi).min(work.map_or(i32::MAX, |r| r.right - r.left));
+                    scale(800, (*state).dpi).min(work.map_or(i32::MAX, |r| r.right - r.left));
                 info.ptMinTrackSize.y =
-                    scale(880, (*state).dpi).min(work.map_or(i32::MAX, |r| r.bottom - r.top));
+                    scale(560, (*state).dpi).min(work.map_or(i32::MAX, |r| r.bottom - r.top));
                 0
             }
             WM_CLOSE => {

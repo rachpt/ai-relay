@@ -260,14 +260,6 @@ unsafe fn fill(dc: HDC, rect: &RECT, color: u32) {
     }
 }
 
-unsafe fn frame(dc: HDC, rect: &RECT, color: u32) {
-    // SAFETY: caller has saved the live DC; stock brush is not owned.
-    unsafe {
-        SetDCBrushColor(dc, color);
-        FrameRect(dc, rect, GetStockObject(DC_BRUSH) as HBRUSH);
-    }
-}
-
 unsafe fn chevron(dc: HDC, rect: &RECT, color: u32, dpi: u32, up: bool) {
     // SAFETY: all coordinates are scalar. The nested DC guard deselects the pen
     // before Pen::drop, including early returns, without deleting stock objects.
@@ -351,8 +343,14 @@ unsafe fn draw_combo(hwnd: HWND, dc: HDC, value: Appearance) {
         if style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE) as u32 == 0 {
             let mut client = RECT::default();
             GetClientRect(hwnd, &mut client);
-            fill(dc, &client, p.surface);
-            frame(dc, &client, if focused { p.accent } else { p.border });
+            super::rounded::surface(
+                dc,
+                &client,
+                value.dpi,
+                p.background,
+                p.surface,
+                if focused { p.accent } else { p.border },
+            );
             font(hwnd, dc);
             SetTextColor(dc, ink);
             let text = title(hwnd);
