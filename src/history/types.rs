@@ -227,9 +227,9 @@ pub enum GroupBy {
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TimeZone {
-    #[default]
     Utc,
     /// The OS local zone at each historical instant, including its DST rules.
+    #[default]
     Local,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

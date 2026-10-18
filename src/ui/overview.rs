@@ -302,7 +302,7 @@ unsafe extern "system" {
     fn SetClipboardData(format: u32, memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
     fn CloseClipboard() -> i32;
 }
-fn copy(hwnd: HWND, text: &str) -> Result<(), String> {
+pub(super) fn copy(hwnd: HWND, text: &str) -> Result<(), String> {
     let text = wide(text);
     // SAFETY: Movable shared memory is populated before transfer. Every failure frees
     // our allocation; successful SetClipboardData transfers ownership to the system.

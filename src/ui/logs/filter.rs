@@ -1,5 +1,6 @@
 //! 日志筛选与有界文本处理：不访问窗口句柄或磁盘。
 use super::*;
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Offset, TimeZone};
 
 pub(super) const MAX_LINES: usize = 1000;
 pub(super) const LIMIT: usize = 256 * 1024;
@@ -58,9 +59,17 @@ pub(super) struct Filters {
     pub(super) errors_only: bool,
 }
 
-// Dates are whole UTC days; numeric endpoints remain inclusive UTC Unix seconds
-// for parser/API callers. The GUI picker accepts only ISO dates or empty, not raw epoch.
-pub(super) fn utc_bound(input: &str, end: bool) -> Result<Option<u64>, String> {
+// Numeric endpoints remain inclusive UTC Unix seconds. Only civil dates use the
+// system zone; the picker itself accepts ISO dates or empty, never raw epoch.
+pub(super) fn local_bound(input: &str, end: bool) -> Result<Option<u64>, String> {
+    bound_with_zone(input, end, &Local)
+}
+
+pub(super) fn bound_with_zone<T: TimeZone>(
+    input: &str,
+    end: bool,
+    zone: &T,
+) -> Result<Option<u64>, String> {
     let input = input.trim();
     if input.is_empty() {
         return Ok(None);
@@ -71,45 +80,56 @@ pub(super) fn utc_bound(input: &str, end: bool) -> Result<Option<u64>, String> {
             .map(Some)
             .map_err(|_| "UTC epoch 秒超出范围".into());
     }
-    let invalid = || "时间须为非负 UTC epoch 秒或 YYYY-MM-DD".to_string();
+    let invalid = || "时间须为非负 UTC epoch 秒或本地日期 YYYY-MM-DD（1970–9999）".to_string();
     let bytes = input.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return Err(invalid());
     }
-    let number = |range: std::ops::Range<usize>| -> Result<u64, String> {
-        let part = &bytes[range];
-        if !part.iter().all(u8::is_ascii_digit) {
-            return Err(invalid());
-        }
-        Ok(part.iter().fold(0, |n, c| n * 10 + u64::from(c - b'0')))
-    };
-    let year = number(0..4)?;
-    let month = number(5..7)?;
-    let day = number(8..10)?;
-    let leap = |y: u64| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
-    let months = [
-        31,
-        if leap(year) { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if year < 1970 || !(1..=12).contains(&month) || day == 0 || day > months[month as usize - 1] {
+    let date = NaiveDate::parse_from_str(input, "%Y-%m-%d").map_err(|_| invalid())?;
+    if !(1970..=9999).contains(&date.year()) || date.format("%Y-%m-%d").to_string() != input {
         return Err(invalid());
     }
-    let leap_days = |y: u64| y / 4 - y / 100 + y / 400;
-    let days = (year - 1970) * 365 + leap_days(year - 1) - leap_days(1969)
-        + months[..month as usize - 1].iter().sum::<u64>()
-        + day
-        - 1;
-    Ok(Some(days * 86400 + if end { 86399 } else { 0 }))
+    // Resolve each endpoint independently, using the rules on that date rather
+    // than today's offset or a fixed 86400 seconds. Folds include both copies;
+    // midnight gaps use the first/last valid second of the selected civil day.
+    let edge = date
+        .and_hms_opt(
+            if end { 23 } else { 0 },
+            if end { 59 } else { 0 },
+            if end { 59 } else { 0 },
+        )
+        .ok_or_else(invalid)?;
+    let choose = |seconds: i64| {
+        let wall =
+            edge.checked_add_signed(Duration::seconds(if end { -seconds } else { seconds }))?;
+        let result = zone.from_local_datetime(&wall);
+        if end {
+            result.latest()
+        } else {
+            result.earliest()
+        }
+    };
+    let mut instant = choose(0);
+    if instant.is_none() {
+        // Minute probes keep unusual midnight gaps bounded, with second-level
+        // refinement for historical transitions. Never cross into another day.
+        for minute in 1..=1440 {
+            let seconds = (minute * 60).min(86399);
+            if choose(seconds).is_some() {
+                instant = ((minute - 1) * 60 + 1..=seconds).find_map(choose);
+                break;
+            }
+        }
+    }
+    let seconds = instant
+        .ok_or("系统时区不存在所选日期，请选择相邻的有效日期")?
+        .timestamp();
+    if end && seconds < 0 {
+        return Err("所选日期早于日志 UTC epoch 范围".into());
+    }
+    // LogEntry timestamps are nonnegative; the first local day may begin before
+    // epoch in a positive-offset zone, so intersect it with the storage range.
+    Ok(Some(seconds.max(0) as u64))
 }
 
 pub(super) fn status_range(input: &str) -> Result<Option<(u16, u16)>, String> {
@@ -149,7 +169,7 @@ impl Filters {
             .zip(self.end)
             .is_some_and(|(start, end)| start > end)
         {
-            return Err("UTC 起始时间不得晚于结束时间".into());
+            return Err("起始时间不得晚于结束时间".into());
         }
         Ok(())
     }
@@ -222,22 +242,61 @@ impl Filters {
     }
 }
 
+// GUI-only annotations retain the raw epoch/Debug text and the original JSON
+// fields. Filtering metadata always uses the unmodified source, not these labels.
+fn display_time<T: TimeZone>(timestamp: u64, zone: &T) -> Option<String> {
+    let instant = DateTime::from_timestamp(i64::try_from(timestamp).ok()?, 0)?;
+    let local = instant.with_timezone(zone);
+    instant
+        .naive_utc()
+        .checked_add_offset(local.offset().fix())?;
+    Some(local.fixed_offset().to_rfc3339())
+}
+
+fn file_display<T: TimeZone>(line: &str, value: &serde_json::Value, zone: &T) -> String {
+    if let Some(time) = value["timestamp"]
+        .as_u64()
+        .and_then(|t| display_time(t, zone))
+        && value.is_object()
+        && value.get("timestamp_local").is_none()
+        && let Some(open) = line.find('{')
+    {
+        // Insert instead of reserializing: preserve all original fields, number
+        // precision, whitespace and ordering. Copied lines remain valid JSON.
+        let (head, tail) = line.split_at(open + 1);
+        return format!("{head}\"timestamp_local\":\"{time}\",{tail}");
+    }
+    line.to_string()
+}
+
+fn search_matches(raw: &str, display: &str, search: &str) -> bool {
+    raw.to_lowercase().contains(search) || display.to_lowercase().contains(search)
+}
+
 pub(super) fn filter(source: &str, filters: &Filters) -> Result<String, String> {
+    filter_with_zone(source, filters, &Local)
+}
+
+pub(super) fn filter_with_zone<T: TimeZone>(
+    source: &str,
+    filters: &Filters,
+    zone: &T,
+) -> Result<String, String> {
     filters.validate()?;
     let mut result = String::new();
     for line in source.lines().take(MAX_LINES) {
-        if !line.to_lowercase().contains(&filters.search) {
-            continue;
-        }
-        let matches = match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(value) => filters.matches_file(&value),
-            Err(_) => !filters.needs_metadata(),
+        let (matches, display) = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => (
+                filters.matches_file(&value),
+                file_display(line, &value, zone),
+            ),
+            Err(_) => (!filters.needs_metadata(), line.to_string()),
         };
-        if matches {
-            if result.len() + line.len() + 2 > LIMIT {
+        if matches && search_matches(line, &display, &filters.search) {
+            if result.len() + display.len() + 2 > LIMIT {
                 break;
             }
-            result.push_str(line);
+            result.push_str(&display);
             result.push_str("\r\n");
         }
     }
@@ -250,6 +309,16 @@ pub(super) fn filter_live(
     cursor: u64,
     filters: &Filters,
 ) -> Result<String, String> {
+    filter_live_with_zone(source, entries, cursor, filters, &Local)
+}
+
+pub(super) fn filter_live_with_zone<T: TimeZone>(
+    source: &str,
+    entries: &[LogEntry],
+    cursor: u64,
+    filters: &Filters,
+    zone: &T,
+) -> Result<String, String> {
     filters.validate()?;
     // Sequence only associates the original Debug display with typed metadata;
     // never interpret status, level, error or timestamp from the display text.
@@ -261,15 +330,16 @@ pub(super) fn filter_live(
         .collect();
     let mut result = String::new();
     for line in source.lines().take(MAX_LINES) {
-        if !line.to_lowercase().contains(&filters.search) {
-            continue;
-        }
+        let mut display = line.to_string();
         let matches = if let Some(number) = sequence(line) {
             let Some(entry) = entries.get(&number) else {
                 continue;
             };
             if entry.sequence <= cursor {
                 continue;
+            }
+            if let Some(time) = display_time(entry.timestamp, zone) {
+                display = format!("{time} | {line}");
             }
             let value =
                 serde_json::to_value(entry).map_err(|_| "实时日志元数据序列化失败".to_string())?;
@@ -279,11 +349,11 @@ pub(super) fn filter_live(
             // allowing untyped lines to satisfy any metadata filter.
             !filters.needs_metadata()
         };
-        if matches {
-            if result.len() + line.len() + 2 > LIMIT {
+        if matches && search_matches(line, &display, &filters.search) {
+            if result.len() + display.len() + 2 > LIMIT {
                 break;
             }
-            result.push_str(line);
+            result.push_str(&display);
             result.push_str("\r\n");
         }
     }

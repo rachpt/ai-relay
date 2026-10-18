@@ -262,6 +262,8 @@ impl History {
             (570, 60, 150, 30),
         )?;
         self.combo(parent, ZONE, &["UTC", "本地"], (384, 102, 132, 32))?;
+        // SAFETY: Live segmented choice; scalar selection, no notification/query.
+        unsafe { SendMessageW(self.control(ZONE), CB_SETCURSEL, 1, 0) };
         self.combo(parent, TREND, &["日", "小时", "月"], (528, 102, 192, 32))?;
         self.combo(
             parent,
@@ -310,7 +312,7 @@ impl History {
             parent,
             TABLE,
             "SysListView32",
-            "历史请求明细／分页汇总",
+            "历史请求明细／分页汇总：点击单元格后 Ctrl+C，或右键复制；左右键切换列",
             WS_TABSTOP
                 | WS_BORDER
                 | LVS_REPORT
@@ -319,6 +321,7 @@ impl History {
                 | LVS_NOSORTHEADER,
             (24, 584, 696, 100),
         )?;
+        cell_table::install(table)?;
         // SAFETY: live native list view; scalar style flags and no borrowed pointers.
         unsafe {
             SendMessageW(

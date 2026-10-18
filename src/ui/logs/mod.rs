@@ -10,7 +10,7 @@ use windows_sys::Win32::{Foundation::HINSTANCE, Graphics::Gdi::HFONT};
 
 mod filter;
 use filter::{
-    Filters, LIMIT, MAX_LINES, bounded_file_text, filter, filter_live, status_range, utc_bound,
+    Filters, LIMIT, MAX_LINES, bounded_file_text, filter, filter_live, local_bound, status_range,
 };
 #[cfg(test)]
 mod tests;
@@ -215,7 +215,7 @@ impl Logs {
             parent,
             instance,
             "STATIC",
-            "UTC 日期：开始（左）/ 结束（右），含首尾整日；取消勾选不限",
+            "本地日期：开始（左）/ 结束（右），含首尾整日；取消勾选不限",
             0,
             0,
             (24, 182, 696, 22),
@@ -472,8 +472,8 @@ impl Logs {
     // IDs 2224–2228 are sampled by the existing UI timer, so no parent dispatch
     // expansion or nested message-loop callbacks are required.
     fn filters(&self) -> Result<Filters, String> {
-        let start = utc_bound(&settings::text(self.control(2224)), false)?;
-        let end = utc_bound(&settings::text(self.control(2225)), true)?;
+        let start = local_bound(&settings::text(self.control(2224)), false)?;
+        let end = local_bound(&settings::text(self.control(2225)), true)?;
         let status = status_range(&settings::text(self.control(2227)))?;
         // SAFETY: Live checkbox owned by this page; message contains no pointers.
         let errors_only = unsafe { SendMessageW(self.control(2228), BM_GETCHECK, 0, 0) != 0 };
@@ -525,7 +525,7 @@ impl Logs {
             .as_ref()
             .err()
             .map(|e| format!("筛选无效：{e}；保留原显示"));
-        let hint = error.as_deref().unwrap_or("所有条件 AND；仅错误 = error 级别、错误码或 HTTP 4xx/5xx。最多显示 1000 行 / 256 KiB；文件筛选仅作用于已加载窗口。");
+        let hint = error.as_deref().unwrap_or("本地时间含偏移，保留 UTC epoch；JSON 增加 timestamp_local。条件 AND；仅错误含 error/错误码/4xx/5xx。上限 1000 行/256 KiB，文件仅筛已加载窗口。");
         if settings::text(self.control(2229)) != hint {
             settings::set_text(self.control(2229), hint);
         }

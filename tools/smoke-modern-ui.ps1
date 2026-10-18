@@ -369,7 +369,7 @@ function Assert-HistoryLayout([string]$Label) {
     # Continue collecting screenshots, but emit exact conflicts immediately too.
     foreach ($problem in $uiFailures) { Write-Warning $problem }
 }
-function Assert-Report([string]$Expected='Utc/Day') {
+function Assert-Report([string]$Expected='Local/Day') {
     Wait-State "backend 10 requests, $Expected" {
         [ProxyUiSmoke]::IsWindowEnabled((Control 2320)) -and
         (Text 2325).Contains('匹配 10 请求') -and (Text 2325).Contains($Expected)
@@ -449,6 +449,7 @@ try {
 
     $stage='native segmented identity and compatibility'
     Select-Page 1 2300
+    if ((Message 2333 0x147) -ne 1) { throw 'Initial timezone must follow system Local' }
     Wait-State 'history scope query enabled' { [ProxyUiSmoke]::IsWindowEnabled((Control 2320)) }
     foreach ($id in @(2300,2301,2333,2334,2338,2353,2030)) {
         $h=Control $id
@@ -482,8 +483,8 @@ try {
         Wait-State "date $index only custom shows 2302/2303" { (Visible 2302) -eq ($index -eq 4) -and (Visible 2303) -eq ($index -eq 4) }
         Capture-Segment 2301 $index
         if ($index -eq 4) {
-            $customStart=[DateTime]::UtcNow.ToString('yyyy-MM-dd')
-            $customEnd=[DateTime]::UtcNow.AddDays(1).ToString('yyyy-MM-dd')
+            $customStart=[DateTime]::Now.ToString('yyyy-MM-dd')
+            $customEnd=[DateTime]::Now.AddDays(1).ToString('yyyy-MM-dd')
             [ProxyUiSmoke]::SetText((Control 2302),[uint32]$ownedPid,$customStart)
             [ProxyUiSmoke]::SetText((Control 2303),[uint32]$ownedPid,$customEnd)
             Snapshot 'history-custom-date' $window -Outer | Out-Null
@@ -495,7 +496,7 @@ try {
             $appliedRows=Message 2337 0x1004
             Click 2317
             Wait-State 'RESET date preset 0, both date inputs hidden, reset notification handled' {
-                (Message 2301 0x147) -eq 0 -and -not (Visible 2302) -and -not (Visible 2303) -and
+                (Message 2301 0x147) -eq 0 -and (Message 2333 0x147) -eq 1 -and -not (Visible 2302) -and -not (Visible 2303) -and
                 (Text 2325).Contains('筛选草稿已重置')
             }
             if ((Text 2330) -cne $appliedSummary -or (Text 2331) -cne $appliedMetadata -or
@@ -508,7 +509,7 @@ try {
     }
 
     $stage='2333/2334 genuine clicks trigger real background queries'
-    foreach ($zone in @(1,0)) {
+    foreach ($zone in @(0,1,0)) {
         Select-Segment 2333 $zone
         $zoneName=if ($zone -eq 1) { 'Local' } else { 'Utc' }
         Assert-Report "$zoneName/Day"
@@ -528,7 +529,7 @@ try {
     $pendingDateEnd=Text 2303
     $pending=[ModernNative]::ProbePending($childHandle,[uint32]$ownedPid,$window)
     if (-not $pending.Seen) { throw 'Pending not observed; cannot claim freeze passed' }
-    Assert-Report
+    Assert-Report 'Utc/Day'
     foreach ($pair in @(@(2301,$pending.Date),@(2333,$pending.Zone),@(2334,$pending.Trend),@(2338,$pending.Table),@(2353,$pending.Export))) {
         if ((Message $pair[0] 0x147) -ne $pair[1]) { throw "Pending changed selection ID $($pair[0])" }
     }
@@ -540,7 +541,7 @@ try {
     Wait-State 'advanced combo visible, chart hidden, table retained' { (Visible 2310) -and -not (Visible 2332) -and (Visible 2337) }
     Select-Combo 2314 3
     Click 2320
-    Assert-Report
+    Assert-Report 'Utc/Day'
     Snapshot 'dark-advanced-table-window' $window -Outer | Out-Null
     Assert-HistoryLayout 'history-advanced-table'
     $table=Control 2337

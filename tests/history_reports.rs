@@ -199,6 +199,40 @@ fn dst_gap_fold_day_lengths_and_month_use_historical_rules() {
     assert!(calendar_bucket_with_zone(i64::MAX, TrendGranularity::Day, &offset).is_err());
 }
 #[test]
+fn default_query_uses_system_local_calendar_without_changing_stored_time() {
+    assert_eq!(TimeZone::default(), TimeZone::Local);
+    let query = Query::default();
+    assert_eq!(query.time_zone, TimeZone::Local);
+    let t = Temp::new();
+    let s = HistoryService::start(&t.0).unwrap();
+    let started_ms = now_ms();
+    put(&s, record(&s.handle(), started_ms));
+    let report = s
+        .query(Query {
+            group_by: vec![GroupBy::Day, GroupBy::Hour, GroupBy::Month],
+            ..query
+        })
+        .unwrap();
+    assert_eq!(report.details[0].started_ms, started_ms);
+    let buckets: Vec<_> = [
+        TrendGranularity::Day,
+        TrendGranularity::Hour,
+        TrendGranularity::Month,
+    ]
+    .into_iter()
+    .map(|grain| calendar_bucket_with_zone(started_ms, grain, &chrono::Local).unwrap())
+    .collect();
+    assert_eq!(report.trend[0].bucket_start_ms, buckets[0].bucket_start_ms);
+    assert_eq!(report.trend[0].label, buckets[0].label);
+    assert_eq!(
+        report.groups[0].keys,
+        buckets
+            .iter()
+            .map(|b| Some(b.label.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+#[test]
 fn month_requested_model_protocol_and_unknown_coverage_agree() {
     let t = Temp::new();
     let s = HistoryService::start(&t.0).unwrap();
@@ -221,6 +255,7 @@ fn month_requested_model_protocol_and_unknown_coverage_agree() {
     let q = Query {
         group_by: vec![GroupBy::Month, GroupBy::RequestedModel, GroupBy::Protocol],
         trend_granularity: TrendGranularity::Month,
+        time_zone: TimeZone::Utc,
         ..Query::default()
     };
     let report = s.query(q).unwrap();
@@ -237,6 +272,7 @@ fn month_requested_model_protocol_and_unknown_coverage_agree() {
     let hours = s
         .query(Query {
             trend_granularity: TrendGranularity::Hour,
+            time_zone: TimeZone::Utc,
             ..Query::default()
         })
         .unwrap();

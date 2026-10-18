@@ -4,6 +4,9 @@
 
 - [当前状态与下一步](STATUS.md)
 - [批次记录模板](TEMPLATE.md)
+- [2026-10-18-24：本地Release重建](2026-10-18-24-release-rebuild.md)
+- [2026-10-18-23：统计表格单元格复制](2026-10-18-23-history-cell-copy.md)
+- [2026-10-18-22：默认使用系统本地时区](2026-10-18-22-local-time-default.md)
 - [2026-10-18-21：日期版本Release与标签](2026-10-18-21-date-release.md)
 - [2026-10-18-20：采用MIT许可证](2026-10-18-20-mit-license.md)
 - [2026-10-18-19：公开准备、历史身份与旧实现清理](2026-10-18-19-publication-cleanup.md)

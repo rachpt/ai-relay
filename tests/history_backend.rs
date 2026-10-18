@@ -132,6 +132,7 @@ fn combined_filters_groups_dates_and_coverage() {
         outcome: Some(a.outcome),
         interface: Some(a.interface),
         group_by: vec![GroupBy::Day, GroupBy::Model, GroupBy::Credential],
+        time_zone: TimeZone::Utc,
         ..Query::default()
     };
     let r = s.query(q).unwrap();

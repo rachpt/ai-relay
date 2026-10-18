@@ -28,6 +28,41 @@ fn idle_requires_no_query_file_chooser_or_confirmation() {
     assert!(!history.busy());
 }
 #[test]
+fn native_time_zone_defaults_and_reset_follow_system_local() {
+    assert_eq!(TimeZone::default(), TimeZone::Local);
+    assert_eq!(Query::default().time_zone, TimeZone::Local);
+    let mut native = super::super::tests::NativeState::new();
+    native.state.show_page(1);
+    assert_eq!(settings::selected(native.state.history.control(ZONE)), 1);
+    assert_eq!(
+        native.state.history.draft().unwrap().time_zone,
+        TimeZone::Local
+    );
+    assert!(native.state.history.pending.is_none());
+
+    native.command(ZONE, Some(0));
+    assert_eq!(
+        native.state.history.draft().unwrap().time_zone,
+        TimeZone::Utc
+    );
+    assert!(native.state.history.pending.is_none());
+    native.command(RESET, None);
+    assert_eq!(settings::selected(native.state.history.control(ZONE)), 1);
+    assert_eq!(
+        native.state.history.draft().unwrap().time_zone,
+        TimeZone::Local
+    );
+    assert!(native.state.history.pending.is_none());
+
+    let ms = db::now_ms();
+    let expected = chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S%.3f %:z")
+        .to_string();
+    assert_eq!(timestamp(ms, TimeZone::default()), expected);
+}
+#[test]
 fn utc_dates() {
     assert_eq!(parse_date("1970-01-01", TimeZone::Utc).unwrap(), Some(0));
     assert!(parse_date("2025-02-29", TimeZone::Utc).is_err());
@@ -163,7 +198,10 @@ fn aliases_are_display_only_and_secret_like_labels_are_rejected() {
         trend_truncated: false,
     };
     assert_eq!(alias_label(&report, Some(&id)), "研发客户端");
-    let query = Query::default();
+    let query = Query {
+        time_zone: TimeZone::Utc,
+        ..Query::default()
+    };
     assert_eq!(group_key(Some("0"), &GroupBy::Day, &query), "1970-01-01");
     assert_eq!(
         group_key(Some("0"), &GroupBy::Hour, &query),

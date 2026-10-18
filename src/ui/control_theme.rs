@@ -189,10 +189,17 @@ pub(super) unsafe fn custom_draw(l: LPARAM) -> Option<LRESULT> {
         if class != "SysListView32" {
             return None;
         }
-        let Some(value) = appearance(hwnd) else {
-            return Some(CDRF_DODEFAULT as LRESULT);
+        let value = appearance(hwnd);
+        // Copy the notification before any reentrant ListView messages. Cell
+        // postpaint adds only a frame; existing/native text and row colors stay.
+        let cell_flags = super::cell_table::custom_draw(
+            *(l as *const NMLVCUSTOMDRAW),
+            value.map(|v| (v.palette.text, v.palette.accent_surface)),
+        );
+        let Some(value) = value else {
+            return Some(cell_flags as LRESULT);
         };
-        let draw = &mut *(l as *mut NMLVCUSTOMDRAW);
+        let mut draw = *(l as *const NMLVCUSTOMDRAW);
         match draw.nmcd.dwDrawStage {
             CDDS_PREPAINT => Some(CDRF_NOTIFYITEMDRAW as LRESULT),
             stage if stage == CDDS_ITEMPREPAINT || stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM => {
@@ -219,9 +226,13 @@ pub(super) unsafe fn custom_draw(l: LPARAM) -> Option<LRESULT> {
                     value.palette.surface
                 };
                 draw.nmcd.uItemState &= !(CDIS_SELECTED | CDIS_HOT);
-                Some((CDRF_NEWFONT | CDRF_NOTIFYSUBITEMDRAW) as LRESULT)
+                // No reference into the notification spans SendMessageW above.
+                (*(l as *mut NMLVCUSTOMDRAW)).clrText = draw.clrText;
+                (*(l as *mut NMLVCUSTOMDRAW)).clrTextBk = draw.clrTextBk;
+                (*(l as *mut NMLVCUSTOMDRAW)).nmcd.uItemState = draw.nmcd.uItemState;
+                Some((CDRF_NEWFONT | CDRF_NOTIFYSUBITEMDRAW | cell_flags) as LRESULT)
             }
-            _ => Some(CDRF_DODEFAULT as LRESULT),
+            _ => Some(cell_flags as LRESULT),
         }
     }
 }

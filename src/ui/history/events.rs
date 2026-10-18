@@ -158,7 +158,7 @@ impl History {
                 ] {
                     // SAFETY: Live native combo, no pointer argument or notification.
                     unsafe {
-                        SendMessageW(self.control(id), CB_SETCURSEL, 0, 0);
+                        SendMessageW(self.control(id), CB_SETCURSEL, usize::from(id == ZONE), 0);
                     }
                 }
                 for id in 2302..=2309 {

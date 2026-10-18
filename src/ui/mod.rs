@@ -1,4 +1,5 @@
 //! Win32 设置与代理控制；所有磁盘和网络初始化由后台控制器执行。
+mod cell_table;
 mod choices;
 mod control_theme;
 mod date_picker;

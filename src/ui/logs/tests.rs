@@ -1,5 +1,9 @@
 use super::*;
 
+fn utc_bound(input: &str, end: bool) -> Result<Option<u64>, String> {
+    filter::bound_with_zone(input, end, &chrono::Utc)
+}
+
 #[test]
 fn live_cursor_and_filters_are_independent() {
     let entries = live_fixture();
@@ -150,6 +154,369 @@ fn utc_date_filters_include_both_days_in_file_and_live_views() {
             .count(),
         2
     );
+}
+
+// A single injected UTC transition models gaps/folds without touching TZ or
+// the system settings, including transitions at midnight and skipped dates.
+#[derive(Clone, Copy)]
+struct TransitionZone {
+    at: i64,
+    before: i32,
+    after: i32,
+}
+impl chrono::TimeZone for TransitionZone {
+    type Offset = chrono::FixedOffset;
+    fn from_offset(offset: &Self::Offset) -> Self {
+        Self {
+            at: i64::MAX,
+            before: offset.local_minus_utc(),
+            after: offset.local_minus_utc(),
+        }
+    }
+    fn offset_from_local_date(
+        &self,
+        date: &chrono::NaiveDate,
+    ) -> chrono::LocalResult<Self::Offset> {
+        self.offset_from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+    }
+    fn offset_from_local_datetime(
+        &self,
+        wall: &chrono::NaiveDateTime,
+    ) -> chrono::LocalResult<Self::Offset> {
+        let seconds = wall.and_utc().timestamp();
+        let before = chrono::FixedOffset::east_opt(self.before).unwrap();
+        let after = chrono::FixedOffset::east_opt(self.after).unwrap();
+        match (
+            seconds - i64::from(self.before) < self.at,
+            seconds - i64::from(self.after) >= self.at,
+        ) {
+            (true, true) => chrono::LocalResult::Ambiguous(before, after),
+            (true, false) => chrono::LocalResult::Single(before),
+            (false, true) => chrono::LocalResult::Single(after),
+            (false, false) => chrono::LocalResult::None,
+        }
+    }
+    fn offset_from_utc_date(&self, date: &chrono::NaiveDate) -> Self::Offset {
+        self.offset_from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+    }
+    fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> Self::Offset {
+        chrono::FixedOffset::east_opt(if utc.and_utc().timestamp() < self.at {
+            self.before
+        } else {
+            self.after
+        })
+        .unwrap()
+    }
+}
+fn epoch(input: &str) -> u64 {
+    chrono::DateTime::parse_from_rfc3339(input)
+        .unwrap()
+        .timestamp() as u64
+}
+
+fn assert_local_day<T: chrono::TimeZone>(
+    date: &str,
+    zone: &T,
+    expected_start: &str,
+    expected_end: &str,
+) {
+    let start = filter::bound_with_zone(date, false, zone).unwrap().unwrap();
+    let end = filter::bound_with_zone(date, true, zone).unwrap().unwrap();
+    assert_eq!(start, epoch(expected_start));
+    assert_eq!(end, epoch(expected_end));
+    let next = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .unwrap()
+        .succ_opt()
+        .unwrap();
+    assert_eq!(
+        filter::bound_with_zone(&next.to_string(), false, zone).unwrap(),
+        Some(end + 1)
+    );
+    let filters = Filters {
+        start: Some(start),
+        end: Some(end),
+        ..Filters::default()
+    };
+    let template = live_fixture()[0].clone();
+    let entries: Vec<_> = [start - 1, start, start + (end - start) / 2, end, end + 1]
+        .into_iter()
+        .enumerate()
+        .map(|(i, timestamp)| LogEntry {
+            sequence: i as u64 + 1,
+            timestamp,
+            ..template.clone()
+        })
+        .collect();
+    let file = entries
+        .iter()
+        .map(|entry| serde_json::to_string(entry).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let live = debug_text(&entries);
+    let file_output = filter::filter_with_zone(&file, &filters, zone).unwrap();
+    let live_output = filter::filter_live_with_zone(&live, &entries, 0, &filters, zone).unwrap();
+    assert_eq!(file_output.lines().count(), 3);
+    assert_eq!(live_output.lines().count(), 3);
+    for ((json, debug), entry) in file_output
+        .lines()
+        .zip(live_output.lines())
+        .zip(&entries[1..4])
+    {
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let label = value
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp_local")
+            .unwrap();
+        let label = label.as_str().unwrap();
+        assert!(label.starts_with(date));
+        assert!(debug.starts_with(&format!("{label} | ")));
+        assert!(debug.ends_with(debug_text(std::slice::from_ref(entry)).trim_end()));
+        assert_eq!(value, serde_json::to_value(entry).unwrap());
+        let copied: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(copied["sequence"], entry.sequence);
+        assert_eq!(copied["timestamp"], entry.timestamp);
+    }
+    // Raw source and typed metadata remain untouched, including their epochs.
+    assert_eq!(debug_text(&entries), live);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(file.lines().next().unwrap()).unwrap()["timestamp"],
+        start - 1
+    );
+}
+
+#[test]
+fn local_dates_and_displays_use_positive_and_negative_offsets() {
+    for (offset, start, end) in [
+        (8 * 3600, "2024-02-28T16:00:00Z", "2024-02-29T15:59:59Z"),
+        (-5 * 3600, "2024-02-29T05:00:00Z", "2024-03-01T04:59:59Z"),
+        (
+            5 * 3600 + 1800,
+            "2024-02-28T18:30:00Z",
+            "2024-02-29T18:29:59Z",
+        ),
+    ] {
+        let zone = chrono::FixedOffset::east_opt(offset).unwrap();
+        assert_local_day("2024-02-29", &zone, start, end);
+    }
+    let east = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    assert_eq!(
+        filter::bound_with_zone("1970-01-01", false, &east).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        filter::bound_with_zone("1970-01-01", true, &east).unwrap(),
+        Some(57599)
+    );
+    assert_eq!(
+        filter::bound_with_zone(" 123 ", true, &east).unwrap(),
+        Some(123)
+    );
+    assert_eq!(local_bound("", false).unwrap(), None);
+    assert_eq!(local_bound("123", false).unwrap(), Some(123));
+    let entry = LogEntry {
+        timestamp: epoch("2024-02-29T12:00:00Z"),
+        ..live_fixture()[0].clone()
+    };
+    let expected = chrono::DateTime::from_timestamp(entry.timestamp as i64, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .fixed_offset()
+        .to_rfc3339();
+    let file = serde_json::to_string(&entry).unwrap();
+    let live = debug_text(std::slice::from_ref(&entry));
+    assert!(
+        filter(&file, &Filters::default())
+            .unwrap()
+            .contains(&expected)
+    );
+    assert!(
+        filter_live(&live, std::slice::from_ref(&entry), 0, &Filters::default())
+            .unwrap()
+            .starts_with(&expected)
+    );
+}
+
+#[test]
+fn local_dst_days_include_23_and_25_hours_and_distinct_fold_labels() {
+    let spring = TransitionZone {
+        at: epoch("2024-03-10T07:00:00Z") as i64,
+        before: -5 * 3600,
+        after: -4 * 3600,
+    };
+    assert_local_day(
+        "2024-03-10",
+        &spring,
+        "2024-03-10T05:00:00Z",
+        "2024-03-11T03:59:59Z",
+    );
+    let fall = TransitionZone {
+        at: epoch("2024-11-03T06:00:00Z") as i64,
+        before: -4 * 3600,
+        after: -5 * 3600,
+    };
+    assert_local_day(
+        "2024-11-03",
+        &fall,
+        "2024-11-03T04:00:00Z",
+        "2024-11-04T04:59:59Z",
+    );
+    let entries: Vec<_> = ["2024-11-03T05:30:00Z", "2024-11-03T06:30:00Z"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, time)| LogEntry {
+            sequence: i as u64 + 1,
+            timestamp: epoch(time),
+            ..live_fixture()[0].clone()
+        })
+        .collect();
+    for (entry, offset) in entries.iter().zip(["-04:00", "-05:00"]) {
+        let filters = Filters {
+            search: format!("2024-11-03t01:30:00{offset}"),
+            start: filter::bound_with_zone("2024-11-03", false, &fall).unwrap(),
+            end: filter::bound_with_zone("2024-11-03", true, &fall).unwrap(),
+            ..Filters::default()
+        };
+        let file = serde_json::to_string(entry).unwrap();
+        let live = debug_text(std::slice::from_ref(entry));
+        assert_eq!(
+            filter::filter_with_zone(&file, &filters, &fall)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            filter::filter_live_with_zone(&live, std::slice::from_ref(entry), 0, &filters, &fall)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn midnight_gaps_folds_and_missing_dates_are_explicit() {
+    let gap = TransitionZone {
+        at: epoch("2024-03-10T05:00:00Z") as i64,
+        before: -5 * 3600,
+        after: -4 * 3600,
+    };
+    assert_local_day(
+        "2024-03-10",
+        &gap,
+        "2024-03-10T05:00:00Z",
+        "2024-03-11T03:59:59Z",
+    );
+    let fold = TransitionZone {
+        at: epoch("2024-11-03T05:00:00Z") as i64,
+        before: -4 * 3600,
+        after: -5 * 3600,
+    };
+    assert_local_day(
+        "2024-11-03",
+        &fold,
+        "2024-11-03T04:00:00Z",
+        "2024-11-04T04:59:59Z",
+    );
+    let evening_gap = TransitionZone {
+        at: epoch("2024-03-11T04:00:00Z") as i64,
+        ..gap
+    };
+    assert_local_day(
+        "2024-03-10",
+        &evening_gap,
+        "2024-03-10T05:00:00Z",
+        "2024-03-11T03:59:59Z",
+    );
+    let second_gap = TransitionZone {
+        at: epoch("2024-02-29T00:00:00Z") as i64,
+        before: 0,
+        after: 30,
+    };
+    assert_local_day(
+        "2024-02-29",
+        &second_gap,
+        "2024-02-29T00:00:00Z",
+        "2024-02-29T23:59:29Z",
+    );
+    let skipped = TransitionZone {
+        at: epoch("2011-12-30T10:00:00Z") as i64,
+        before: -10 * 3600,
+        after: 14 * 3600,
+    };
+    for end in [false, true] {
+        assert!(
+            filter::bound_with_zone("2011-12-30", end, &skipped)
+                .unwrap_err()
+                .contains("不存在")
+        );
+    }
+}
+
+#[test]
+fn display_annotations_preserve_raw_search_json_and_invalid_timestamps() {
+    let zone = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let entry = live_fixture()[0].clone();
+    let file = format!(
+        " {{ \"timestamp\":100, \"sequence\":1, \"large\":18446744073709551615, \"event\":{} }}",
+        serde_json::to_string(&entry.event).unwrap()
+    );
+    let live = debug_text(std::slice::from_ref(&entry));
+    let filters = Filters {
+        search: "100".into(),
+        ..Filters::default()
+    };
+    let output = filter::filter_with_zone(&file, &filters, &zone).unwrap();
+    let label = "1970-01-01T08:01:40+08:00";
+    assert!(output.contains(label));
+
+    assert!(output.contains("\"large\":18446744073709551615"));
+    assert_eq!(
+        output.replacen(&format!("\"timestamp_local\":\"{label}\","), "", 1),
+        format!("{file}\r\n")
+    );
+    assert!(
+        filter::filter_live_with_zone(&live, std::slice::from_ref(&entry), 0, &filters, &zone)
+            .unwrap()
+            .contains(label)
+    );
+    for raw in [
+        r#"{"timestamp":18446744073709551615}"#,
+        r#"{"timestamp":"100"}"#,
+        r#"{"timestamp":-1}"#,
+        r#"{"timestamp":100,"timestamp_local":"existing"}"#,
+        "invalid json",
+    ] {
+        assert_eq!(
+            filter::filter_with_zone(raw, &Filters::default(), &zone).unwrap(),
+            format!("{raw}\r\n")
+        );
+    }
+    let invalid = LogEntry {
+        timestamp: u64::MAX,
+        ..entry
+    };
+    let raw = debug_text(std::slice::from_ref(&invalid));
+    assert_eq!(
+        filter::filter_live_with_zone(
+            &raw,
+            std::slice::from_ref(&invalid),
+            0,
+            &Filters::default(),
+            &zone,
+        )
+        .unwrap(),
+        raw.replace('\n', "\r\n")
+    );
+    let expanding =
+        format!("{{\"timestamp\":100,\"text\":\"{}\"}}\n", "x".repeat(1000)).repeat(MAX_LINES);
+    let rendered = filter::filter_with_zone(&expanding, &Filters::default(), &zone).unwrap();
+    assert!(rendered.len() <= LIMIT);
+    for line in rendered.lines() {
+        assert!(serde_json::from_str::<serde_json::Value>(line).is_ok());
+    }
 }
 
 #[test]
@@ -380,6 +747,11 @@ fn live_metadata_is_typed_and_keeps_original_debug_lines() {
     assert_eq!(success.lines().count(), 1);
     assert!(success.contains("#3 Access"));
     assert!(filter_live(&text, &[], 0, &status).unwrap().is_empty());
+    let misleading = text.replacen("100 #1", "999999 #1", 1);
+    let rendered =
+        filter::filter_live_with_zone(&misleading, &entries, 0, &Filters::default(), &chrono::Utc)
+            .unwrap();
+    assert!(rendered.starts_with("1970-01-01T00:01:40+00:00 | 999999 #1"));
 }
 
 fn live_fixture() -> Vec<LogEntry> {
@@ -482,6 +854,33 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
             }
         }
     }
+    // Keep UI fixtures in the picker range regardless of the host's UTC offset.
+    let base = 1709208000;
+    let local_date = chrono::DateTime::from_timestamp(base + 103, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .date_naive();
+    let date_text = local_date.to_string();
+    let file_fixture = || {
+        fixture()
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["timestamp"] = (base as u64 + value["timestamp"].as_u64().unwrap()).into();
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let entries_fixture = || {
+        live_fixture()
+            .into_iter()
+            .map(|mut entry| {
+                entry.timestamp += base as u64;
+                entry
+            })
+            .collect::<Vec<_>>()
+    };
     // SAFETY: No application singleton/controller is created. All windows are
     // owned, used and destroyed on this test thread, with no disk/network IO.
     unsafe {
@@ -555,7 +954,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
                     } else {
                         filters.end
                     },
-                    utc_bound(date, id == 2225).unwrap()
+                    local_bound(date, id == 2225).unwrap()
                 );
             }
             // Strict picker writes reject raw epoch and malformed dates;
@@ -577,7 +976,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
                 assert_eq!(settings::text(picker), "9999-12-31");
             }
             // Calendar/keyboard changes use native SYSTEMTIME; even a
-            // non-midnight value still maps to a whole UTC day, not local time.
+            // non-midnight value still maps to the whole local calendar day.
             native = SYSTEMTIME {
                 wYear: 2024,
                 wMonth: 2,
@@ -602,7 +1001,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
                 } else {
                     filters.end
                 },
-                Some(1709164800 + if id == 2225 { 86399 } else { 0 })
+                local_bound("2024-02-29", id == 2225).unwrap()
             );
             assert_eq!(
                 if id == 2224 {
@@ -655,7 +1054,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
         logs.visible = true;
         logs.file_mode = true;
         logs.paused = true;
-        logs.file_text = fixture();
+        logs.file_text = file_fixture();
         logs.before = Some(FileCursor {
             index: 1,
             identity: [1, 2, 3],
@@ -707,8 +1106,8 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
         }
         logs.render();
         assert_eq!(logs.rendered.lines().count(), 6);
-        settings::set_text(logs.control(2224), "1970-01-01");
-        settings::set_text(logs.control(2225), "1970-01-01");
+        settings::set_text(logs.control(2224), &date_text);
+        settings::set_text(logs.control(2225), &date_text);
         settings::set_text(logs.control(2227), "5xx");
         SendMessageW(logs.control(2226), CB_SETCURSEL, 2, 0);
         SendMessageW(logs.control(2208), CB_SETCURSEL, 4, 0);
@@ -729,7 +1128,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
                     ),
                     0
                 );
-                assert_eq!(settings::text(logs.control(id)), "1970-01-01");
+                assert_eq!(settings::text(logs.control(id)), date_text);
                 logs.render();
                 assert_eq!(logs.rendered, valid);
                 assert!(!settings::text(logs.control(2220)).contains("筛选无效"));
@@ -740,7 +1139,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
         assert_eq!(logs.rendered, valid);
         assert!(settings::text(logs.control(2220)).contains("筛选无效"));
         assert!(settings::text(logs.control(2229)).contains("保留原显示"));
-        assert_eq!(logs.file_text, fixture());
+        assert_eq!(logs.file_text, file_fixture());
         assert_eq!(logs.before.as_ref().unwrap().offset, 10);
         assert_eq!(logs.follow.as_ref().unwrap().offset, 10);
         assert!(logs.paused);
@@ -755,30 +1154,33 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
         SendMessageW(logs.control(2228), BM_SETCHECK, 0, 0);
         logs.file_mode = false;
         logs.paused = false;
-        logs.snapshot = Some(live_snapshot(live_fixture()));
+        logs.snapshot = Some(live_snapshot(entries_fixture()));
         logs.render();
         assert_eq!(logs.rendered.lines().count(), 6);
         let frozen_text = logs.live_text.clone();
         logs.paused = true;
-        let mut newer = live_fixture();
+        let mut newer = entries_fixture();
         for entry in &mut newer {
             entry.sequence += 10;
             entry.timestamp += 86400;
         }
         logs.snapshot = Some(live_snapshot(newer));
-        settings::set_text(logs.control(2224), "1970-01-01");
-        settings::set_text(logs.control(2225), "1970-01-01");
+        settings::set_text(logs.control(2224), &date_text);
+        settings::set_text(logs.control(2225), &date_text);
         settings::set_text(logs.control(2227), "5xx");
         SendMessageW(logs.control(2226), CB_SETCURSEL, 2, 0);
         SendMessageW(logs.control(2208), CB_SETCURSEL, 4, 0);
         SendMessageW(logs.control(2228), BM_SETCHECK, 1, 0);
         logs.render();
         assert_eq!(logs.rendered.lines().count(), 1);
-        assert!(logs.rendered.contains("103 #4 Access"));
+        assert!(logs.rendered.contains(&format!("{} #4 Access", base + 103)));
         assert_eq!(logs.live_text, frozen_text);
-        assert_eq!(logs.live_entries[3].timestamp, 103);
+        assert_eq!(logs.live_entries[3].timestamp, base as u64 + 103);
         let valid = logs.rendered.clone();
-        settings::set_text(logs.control(2224), "1970-01-02");
+        settings::set_text(
+            logs.control(2224),
+            &local_date.succ_opt().unwrap().to_string(),
+        );
         logs.render();
         assert_eq!(logs.rendered, valid);
         assert!(settings::text(logs.control(2220)).contains("不得晚于"));
@@ -800,7 +1202,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
         logs.paused = false;
         logs.render();
         assert!(logs.rendered.is_empty());
-        let mut next = live_fixture()[0].clone();
+        let mut next = entries_fixture()[0].clone();
         next.sequence = 17;
         logs.snapshot = Some(live_snapshot(vec![next]));
         logs.render();

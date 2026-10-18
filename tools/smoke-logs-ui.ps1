@@ -95,6 +95,25 @@ public static class LogsUiRegression {
     }
 }
 '@
+    function Format-LocalLogTime([long]$Epoch) {
+        [DateTimeOffset]::FromUnixTimeSeconds($Epoch).ToLocalTime().ToString("yyyy-MM-dd'T'HH:mm:sszzz", [Globalization.CultureInfo]::InvariantCulture)
+    }
+    function Get-LocalDayStart([datetime]$Date) {
+        $midnight = [DateTime]::SpecifyKind($Date.Date, [DateTimeKind]::Unspecified)
+        $zone = [TimeZoneInfo]::Local
+        # Match the GUI: first valid local second, earliest instant in a midnight fold.
+        for ($second = 0; $second -lt 86400; $second++) {
+            $wall = $midnight.AddSeconds($second)
+            if ($zone.IsInvalidTime($wall)) { continue }
+            if ($zone.IsAmbiguousTime($wall)) {
+                $offset = @($zone.GetAmbiguousTimeOffsets($wall) | Sort-Object -Descending)[0]
+                return [DateTimeOffset]::new($wall, $offset).ToUnixTimeSeconds()
+            }
+            return [DateTimeOffset]::new([TimeZoneInfo]::ConvertTimeToUtc($wall, $zone)).ToUnixTimeSeconds()
+        }
+        throw "Local timezone has no valid instant on $($midnight.ToString('yyyy-MM-dd'))"
+    }
+    $livePrefix = '^(?<local>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}) \| (?<epoch>\d+) #\d+ '
     function LogText { [LogsUiRegression]::Read((Button 2200), [uint32]$child.Id) }
     function Set-LogFilter([int]$Id, [string]$Value) { [ProxyUiSmoke]::SetText((Button $Id), [uint32]$child.Id, $Value) }
     function Select-LogFilter([int]$Id, [int]$Index) { [ProxyUiSmoke]::Send((Button $Id), [uint32]$child.Id, 0x14E, [uint32]$Index) }
@@ -147,14 +166,16 @@ public static class LogsUiRegression {
     Write-Output "PASS: logs layout at actual DPI $dpi, minimum and enlarged child window sizes."
     LogClick 2202
     Wait-Until 'live runtime view paused for metadata filters' { (LogStatus).Contains('已暂停') }
-    $runtimeLine = @((LogText) -split "`n" | Where-Object { $_ -match '^\d+ #\d+ Runtime ' })[0].Trim()
-    $runtimeEpoch = [long]([regex]::Match($runtimeLine, '^(\d+) ').Groups[1].Value)
-    $runtimeDay = [DateTimeOffset]::FromUnixTimeSeconds($runtimeEpoch).UtcDateTime.ToString('yyyy-MM-dd')
+    $runtimeLine = @((LogText) -split "`n" | Where-Object { $_ -match ($livePrefix + 'Runtime ') })[0].Trim()
+    $runtimeMatch = [regex]::Match($runtimeLine, $livePrefix)
+    $runtimeEpoch = [long]$runtimeMatch.Groups['epoch'].Value
+    if ($runtimeMatch.Groups['local'].Value -cne (Format-LocalLogTime $runtimeEpoch)) { throw 'Runtime time label does not match system local timezone/offset' }
+    $runtimeDay = [DateTimeOffset]::FromUnixTimeSeconds($runtimeEpoch).LocalDateTime.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
     Select-LogFilter 2226 1
     Set-LogFilter 2224 $runtimeDay
     Set-LogFilter 2225 $runtimeDay
     Set-LogFilter 2207 'runtime'
-    Wait-Until 'live UTC date and Runtime metadata AND search' { (LogText).Contains($runtimeLine) -and -not (LogStatus).Contains('筛选无效') }
+    Wait-Until 'live local date and Runtime metadata AND search' { (LogText).Contains($runtimeLine) -and -not (LogStatus).Contains('筛选无效') }
     if ((LogText).Contains('Access')) { throw 'Runtime category included Access' }
     Set-LogFilter 2227 '2xx'
     Wait-Until 'runtime has no HTTP status' { (LogText).Length -eq 0 -and -not (LogStatus).Contains('筛选无效') }
@@ -176,16 +197,18 @@ public static class LogsUiRegression {
     Wait-Until 'real typed proxy access metadata appears' { (LogText).Contains('Access') -and (LogText).Contains('status: Some(200)') }
     LogClick 2202
     Wait-Until 'live access batch frozen' { (LogStatus).Contains('已暂停') }
-    $accessLine = @((LogText) -split "`n" | Where-Object { $_ -match '^\d+ #\d+ Access .*status: Some\(200\)' })[0].Trim()
-    $accessEpoch = [long]([regex]::Match($accessLine, '^(\d+) ').Groups[1].Value)
-    $accessDay = [DateTimeOffset]::FromUnixTimeSeconds($accessEpoch).UtcDateTime.ToString('yyyy-MM-dd')
+    $accessLine = @((LogText) -split "`n" | Where-Object { $_ -match ($livePrefix + 'Access .*status: Some\(200\)') })[0].Trim()
+    $accessMatch = [regex]::Match($accessLine, $livePrefix)
+    $accessEpoch = [long]$accessMatch.Groups['epoch'].Value
+    if ($accessMatch.Groups['local'].Value -cne (Format-LocalLogTime $accessEpoch)) { throw 'Access time label does not match system local timezone/offset' }
+    $accessDay = [DateTimeOffset]::FromUnixTimeSeconds($accessEpoch).LocalDateTime.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
     Set-LogFilter 2224 $accessDay
     Set-LogFilter 2225 $accessDay
     Select-LogFilter 2226 2
     Select-LogFilter 2208 3
     Set-LogFilter 2227 '200'
     Set-LogFilter 2207 'access'
-    Wait-Until 'live Access/UTC-same-day/exact-status/level/text AND' { (LogText).Contains($accessLine) -and -not (LogText).Contains('Runtime') -and -not (LogStatus).Contains('筛选无效') }
+    Wait-Until 'live Access/local-same-day/exact-status/level/text AND' { (LogText).Contains($accessLine) -and -not (LogText).Contains('Runtime') -and -not (LogStatus).Contains('筛选无效') }
     Set-LogFilter 2227 '2xx'
     Wait-Until 'live status class' { (LogText).Contains($accessLine) }
     $frozenLive = LogText
@@ -211,7 +234,7 @@ public static class LogsUiRegression {
     Set-LogFilter 2227 '200'
     Wait-Until 'paused filters still use frozen success entry' { (LogText).Contains($accessLine) }
     $validLive = LogText
-    Set-LogFilter 2224 ([DateTimeOffset]::FromUnixTimeSeconds($accessEpoch).UtcDateTime.AddDays(1).ToString('yyyy-MM-dd'))
+    Set-LogFilter 2224 ([DateTimeOffset]::FromUnixTimeSeconds($accessEpoch).LocalDateTime.Date.AddDays(1).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture))
     Wait-Until 'live inverted range visible' { (LogStatus).Contains('不得晚于') }
     if ((LogText) -cne $validLive) { throw 'Invalid live range changed display' }
     Reset-LogFilters
@@ -256,23 +279,36 @@ public static class LogsUiRegression {
     LogClick 2206
     Wait-Until 'selected history tail read' { (LogText).Contains('"started"') -and (LogStatus).Contains('ai-relay.1.log') }
     # Replace only this test-owned, closed history file with schema-shaped JSONL.
-    $fixture = @(
-        '{"sequence":1,"timestamp":1704067200,"event":{"category":"runtime","level":"info","event":"started","error":null},"text":"status 503 error timeout"}',
-        '{"sequence":2,"timestamp":1704067201,"event":{"category":"access","level":"info","metadata":{"status":200,"error":null}},"text":"503 error"}',
-        '{"sequence":3,"timestamp":1704067202,"event":{"category":"access","level":"warn","metadata":{"status":503,"error":null}}}',
-        '{"sequence":4,"timestamp":1704067203,"event":{"category":"access","level":"info","metadata":{"status":null,"error":"timeout"}}}',
-        '{"sequence":5,"timestamp":1704153599,"event":{"category":"runtime","level":"error","event":"operation_failed","error":"io"}}',
-        '{"sequence":6,"timestamp":1704153600,"event":{"category":"access","level":"info","metadata":{"status":200,"error":null}}}'
-    ) -join "`n"
+    # Resolve both civil day boundaries independently using historical local rules.
+    $fixtureStart = Get-LocalDayStart ([datetime]::new(2024, 1, 1))
+    $fixtureNext = Get-LocalDayStart ([datetime]::new(2024, 1, 2))
+    $fixtureEpochs = @($fixtureStart, ($fixtureStart + 1), ($fixtureStart + 2), ($fixtureStart + 3), ($fixtureNext - 1), $fixtureNext)
+    $fixtureTemplates = @(
+        '{"sequence":1,"timestamp":EPOCH,"event":{"category":"runtime","level":"info","event":"started","error":null},"text":"status 503 error timeout"}',
+        '{"sequence":2,"timestamp":EPOCH,"event":{"category":"access","level":"info","metadata":{"status":200,"error":null}},"text":"503 error"}',
+        '{"sequence":3,"timestamp":EPOCH,"event":{"category":"access","level":"warn","metadata":{"status":503,"error":null}}}',
+        '{"sequence":4,"timestamp":EPOCH,"event":{"category":"access","level":"info","metadata":{"status":null,"error":"timeout"}}}',
+        '{"sequence":5,"timestamp":EPOCH,"event":{"category":"runtime","level":"error","event":"operation_failed","error":"io"}}',
+        '{"sequence":6,"timestamp":EPOCH,"event":{"category":"access","level":"info","metadata":{"status":200,"error":null}}}'
+    )
+    $fixture = @(for ($i = 0; $i -lt $fixtureTemplates.Count; $i++) {
+        $fixtureTemplates[$i].Replace('EPOCH', $fixtureEpochs[$i].ToString([Globalization.CultureInfo]::InvariantCulture))
+    }) -join "`n"
     [IO.File]::WriteAllText($history, $fixture + "`n")
     LogClick 2206
     Wait-Until 'structured fixture loaded' { (LogText).Contains('"sequence":6') }
     LogClick 2202
     Wait-Until 'fixture follow paused' { (LogStatus).Contains('已暂停') }
     $fixtureBytes = [IO.File]::ReadAllBytes($history)
+    foreach ($line in @((LogText) -split "`n" | Where-Object { $_.Trim() })) {
+        $entry = $line | ConvertFrom-Json
+        $epoch = $fixtureEpochs[[int]$entry.sequence - 1]
+        if ($entry.timestamp -ne $epoch) { throw 'File display changed raw UTC epoch' }
+        if ($entry.timestamp_local -cne (Format-LocalLogTime $epoch)) { throw 'File time label does not match system local timezone/offset' }
+    }
     Set-LogFilter 2224 '2024-01-01'
     Set-LogFilter 2225 '2024-01-01'
-    Wait-Until 'UTC whole-day inclusive bounds' { (LogText).Contains('"sequence":5') -and -not (LogText).Contains('"sequence":6') }
+    Wait-Until 'local whole-day inclusive bounds' { (LogText).Contains('"sequence":5') -and -not (LogText).Contains('"sequence":6') }
     Assert-Sequences @(1,2,3,4,5)
     Select-LogFilter 2226 2
     Set-LogFilter 2227 '5xx'
@@ -283,7 +319,7 @@ public static class LogsUiRegression {
     Assert-Sequences @(3)
     Set-LogFilter 2224 '2024-01-01'
     Set-LogFilter 2225 '2024-01-01'
-    Wait-Until 'UTC same-day range retains metadata AND result' { (LogText).Contains('"sequence":3') -and -not (LogStatus).Contains('筛选无效') }
+    Wait-Until 'local same-day range retains metadata AND result' { (LogText).Contains('"sequence":3') -and -not (LogStatus).Contains('筛选无效') }
     Assert-Sequences @(3)
     Set-LogFilter 2207 'started'
     Wait-Until 'text is AND not OR' { (LogText).Length -eq 0 }
@@ -307,12 +343,12 @@ public static class LogsUiRegression {
     Set-LogFilter 2227 '400-599'
     foreach ($id in @(2224,2225)) {
         Set-LogFilter $id '2024-01-01'
-        Wait-Until 'valid UTC date filter applied before rejection checks' { (LogText).Contains('"sequence":3') -and -not (LogStatus).Contains('筛选无效') }
+        Wait-Until 'valid local date filter applied before rejection checks' { (LogText).Contains('"sequence":3') -and -not (LogStatus).Contains('筛选无效') }
         Assert-Sequences @(3)
         $validDate = [ProxyUiSmoke]::ReadText((Button $id), [uint32]$child.Id)
         $validDisplay = LogText
-        # Epoch remains covered by pure utc_bound tests; GUI pickers accept only ISO/empty.
-        foreach ($invalid in @('2023-02-29','2024-13-01','2024-1-1','1704067202')) {
+        # Epoch remains covered by pure bound_with_zone tests; GUI pickers accept only ISO/empty.
+        foreach ($invalid in @('2023-02-29','2024-13-01','2024-1-1',$fixtureEpochs[2].ToString([Globalization.CultureInfo]::InvariantCulture))) {
             if ([LogsUiRegression]::SetTextRaw((Button $id), [uint32]$child.Id, $invalid)) { throw "Date picker $id accepted invalid text: $invalid" }
             if ([ProxyUiSmoke]::ReadText((Button $id), [uint32]$child.Id) -cne $validDate) { throw "Rejected date changed picker $id value" }
             if ((LogText) -cne $validDisplay) { throw 'Rejected date changed display' }
@@ -320,7 +356,7 @@ public static class LogsUiRegression {
     }
     Set-LogFilter 2224 '2024-01-02'
     Set-LogFilter 2225 '2024-01-01'
-    Wait-Until 'inverted UTC range is visible' { (LogStatus).Contains('不得晚于') }
+    Wait-Until 'inverted local range is visible' { (LogStatus).Contains('不得晚于') }
     Reset-LogFilters
     LogClick 2228
     Wait-Until 'errors include HTTP failure, structured code, error level' { (LogText).Contains('"sequence":5') -and -not (LogText).Contains('"sequence":2') }
@@ -334,7 +370,8 @@ public static class LogsUiRegression {
     Wait-Until 'clear file display only' { (LogText).Length -eq 0 }
     if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($history)) -ne [Convert]::ToBase64String($fixtureBytes)) { throw 'Clear view modified file' }
     # Clear view retains follow cursor: append while paused, then resume without tail reload.
-    [IO.File]::AppendAllText($history, '{"sequence":7,"timestamp":1704153601,"event":{"category":"runtime","level":"info","event":"follow-smoke","error":null}}' + "`n")
+    $append = '{"sequence":7,"timestamp":EPOCH,"event":{"category":"runtime","level":"info","event":"follow-smoke","error":null}}'.Replace('EPOCH', ($fixtureNext + 1).ToString([Globalization.CultureInfo]::InvariantCulture))
+    [IO.File]::AppendAllText($history, $append + "`n")
     Start-Sleep -Milliseconds 1100
     if ((LogText).Length -ne 0) { throw 'Paused file view followed append' }
     LogClick 2202
@@ -392,7 +429,7 @@ public static class LogsUiRegression {
     Apply-Options
     Wait-Until 'logging continues after clear all' { (LogText).Contains('ConfigurationApplied') }
     if ((Read-Shared $current).Contains('probe=1')) { throw 'Query values leaked into managed logs' }
-    Write-Output 'PASS: typed live snapshots with original Debug display, live/file UTC/date/category/status/errors/text/level AND, invalid-filter preservation, paused filters, cursor/follow/page, 1000-line bound, DPI-aware layout, non-destructive view operations, apply/save and cleanup regression.'
+    Write-Output 'PASS: typed live snapshots with local time/offset and original Debug display, live/file local date/category/status/errors/text/level AND, unchanged UTC epochs/file bytes, invalid-filter preservation, paused filters, cursor/follow/page, 1000-line bound, DPI-aware layout, non-destructive view operations, apply/save and cleanup regression.'
     Write-Output 'LIMITS: synthetic messages; no physical keyboard or multi-monitor DPI validation; no real Startup writes.'
 }
 & (Join-Path $PSScriptRoot 'smoke-proxy-ui.ps1') -ExePath $ExePath -StepTimeoutSeconds $StepTimeoutSeconds -LogsOnly
