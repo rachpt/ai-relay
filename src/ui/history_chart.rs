@@ -8,9 +8,10 @@ use crate::windows::scale;
 use windows_sys::Win32::{
     Foundation::{RECT, SIZE},
     Graphics::Gdi::{
-        DC_BRUSH, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW,
-        FillRect, FrameRect, GetStockObject, GetTextExtentPoint32W, HDC, HFONT, IntersectClipRect,
-        RestoreDC, SaveDC, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor, TRANSPARENT,
+        DC_BRUSH, DC_PEN, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        DrawTextW, FillRect, FrameRect, GetStockObject, GetTextExtentPoint32W, HDC, HFONT,
+        IntersectClipRect, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode, SetDCBrushColor,
+        SetDCPenColor, SetTextColor, TRANSPARENT,
     },
     UI::Controls::DRAWITEMSTRUCT,
 };
@@ -99,6 +100,7 @@ struct Canvas {
     font: HFONT,
     heading: HFONT,
     palette: super::theme::Palette,
+    contrast: bool,
     bounds: RECT,
     dpi: u32,
 }
@@ -136,6 +138,26 @@ impl Canvas {
         }
     }
 
+    fn panel(&self, rect: RECT, fill: u32, border: u32, diameter: i32) {
+        // SAFETY: Canvas is used only under draw's saved DC; stock selections
+        // and colors are restored, and no GDI objects are owned or retained.
+        unsafe {
+            SelectObject(self.dc, GetStockObject(DC_BRUSH));
+            SelectObject(self.dc, GetStockObject(DC_PEN));
+            SetDCBrushColor(self.dc, fill);
+            SetDCPenColor(self.dc, border);
+            RoundRect(
+                self.dc,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                diameter,
+                diameter,
+            );
+        }
+    }
+
     fn text(&self, text: &str, mut rect: RECT, heading: bool, centered: bool) {
         if rect.right <= rect.left || rect.bottom <= rect.top {
             return;
@@ -146,6 +168,14 @@ impl Canvas {
         // used. Font selection and text/DC attributes are restored by SavedDc.
         unsafe {
             SelectObject(self.dc, if heading { self.heading } else { self.font });
+            SetTextColor(
+                self.dc,
+                if heading || self.contrast {
+                    self.palette.text
+                } else {
+                    self.palette.disabled
+                },
+            );
             DrawTextW(
                 self.dc,
                 text.as_ptr(),
@@ -186,9 +216,29 @@ impl Canvas {
             "已报告总 Token",
         ];
         for (index, title) in titles.into_iter().enumerate() {
-            let x = self.px(8) + width * index as i32 / 4;
+            let card_left = self.px(8) + width * index as i32 / 4;
             let right = self.px(8) + width * (index as i32 + 1) / 4;
-            let cell = right - x - self.px(8);
+            self.panel(
+                self.rect(
+                    card_left,
+                    self.px(2),
+                    right - card_left - self.px(6),
+                    self.px(70),
+                ),
+                if self.contrast {
+                    self.palette.surface
+                } else {
+                    self.palette.subtle()
+                },
+                if self.contrast {
+                    self.palette.border
+                } else {
+                    self.palette.subtle()
+                },
+                self.px(12),
+            );
+            let x = card_left + self.px(10);
+            let cell = (right - x - self.px(14)).max(0);
             self.text(
                 title,
                 self.rect(x, self.px(4), cell, self.px(20)),
@@ -353,7 +403,20 @@ impl Canvas {
                 false,
             );
             let track = self.rect(x, top + self.px(21), width, self.px(4));
-            self.fill(track, self.palette.disabled, true);
+            self.panel(
+                track,
+                if self.contrast {
+                    self.palette.surface
+                } else {
+                    self.palette.subtle()
+                },
+                if self.contrast {
+                    self.palette.border
+                } else {
+                    self.palette.subtle()
+                },
+                self.px(4),
+            );
             if let Some(length) = proportion(count, summary.requests, width)
                 && count != 0
             {
@@ -389,10 +452,12 @@ pub(super) unsafe fn draw(
     dpi: u32,
     font: HFONT,
     heading: HFONT,
-    palette: super::theme::Palette,
+    theme: &super::theme::Theme,
     report: Option<&crate::history::QueryReport>,
     pending: bool,
 ) {
+    let palette = theme.palette;
+    let kind = theme.kind;
     if item.hDC.is_null()
         || item.rcItem.right <= item.rcItem.left
         || item.rcItem.bottom <= item.rcItem.top
@@ -427,15 +492,16 @@ pub(super) unsafe fn draw(
             font,
             heading,
             palette,
+            contrast: kind == super::theme::Resolved::Contrast,
             bounds,
             dpi: if dpi == 0 { 96 } else { dpi },
         };
-        canvas.fill(bounds, palette.surface, false);
+        canvas.fill(bounds, palette.background, false);
         let width = (bounds.right - bounds.left - canvas.px(16)).max(0);
         canvas.summaries(report, pending, width);
         canvas.fill(
             canvas.rect(canvas.px(8), canvas.px(74), width, canvas.px(1)),
-            palette.disabled,
+            palette.border,
             false,
         );
         let message = if pending {

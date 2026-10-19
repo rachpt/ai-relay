@@ -28,6 +28,20 @@ cargo clippy --all-targets -- -D warnings
 - 纯逻辑验证通过不能替代 Windows GUI、IPC、自启和便携测试。
 - 自动测试已覆盖配置、原子保存、代理、usage、单实例及日志；完整系统验收仍须Windows手工验证，详见本批开发记录。
 
+## target 空间管理
+
+- `target/` 是构建产物，不是应用数据目录。先统计后清理，区分第三方依赖、项目测试EXE/PDB、增量缓存、可运行产物及验证截图；统计NTFS硬链接时不要重复计算为实际独占空间。
+- 清理前确认没有Cargo/rustc/clippy或本项目测试正在执行，不主动结束用户进程。遇到配置、密钥、数据库、JSONL或重解析点应单独核查，不把整个目录一律视为可丢弃数据。
+- 项目级开发缓存清理可先预览：
+
+  ```text
+  cargo clean --dry-run --verbose --package ai-relay --profile dev --locked --offline
+  ```
+
+- 不带 `--dry-run` 会同时删除本项目Debug EXE/PDB、库、测试和相关fingerprint/incremental。若需保留当前可运行版本，先将Debug EXE及匹配PDB移到清理范围外，操作成功后恢复并比对SHA256；不要直接清空整个 `target/`。包级清理仍会增加下一次项目编译/测试的耗时，但比全部依赖冷重建更节省开发时间。
+- 默认保留Release、发布包、最新及历史验证证据；不把清理后未经重跑的测试宣传为再次通过。不为一次空间清理擅改 `profile.dev` / `profile.test` 或禁用增量编译。
+- 本次清理明细及硬链接去重口径见[2026-10-19清理记录](development/2026-10-19-03-target-space-cleanup.md)。
+
 ## 当前程序入口
 
 ```text
@@ -53,6 +67,18 @@ cargo build --release --target x86_64-pc-windows-msvc
 - ZIP 中不包含旧脚本、配置、密钥、日志、PID 或调试符号。
 
 `tools/package.ps1` 可生成静态CRT x64便携预览ZIP，PE导入检查只发现系统DLL；不是完成签名/许可证/干净系统验收的正式版。Release EXE 为开发预览。`tools/smoke-proxy-ui.ps1` 使用临时配置和本地 mock 验证保存、启停、转发、重新加载与退出清理。`tools/smoke-native-host.ps1` 提供有限时 GUI 自动冒烟；`tools/generate-icon.ps1` 从 SVG 生成 ICO，可用 `-ValidateOnly` 检查现有图标。`tools/smoke-logs-ui.ps1 -RequireAccessLog` 验证实时/文件日志及安全清理。真实托盘菜单退出、Explorer 重启和多屏 DPI 仍需手工验收。
+
+日志高度/暗色按住滚动专项：`powershell.exe -NoProfile -NonInteractive -File tools/smoke-logs-interaction-ui.ps1 -ValidateOnly` 先检查声明/纯逻辑；随后不带该开关在独占桌面执行，默认使用Debug，显式 `-ExePath` 必须是绝对路径。脚本使用私有停止配置/关闭的虚构JSONL文件，不保存配置或修改剪贴板/Startup；按住未释放阶段检查capture、native位置和实际CopyFromScreen条带，不以PrintWindow代替。遮挡或前台请求拒绝使Complete=false，即使功能Passed=true也不能宣称视觉全验收。保留临时fixture和报告供复核。缩放以异步请求、完整外框和活动日志后代布局的有界观察确认完成（含仅宽度变化）；进程原始handle/PID/start/实际EXE始终严格核验，仅空托管Path有界等待。不要与原生HWND测试或其他GUI冒烟并行执行；整条测试命令超时应分段补齐，不把未执行项记为通过。最新修复及一次早轮Debug白条失败的保留边界见[08记录](development/2026-10-19-08-review-interaction-fixes.md)。
+
+概览图表定向验证：`tools/smoke-overview-dashboard-ui.ps1 -ValidateOnly` 先检查声明及辅助自检，随后以 `-ExePath target/debug/ai-relay.exe` 或Release执行。工具使用真实回环mock/私有配置，检查计数、字节、速率和隐藏/启停语义。最小/默认/放大窗口按实际工作区测量；完整dashboard装不进viewport时仅记录分段图/几何及限制，能完整放入时从整窗PrintWindow作严格完整矩形1:1裁图。图像均为OFFSCREEN，不代表物理可见性；外部字体预算复用Font::new契约，不直接使用跨进程HFONT或宣传OCR/实际文字fit证明。
+
+普通打开自动启动专项：先执行 `powershell.exe -NoProfile -File tools/smoke-auto-start-ui.ps1 -ValidateOnly` 检查声明，再以 `-ExePath target/debug/ai-relay.exe` 或Release运行。工具只以普通 `Launch --config-dir <绝对私有临时目录>` 打开，7组/10个fixture覆盖缺省与显式开关、首次无配置、无效/空上游、占用端口及LAN保护；自动监听不靠CLI/GUI Start触发。只读检查设置开关、健康接口与固定回环mock GET，配置哈希在启动前/过程中/正常退出后比较。已有实例时拒绝执行；原始进程handle/EXE/HWND树固定，退出只走自有窗口正常路由，不强杀，异常保留fixture。未改真实Startup/剪贴板/系统代理/防火墙；有限观察窗的无重试、定向HWND状态不代表物理输入或系统完整验收。
+
+深色标题菜单专项：先运行 `powershell.exe -NoProfile -NonInteractive -File tools/smoke-dark-menu-ui.ps1 -ValidateOnly`，再以默认Debug或 `-ExePath target/release/ai-relay.exe` 执行。工具只用私有停止配置，验证浅→深→浅、F10/Alt+M/Alt+Space、四子菜单／助记键／方向键切页／Escape及原生命令和启禁／radio，保存21张OFFSCREEN PrintWindow菜单图与像素采样，内部纯RGB空图统一拒绝；配置哈希不变、正常退出、不强杀、不改剪贴板／Startup／系统主题。实际高对比度／高DPI／读屏／物理键鼠仍需验收，Complete=false。不要与其他GUI冒烟或大量原生HWND测试并行执行，以免窗口激活／焦点干扰；旧 `smoke-title-menu-ui.ps1` 包含已过时的caption hamburger／布局断言，不能替代本专项。
+
+深色日期专项：先运行 `powershell.exe -NoProfile -NonInteractive -File tools/smoke-dark-date-picker-ui.ps1 -ValidateOnly`，再用默认Debug或 `-ExePath target/release/ai-relay.exe` 执行，不与其他GUI测试并行。私有停止配置／无网络，浅→深→浅遍历日志与统计四日期框，检查闭合／聚焦／展开／翻月／选日／清空、原生日期值与最小尺寸；84张OFFSCREEN及最多12张有遮挡保护的物理图，正文及月历标题／日期网格／今天页脚逐区检查前景；ValidateOnly拒绝纯色和逐区缺失合成图，8轮主题＋弹窗GDI及正常退出／配置不变。遮挡会跳过物理图，不当作通过；实际高DPI／高对比度／读屏保持待验收。旧 `smoke-date-picker-ui.ps1` 有过时的父窗口／设置分类及允许白色弹窗断言，不替代本专项。
+
+提交前复核中菜单纯黑捕获／浅色月历翻月页脚缺失曾被严格检查拒绝，最新Release日期专项未通过；不以早轮成功或普通测试代替，当前限制及失败证据见[提交前review记录](development/2026-10-20-02-precommit-review.md)。
 
 补充冒烟：`smoke-history-ui.ps1`、`smoke-settings-ui.ps1`、`smoke-cli.ps1`，使用临时目录和本地mock，真实Startup未修改。迁移目前覆盖文件/历史快照及失败回退单测，未对真实软件/标准目录执行破坏性迁移。
 

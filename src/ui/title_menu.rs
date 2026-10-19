@@ -4,9 +4,12 @@
 //!
 //! The caption icon retains Windows' system-menu accessibility, Alt+Space and
 //! double-click-to-close behavior. The host may intercept WM_NCLBUTTONDBLCLK /
-//! HTSYSMENU if it deliberately wants to suppress the latter. Native popup menus
-//! retain system styling; application dark mode does not force dark popups.
-use super::theme::{Palette, Resolved};
+//! HTSYSMENU if it deliberately wants to suppress the latter. Dark menus use
+//! documented owner drawing; light/high contrast retain native system styling.
+use super::{
+    menu_theme::MenuTheme,
+    theme::{Palette, Resolved},
+};
 use crate::windows::{Menu, last_error, scale, wide};
 use std::{mem::size_of, ptr::null_mut};
 use windows_sys::Win32::{
@@ -94,6 +97,7 @@ pub(super) struct TitleMenu {
     original_small: HICON,
     key: Option<IconKey>,
     install_caption_icon: bool,
+    menu_theme: MenuTheme,
 }
 impl Default for TitleMenu {
     fn default() -> Self {
@@ -105,6 +109,7 @@ impl Default for TitleMenu {
             // Unit tests exercise the caption-icon path; the app disables it and
             // uses a client-side menu button so taskbar keeps the product icon.
             install_caption_icon: true,
+            menu_theme: MenuTheme::default(),
         }
     }
 }
@@ -215,6 +220,8 @@ impl TitleMenu {
                 self.icon = Some(icon);
                 self.key = Some(key);
             }
+            // Theme allocation failure keeps the fully usable native menu.
+            let _ = self.menu_theme.refresh(hwnd, dpi, kind, palette);
             DrawMenuBar(hwnd);
             Ok(())
         }
@@ -235,6 +242,9 @@ impl TitleMenu {
         if self.hwnd.is_null() || self.hwnd != hwnd {
             return Err("标题菜单尚未附加到此窗口。".into());
         }
+        // SAFETY: Same live owner-thread HWND contract as this method. This
+        // must also run in client-button mode, where no caption icon is installed.
+        unsafe { self.menu_theme.refresh(hwnd, dpi, kind, palette)? };
         if !self.install_caption_icon {
             return Ok(());
         }
@@ -251,6 +261,12 @@ impl TitleMenu {
         self.icon = Some(next);
         self.key = Some(key);
         Ok(())
+    }
+
+    pub(super) unsafe fn message(&self, message: u32, w: usize, l: isize) -> Option<isize> {
+        // SAFETY: The host forwards its actual Win32 menu messages before
+        // generic control drawing, without a borrow across modal dispatch.
+        unsafe { self.menu_theme.message(message, w, l) }
     }
 }
 
@@ -670,6 +686,14 @@ mod tests {
                 .refresh(window.0, 96, Resolved::Light, palette(0x202020))
                 .unwrap();
             assert_eq!(title.icon.as_ref().unwrap().0, first);
+            // Warm the system menu font/metrics cache introduced by dark drawing
+            // before checking repeated refreshes for resource growth.
+            title
+                .refresh(window.0, 96, Resolved::Dark, palette(0xf0f0f0))
+                .unwrap();
+            title
+                .refresh(window.0, 96, Resolved::Light, palette(0x202020))
+                .unwrap();
             let baseline = resources();
             for index in 0..20 {
                 let kind = if index % 2 == 0 {

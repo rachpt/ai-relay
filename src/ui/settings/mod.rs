@@ -42,6 +42,7 @@ const RESTORE: u32 = 2036;
 const DISCARD: u32 = 2037;
 const CATEGORY: u32 = 2039;
 const LOG_SETTINGS: u32 = 2062;
+const AUTO_START: u32 = 2065;
 
 #[derive(Default)]
 pub(super) struct Settings {

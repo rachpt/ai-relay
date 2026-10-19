@@ -26,6 +26,14 @@
 
 - [0012：采用MIT项目许可证](0012-mit-license.md)
 
+- [0013：原生控件视觉统一与输入框边界](0013-native-control-polish.md)
+
+- [0014：暗色滚动条鼠标跟踪与日志高度调整](0014-scrollbar-tracking-log-resize.md)
+
+- [0015：公开API深色标题／系统菜单](0015-dark-title-menu.md)
+
+- [0016：保留原生布局的深色日期框与月历](0016-dark-native-date-picker.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

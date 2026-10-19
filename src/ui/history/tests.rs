@@ -95,9 +95,9 @@ fn rejects_results_after_scope_changes_including_return_to_same_directory() {
 #[test]
 fn chart_and_results_fit_minimum_client_at_common_dpi() {
     for dpi in [96, 144, 192] {
-        let bottom = scale(880 - 64 - 92, dpi);
-        for sort_top in [312 + 200 + 8, 450] {
-            let table_top = scale(sort_top + 36, dpi);
+        let bottom = viewport::content_bottom(dpi, scale(820, dpi));
+        for sort_top in [312 + 200 + 8, 466] {
+            let table_top = scale(sort_top + 72, dpi);
             assert!(bottom - table_top >= scale(80, dpi));
         }
     }

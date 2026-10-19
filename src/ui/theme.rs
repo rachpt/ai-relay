@@ -73,27 +73,56 @@ impl Palette {
                     accent_surface: GetSysColor(COLOR_HIGHLIGHT),
                 },
                 Resolved::Light => Self {
-                    background: 0x00ffffff,
+                    background: 0x00fbf7f5,
                     surface: 0x00ffffff,
-                    text: 0x00262220,
-                    disabled: 0x00756d66,
-                    accent: 0x00d77800,
-                    border: 0x00e3ded9,
-                    accent_surface: 0x00fcf0e5,
+                    text: 0x003d2b20,
+                    disabled: 0x00806a5a,
+                    accent: 0x00ce5c31,
+                    border: 0x00ebdfd7,
+                    accent_surface: 0x00ffefe8,
                 },
                 Resolved::Dark => Self {
-                    background: 0x0024201e,
-                    surface: 0x00322c29,
-                    text: 0x00f5f2ee,
-                    disabled: 0x00b2aaa2,
-                    accent: 0x00ffc078,
-                    border: 0x00574e47,
-                    accent_surface: 0x00543e29,
+                    background: 0x00221915,
+                    surface: 0x0032261f,
+                    text: 0x00f8eee9,
+                    disabled: 0x00c5afa1,
+                    accent: 0x00ffba9b,
+                    border: 0x00544035,
+                    accent_surface: 0x00513929,
                 },
             }
         }
     }
+
+    pub fn subtle(self) -> u32 {
+        blend(self.background, self.text, 5)
+    }
+
+    pub fn hover(self) -> u32 {
+        blend(self.surface, self.accent, 10)
+    }
+
+    pub fn on_accent(self) -> u32 {
+        let brightness = (self.accent & 255) * 299
+            + ((self.accent >> 8) & 255) * 587
+            + ((self.accent >> 16) & 255) * 114;
+        if brightness >= 155_000 {
+            0x00221915
+        } else {
+            0x00ffffff
+        }
+    }
 }
+
+pub(super) fn blend(a: u32, b: u32, percent: u32) -> u32 {
+    let percent = percent.min(100);
+    [0, 8, 16].into_iter().fold(0, |color, shift| {
+        let channel =
+            (((a >> shift) & 255) * (100 - percent) + ((b >> shift) & 255) * percent) / 100;
+        color | (channel << shift)
+    })
+}
+
 struct Brush(HBRUSH);
 impl Brush {
     fn new(color: u32) -> Result<Self, String> {
@@ -186,7 +215,8 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
         (*state).theme = theme;
         let dpi = (*state).dpi;
         let palette = (*state).theme.palette;
-        // Optional icon refresh failure leaves the prior valid caption icon.
+        // Optional menu styling falls back to native; icon allocation failure
+        // leaves the prior valid caption icon.
         let _ = (*state).title_menu.refresh(hwnd, dpi, kind, palette);
         let tab = (*state).tabs.handle;
         SetWindowSubclass(tab, Some(tab_proc), 1, state as usize);
@@ -251,6 +281,7 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
             }
             let button_kind = style & BS_TYPEMASK as u32;
             if class == "Button"
+                && GetDlgCtrlID(child) != 2230
                 && [
                     BS_PUSHBUTTON as u32,
                     BS_DEFPUSHBUTTON as u32,
@@ -269,9 +300,12 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
                         }) as isize,
                 );
             }
+            logs::apply_grip(child, kind, palette, dpi);
             control_theme::apply(child, kind, (*state).theme.palette, (*state).dpi);
             choices::apply(child, kind, (*state).theme.palette, (*state).dpi);
             date_picker::apply(child, kind, (*state).theme.palette, (*state).dpi);
+            buttons::apply(child, kind);
+            input_frame::apply(child, kind, palette, dpi);
             rounded::apply(child, kind, (*state).theme.palette, (*state).dpi);
             scroll_theme::apply(child, kind, (*state).theme.palette, (*state).dpi);
             InvalidateRect(child, null(), 1);
@@ -308,10 +342,18 @@ pub(super) unsafe fn paint(
                     || GetWindowLongPtrW(l as HWND, GWL_STYLE) as u32 & ES_READONLY as u32 != 0;
                 SetTextColor(
                     dc,
-                    if GetWindowLongPtrW(l as HWND, GWL_STYLE) as u32 & WS_DISABLED == 0 {
-                        palette.text
-                    } else {
+                    if GetWindowLongPtrW(l as HWND, GWL_STYLE) as u32 & WS_DISABLED != 0
+                        || ((*state).theme.kind != Resolved::Contrast
+                            && !edit
+                            && l as HWND != (*state).brand_label
+                            && !(*state)
+                                .labels
+                                .first()
+                                .is_some_and(|label| *label == l as HWND))
+                    {
                         palette.disabled
+                    } else {
+                        palette.text
                     },
                 );
                 SetBkColor(
@@ -334,69 +376,7 @@ pub(super) unsafe fn paint(
                     return None;
                 }
                 if item.CtlType == ODT_BUTTON {
-                    let active = item.itemState & (ODS_FOCUS | ODS_SELECTED) != 0;
-                    let primary = [2001, tabs::START, 2320, 2219].contains(&item.CtlID)
-                        && item.itemState & ODS_DISABLED == 0;
-                    let danger = [2210, 2211, 2350, 2352].contains(&item.CtlID)
-                        && item.itemState & ODS_DISABLED == 0;
-                    let mut palette = palette;
-                    if danger {
-                        palette.accent = if (*state).theme.kind == Resolved::Dark {
-                            0x009b9bff
-                        } else {
-                            0x003c36b4
-                        };
-                        palette.accent_surface = if (*state).theme.kind == Resolved::Dark {
-                            0x00332a40
-                        } else {
-                            0x00f5f3ff
-                        };
-                    }
-                    rounded::surface(
-                        item.hDC,
-                        &item.rcItem,
-                        (*state).dpi,
-                        palette.background,
-                        if primary || danger || active {
-                            palette.accent_surface
-                        } else {
-                            palette.surface
-                        },
-                        if active || primary || danger {
-                            palette.accent
-                        } else {
-                            palette.border
-                        },
-                    );
-                    SetBkMode(item.hDC, TRANSPARENT as i32);
-                    SetTextColor(
-                        item.hDC,
-                        if item.itemState & ODS_DISABLED != 0 {
-                            palette.disabled
-                        } else if primary || danger {
-                            palette.accent
-                        } else {
-                            palette.text
-                        },
-                    );
-                    let title = wide(&settings::text(item.hwndItem));
-                    let mut rect = item.rcItem;
-                    if item.itemState & ODS_SELECTED != 0 {
-                        OffsetRect(&mut rect, 1, 1);
-                    }
-                    let flags = DT_CENTER
-                        | DT_VCENTER
-                        | DT_SINGLELINE
-                        | if item.itemState & ODS_NOACCEL != 0 {
-                            DT_HIDEPREFIX
-                        } else {
-                            0
-                        };
-                    DrawTextW(item.hDC, title.as_ptr(), -1, &mut rect, flags);
-                    if item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0 {
-                        InflateRect(&mut rect, -4, -4);
-                        DrawFocusRect(item.hDC, &rect);
-                    }
+                    buttons::draw(item, (*state).dpi, palette, (*state).theme.kind);
                     return Some(1);
                 }
                 if item.CtlType != ODT_TAB || item.itemID > 3 {
@@ -538,10 +518,23 @@ unsafe extern "system" fn tab_proc(
                         continue;
                     }
                     let active = selected == index as isize;
-                    if active && let Ok(brush) = Brush::new(palette.accent_surface) {
-                        FillRect(dc, &rect, brush.0);
+                    if active {
+                        let mut pill = rect;
+                        InflateRect(&mut pill, -scale(3, (*state).dpi), -scale(3, (*state).dpi));
+                        rounded::surface(
+                            dc,
+                            &pill,
+                            (*state).dpi,
+                            palette.background,
+                            palette.accent_surface,
+                            palette.accent_surface,
+                        );
                     }
-                    let color = if active { palette.accent } else { palette.text };
+                    let color = if active {
+                        palette.accent
+                    } else {
+                        palette.disabled
+                    };
                     SetTextColor(dc, color);
                     let title = wide(title);
                     let mut measured = RECT::default();
@@ -583,13 +576,7 @@ unsafe extern "system" fn tab_proc(
                         &mut text_rect,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                     );
-                    if active {
-                        let mut line = rect;
-                        line.top = line.bottom - scale(2, (*state).dpi);
-                        if let Ok(brush) = Brush::new(palette.accent) {
-                            FillRect(dc, &line, brush.0);
-                        }
-                    }
+
                     if active
                         && GetFocus() == hwnd
                         && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize == 0
@@ -633,6 +620,54 @@ mod tests {
             assert!(scale(486 - 48 + 32, dpi) < scale(546 - 48, dpi));
             assert_eq!(scale(32, dpi), [32, 48, 64][(dpi / 48 - 2) as usize]);
         }
+    }
+
+    fn luminance(color: u32) -> f64 {
+        [0.2126, 0.7152, 0.0722]
+            .into_iter()
+            .enumerate()
+            .map(|(index, weight)| {
+                let channel = f64::from((color >> (index * 8)) & 255) / 255.0;
+                weight
+                    * if channel <= 0.04045 {
+                        channel / 12.92
+                    } else {
+                        ((channel + 0.055) / 1.055).powf(2.4)
+                    }
+            })
+            .sum()
+    }
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn app_palette_preserves_readable_text_and_solid_action_contrast() {
+        for kind in [Resolved::Light, Resolved::Dark] {
+            let p = Palette::new(kind);
+            for background in [
+                p.background,
+                p.surface,
+                p.subtle(),
+                p.hover(),
+                p.accent_surface,
+            ] {
+                assert!(contrast(p.text, background) >= 7.0);
+                assert!(
+                    contrast(p.disabled, background) >= 4.5,
+                    "secondary text/background contrast in {kind:?}: {}",
+                    contrast(p.disabled, background)
+                );
+            }
+            assert!(contrast(p.on_accent(), p.accent) >= 4.5);
+            assert!(contrast(p.accent, p.surface) >= 4.5);
+            assert_ne!(p.background, p.surface);
+        }
+        assert_eq!(blend(0, 0xffffff, 100), 0xffffff);
+        assert_eq!(blend(0, 0xffffff, 150), 0xffffff);
+        assert_eq!(blend(0x123456, 0xffffff, 0), 0x123456);
     }
 
     #[test]

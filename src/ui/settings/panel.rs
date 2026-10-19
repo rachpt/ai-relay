@@ -15,12 +15,13 @@ impl Settings {
         id: u32,
         row: (i32, i32, i32, i32),
     ) -> Result<HWND, String> {
+        let edit_frame = class.eq_ignore_ascii_case("EDIT") && style & WS_BORDER != 0;
         let class = wide(class);
         let title = wide(title);
         // SAFETY: Strings live for synchronous creation, parent/module are live; child ID is not a pointer.
         let control = unsafe {
             CreateWindowExW(
-                0,
+                if edit_frame { WS_EX_CLIENTEDGE } else { 0 },
                 class.as_ptr(),
                 title.as_ptr(),
                 WS_CHILD | WS_VISIBLE | style,
@@ -152,9 +153,9 @@ impl Settings {
             hwnd,
             instance,
             "BUTTON",
-            "下次程序启动时自动启动代理",
+            "打开软件后自动启动代理（使用已保存配置）",
             WS_TABSTOP | BS_AUTOCHECKBOX as u32,
-            0,
+            AUTO_START,
             (180, 370, 550, 28),
         )?;
         self.directory = self.control(
@@ -297,6 +298,10 @@ impl Settings {
             .unwrap_or(142)
             + 24
     }
+    pub(in crate::ui) fn document_bottom(&self, dpi: u32) -> i32 {
+        scale(self.actions_y() - 48 + 32, dpi)
+    }
+
     pub fn layout(&self, dpi: u32, width: i32, height: i32) {
         let actions_y = self.actions_y();
         let mut moves = MoveBatch::with_capacity(self.controls.len());
@@ -307,7 +312,7 @@ impl Settings {
                     scale(24, dpi),
                     scale(110, dpi),
                     width,
-                    (height - scale(194, dpi)).max(scale(120, dpi)),
+                    (viewport::content_bottom(dpi, height) - scale(110, dpi)).max(scale(120, dpi)),
                 );
                 continue;
             }

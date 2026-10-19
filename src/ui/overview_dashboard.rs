@@ -276,11 +276,11 @@ mod painting {
     use super::*;
     use crate::windows::scale;
     use windows_sys::Win32::{
-        Foundation::RECT,
+        Foundation::{RECT, SIZE},
         Graphics::Gdi::{
             DC_BRUSH, DC_PEN, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-            DT_VCENTER, DrawTextW, Ellipse, FillRect, GetStockObject, HDC, HFONT,
-            IntersectClipRect, LineTo, MoveToEx, Rectangle, RestoreDC, RoundRect, SaveDC,
+            DT_VCENTER, DrawTextW, Ellipse, FillRect, GetStockObject, GetTextExtentPoint32W, HDC,
+            HFONT, IntersectClipRect, LineTo, MoveToEx, Rectangle, RestoreDC, RoundRect, SaveDC,
             SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
         },
         UI::Controls::DRAWITEMSTRUCT,
@@ -308,6 +308,74 @@ mod painting {
             color |= channel << shift;
         }
         color
+    }
+
+    struct ChartLayout {
+        title: RECT,
+        unit: RECT,
+        legends: [RECT; 2],
+        status: Option<RECT>,
+        plot: RECT,
+    }
+    impl ChartLayout {
+        fn new(panel: RECT, dpi: u32, labels: [i32; 2], unit_width: i32, status: bool) -> Self {
+            let px = |value| scale(value, dpi);
+            let left = panel.left + px(14);
+            let right = panel.right - px(14);
+            let gap = px(12);
+            let available = (right - left - gap).max(0);
+            let marker = px(22);
+            let desired = labels.map(|width| width.max(0).saturating_add(marker));
+            let first = if desired[0].saturating_add(desired[1]) <= available {
+                desired[0]
+            } else {
+                desired[0].min(available / 2)
+            };
+            let second = desired[1].min((available - first).max(0));
+            let top = panel.top + px(34);
+            let legends = [
+                RECT {
+                    left,
+                    top,
+                    right: left + first,
+                    bottom: top + px(20),
+                },
+                RECT {
+                    left: left + first + gap,
+                    top,
+                    right: left + first + gap + second,
+                    bottom: top + px(20),
+                },
+            ];
+            let unit = RECT {
+                left: (right - unit_width.max(0)).max(left),
+                top: panel.top + px(8),
+                right,
+                bottom: panel.top + px(30),
+            };
+            Self {
+                title: RECT {
+                    left,
+                    top: unit.top,
+                    right: (unit.left - gap).max(left),
+                    bottom: unit.bottom,
+                },
+                unit,
+                legends,
+                status: status.then_some(RECT {
+                    left: panel.left + px(62),
+                    top: panel.top + px(58),
+                    right,
+                    bottom: panel.top + px(76),
+                }),
+                plot: RECT {
+                    left: panel.left + px(62),
+                    top: panel.top + px(if status { 88 } else { 68 }),
+                    right: panel.right - px(18),
+                    bottom: panel.bottom - px(32),
+                },
+            }
+        }
     }
 
     struct Canvas {
@@ -380,6 +448,21 @@ mod painting {
                     DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | align,
                 );
             }
+        }
+        fn text_width(&self, text: &str) -> i32 {
+            let text: Vec<u16> = text.encode_utf16().collect();
+            let mut size = SIZE::default();
+            // SAFETY: Live guarded paint DC and borrowed font; UTF-16 and output
+            // buffer live through the call. Fixed chart labels have bounded length.
+            unsafe {
+                SelectObject(self.dc, self.font);
+                if let Ok(length) = i32::try_from(text.len())
+                    && GetTextExtentPoint32W(self.dc, text.as_ptr(), length, &mut size) != 0
+                {
+                    return size.cx;
+                }
+            }
+            self.px(120)
         }
         fn line(&self, a: (i32, i32), b: (i32, i32), color: u32) {
             // SAFETY: Coordinates are bounded by the clipped panel. MoveToEx
@@ -479,7 +562,16 @@ mod painting {
                 let w = if i == 3 { width - x } else { cell };
                 let card = self.rect(bounds, x, 0, w, self.px(112));
                 let color = self.colors[i];
-                self.panel(card, self.palette.surface, self.palette.border, 12);
+                self.panel(
+                    card,
+                    self.palette.surface,
+                    if self.kind == Resolved::Contrast {
+                        self.palette.border
+                    } else {
+                        blend(self.palette.background, self.palette.border, 55)
+                    },
+                    16,
+                );
                 let badge = self.rect(card, self.px(12), self.px(12), self.px(22), self.px(22));
                 let tint = if self.kind == Resolved::Contrast {
                     self.palette.surface
@@ -491,7 +583,11 @@ mod painting {
                 self.text(
                     ["累计请求", "错误次数", "活动请求", "下载累计"][i],
                     self.rect(card, self.px(42), self.px(12), w - self.px(52), self.px(22)),
-                    self.palette.text,
+                    if self.kind == Resolved::Contrast {
+                        self.palette.text
+                    } else {
+                        self.palette.disabled
+                    },
                     false,
                     0,
                 );
@@ -499,23 +595,36 @@ mod painting {
                 self.text(
                     &value,
                     self.rect(card, self.px(12), self.px(40), w - self.px(24), self.px(36)),
-                    color,
+                    self.palette.text,
                     true,
                     0,
                 );
                 self.text(
                     &details[i],
                     self.rect(card, self.px(12), self.px(82), w - self.px(24), self.px(20)),
-                    self.palette.text,
+                    if self.kind == Resolved::Contrast {
+                        self.palette.text
+                    } else {
+                        self.palette.disabled
+                    },
                     false,
                     0,
                 );
             }
         }
         fn chart(&self, panel: RECT, timeline: &Timeline, bytes: bool, available: bool) {
-            self.panel(panel, self.palette.surface, self.palette.border, 12);
-            let w = panel.right - panel.left;
-            let h = panel.bottom - panel.top;
+            // SAFETY: Parent draw owns this live DC. Clip each chart separately
+            // so ellipsized labels cannot paint into its neighbor at narrow sizes.
+            let level = unsafe { SaveDC(self.dc) };
+            if level == 0 {
+                return;
+            }
+            let _saved = SavedDc { dc: self.dc, level };
+            // SAFETY: Scalar panel coordinates inside the caller's guarded bounds.
+            unsafe {
+                IntersectClipRect(self.dc, panel.left, panel.top, panel.right, panel.bottom);
+            }
+            self.panel(panel, self.palette.surface, self.palette.border, 16);
             let color = if bytes {
                 [self.colors[2], self.colors[0]]
             } else {
@@ -526,45 +635,6 @@ mod painting {
             } else {
                 ["请求", "错误"]
             };
-            self.text(
-                if bytes {
-                    "上传 / 下载速率"
-                } else {
-                    "请求 / 错误速率"
-                },
-                self.rect(panel, self.px(14), self.px(8), w - self.px(28), self.px(24)),
-                self.palette.text,
-                false,
-                0,
-            );
-            for i in 0..2 {
-                let x = self.px(16) + i as i32 * (w / 2);
-                self.series_line(
-                    (panel.left + x, panel.top + self.px(43)),
-                    (panel.left + x + self.px(18), panel.top + self.px(43)),
-                    color[i],
-                    i == 1,
-                );
-                self.dot(
-                    panel.left + x + self.px(9),
-                    panel.top + self.px(43),
-                    color[i],
-                    i == 1,
-                );
-                self.text(
-                    names[i],
-                    self.rect(
-                        panel,
-                        x + self.px(24),
-                        self.px(32),
-                        w / 2 - self.px(38),
-                        self.px(22),
-                    ),
-                    self.palette.text,
-                    false,
-                    0,
-                );
-            }
             let current = available.then(|| timeline.current_sample()).flatten();
             let latest = current.and_then(|s| s.rates).map(|r| {
                 if bytes {
@@ -573,37 +643,65 @@ mod painting {
                     [r.requests, r.errors]
                 }
             });
-            let label = latest.map_or_else(
-                || "最新：未知".into(),
-                |r| {
-                    format!(
-                        "区间均值 {} / {} {}",
-                        rate_number(r[0]),
-                        rate_number(r[1]),
-                        if bytes { "B/s" } else { "次/s" }
-                    )
-                },
+            let labels = std::array::from_fn::<_, 2, _>(|i| {
+                format!(
+                    "{} {}",
+                    names[i],
+                    latest.map_or_else(|| "未知".into(), |rates| rate_number(rates[i]))
+                )
+            });
+            let unit = format!("区间均值 · {}", if bytes { "B/s" } else { "次/s" });
+            let layout = ChartLayout::new(
+                panel,
+                self.dpi,
+                labels.each_ref().map(|label| self.text_width(label)),
+                self.text_width(&unit),
+                current.is_some_and(|sample| sample.unknown.is_some()),
             );
             self.text(
-                &label,
-                self.rect(
-                    panel,
-                    self.px(14),
-                    self.px(56),
-                    w - self.px(28),
-                    self.px(20),
-                ),
+                if bytes {
+                    "上传 / 下载速率"
+                } else {
+                    "请求 / 错误速率"
+                },
+                layout.title,
                 self.palette.text,
                 false,
                 0,
             );
-            let plot = self.rect(
-                panel,
-                self.px(62),
-                self.px(108),
-                w - self.px(80),
-                h - self.px(148),
+            self.text(
+                &unit,
+                layout.unit,
+                if self.kind == Resolved::Contrast {
+                    self.palette.text
+                } else {
+                    self.palette.disabled
+                },
+                false,
+                DT_RIGHT,
             );
+            for i in 0..2 {
+                let rect = layout.legends[i];
+                let y = (rect.top + rect.bottom) / 2;
+                self.series_line(
+                    (rect.left, y),
+                    (rect.left + self.px(14), y),
+                    color[i],
+                    i == 1,
+                );
+                self.dot(rect.left + self.px(7), y, color[i], i == 1);
+                self.text(
+                    &labels[i],
+                    RECT {
+                        left: rect.left + self.px(22),
+                        ..rect
+                    },
+                    self.palette.text,
+                    false,
+                    0,
+                );
+            }
+            let plot = layout.plot;
             let now = timeline.latest.map(|m| m.uptime).unwrap_or_default();
             let mut maximum = 1.0_f64;
             let mut known = false;
@@ -622,8 +720,8 @@ mod painting {
                     }
                 }
             }
-            // Y labels always include their units; a unit-sized axis for idle
-            // data does not imply a nonzero rate. No per-pixel or unbounded loops.
+            // The header carries the shared axis/legend unit. A unit-sized axis
+            // for idle data does not imply a nonzero rate; unknowns remain gaps.
             for i in 0..3 {
                 let y = plot.top + (plot.bottom - plot.top) * i / 2;
                 self.line((plot.left, y), (plot.right, y), self.palette.border);
@@ -640,13 +738,7 @@ mod painting {
                     DT_RIGHT,
                 );
             }
-            self.text(
-                if bytes { "B/s" } else { "次/s" },
-                self.rect(panel, self.px(6), self.px(76), self.px(52), self.px(18)),
-                self.palette.text,
-                false,
-                DT_RIGHT,
-            );
+
             self.line(
                 (plot.left, plot.top),
                 (plot.left, plot.bottom),
@@ -656,11 +748,15 @@ mod painting {
                 let x = plot.left + (plot.right - plot.left) * i as i32 / 2;
                 self.text(
                     label,
-                    RECT {
-                        left: x - self.px(26),
-                        top: plot.bottom + self.px(6),
-                        right: x + self.px(26),
-                        bottom: plot.bottom + self.px(28),
+                    {
+                        let left = (x - self.px(26))
+                            .clamp(panel.left + self.px(4), panel.right - self.px(56));
+                        RECT {
+                            left,
+                            top: plot.bottom + self.px(4),
+                            right: left + self.px(52),
+                            bottom: plot.bottom + self.px(24),
+                        }
                     },
                     self.palette.text,
                     false,
@@ -709,22 +805,12 @@ mod painting {
                     previous = Some(((x, y), sample.at));
                 }
             }
-            if let Some(reason) = current.and_then(|s| s.unknown) {
+            if let Some(reason) = current.and_then(|s| s.unknown)
+                && let Some(status) = layout.status
+            {
                 // Keep historical valid segments visible, but do not imply that
                 // they extend to an unknown current interval.
-                self.text(
-                    reason.text(),
-                    self.rect(
-                        panel,
-                        self.px(64),
-                        self.px(77),
-                        w - self.px(78),
-                        self.px(18),
-                    ),
-                    self.palette.text,
-                    false,
-                    0,
-                );
+                self.text(reason.text(), status, self.palette.text, false, 0);
             }
         }
     }
@@ -877,6 +963,194 @@ mod painting {
                 false,
                 0,
             );
+        }
+    }
+    #[cfg(test)]
+    mod layout_tests {
+        use super::*;
+        use crate::{config::ThemeMode, windows::Font};
+        use windows_sys::Win32::{
+            Graphics::Gdi::*,
+            System::Threading::{GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources},
+        };
+
+        #[test]
+        fn compact_layout_packs_legends_without_overlapping_axes_or_status() {
+            for dpi in [96, 120, 144, 192] {
+                let px = |n| scale(n, dpi);
+                for width in [348, 454, 700] {
+                    let panel = RECT {
+                        left: px(19),
+                        top: px(23),
+                        right: px(19 + width),
+                        bottom: px(23 + 202),
+                    };
+                    for status in [false, true] {
+                        let layout = ChartLayout::new(panel, dpi, [px(52); 2], px(112), status);
+                        assert_eq!(
+                            layout.legends[0].right - layout.legends[0].left,
+                            px(52) + px(22)
+                        );
+                        assert_eq!(layout.legends[1].left - layout.legends[0].right, px(12));
+                        assert!(layout.legends[1].right <= panel.right - px(14));
+                        assert!(layout.title.right + px(12) <= layout.unit.left);
+                        assert!(layout.legends[0].bottom < layout.plot.top - px(10));
+                        assert!(layout.plot.right > layout.plot.left);
+                        assert!(layout.plot.bottom - layout.plot.top >= px(82) - 1);
+                        assert_eq!(
+                            layout.plot.top - panel.top,
+                            px(if status { 88 } else { 68 })
+                        );
+                        if let Some(reason) = layout.status {
+                            assert!(reason.top > layout.legends[0].bottom);
+                            assert!(reason.bottom <= layout.plot.top - px(10));
+                        }
+                        let long =
+                            ChartLayout::new(panel, dpi, [px(800), px(900)], px(112), status);
+                        assert!(long.legends[0].right + px(12) <= long.legends[1].left);
+                        assert!(long.legends[1].right <= panel.right - px(14));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn actual_fonts_fit_compact_headers_and_chart_paint_restores_dc_and_gdi() {
+            // SAFETY: Private memory DC/bitmap and owned fonts, no HWND, user data,
+            // network or system setting changes. Restore selections before deletion.
+            unsafe {
+                let dc = CreateCompatibleDC(std::ptr::null_mut());
+                let bitmap = CreateBitmap(1600, 900, 1, 32, std::ptr::null());
+                assert!(!dc.is_null() && !bitmap.is_null());
+                let old = SelectObject(dc, bitmap);
+                for dpi in [96, 120, 144, 192] {
+                    let font = Font::new(dpi).unwrap();
+                    let heading = Font::heading(dpi).unwrap();
+                    let panel = RECT {
+                        left: scale(8, dpi),
+                        top: scale(8, dpi),
+                        right: scale(356, dpi),
+                        bottom: scale(230, dpi),
+                    };
+                    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                        let theme = super::super::super::theme::Theme::new(mode).unwrap();
+                        for kind in [theme.kind, Resolved::Contrast] {
+                            let canvas = Canvas {
+                                dc,
+                                font: font.0,
+                                heading: heading.0,
+                                dpi,
+                                palette: theme.palette,
+                                kind,
+                                colors: [theme.palette.accent, 0x333dc2, 0x7d7711, 0xa06c12],
+                            };
+                            let level = SaveDC(dc);
+                            assert_ne!(level, 0);
+                            SelectObject(dc, GetStockObject(DC_PEN));
+                            SelectObject(dc, GetStockObject(DC_BRUSH));
+                            SetBkMode(dc, TRANSPARENT as i32);
+                            for bytes in [false, true] {
+                                let names = if bytes {
+                                    ["上传", "下载"]
+                                } else {
+                                    ["请求", "错误"]
+                                };
+                                let title = if bytes {
+                                    "上传 / 下载速率"
+                                } else {
+                                    "请求 / 错误速率"
+                                };
+                                let unit = if bytes {
+                                    "区间均值 · B/s"
+                                } else {
+                                    "区间均值 · 次/s"
+                                };
+                                let labels = names.map(|name| format!("{name} 999999.00"));
+                                let widths =
+                                    labels.each_ref().map(|label| canvas.text_width(label));
+                                let layout = ChartLayout::new(
+                                    panel,
+                                    dpi,
+                                    widths,
+                                    canvas.text_width(unit),
+                                    false,
+                                );
+                                assert!(
+                                    canvas.text_width(title)
+                                        <= layout.title.right - layout.title.left
+                                );
+                                for (i, width) in widths.into_iter().enumerate() {
+                                    assert!(
+                                        width
+                                            <= layout.legends[i].right
+                                                - layout.legends[i].left
+                                                - scale(22, dpi)
+                                    );
+                                }
+                                let mut timeline = Timeline::default();
+                                timeline.record(&ProxyMetricsSnapshot::default());
+                                timeline.record(&ProxyMetricsSnapshot {
+                                    uptime: Duration::from_secs(1),
+                                    total_requests: 8,
+                                    errors: 2,
+                                    upload_body_bytes: 100,
+                                    download_body_bytes: 200,
+                                    ..Default::default()
+                                });
+                                // Known interval, first sample, no snapshot, and a
+                                // missing current interval must all restore the DC.
+                                for state in 0..4 {
+                                    if state == 3 {
+                                        timeline.record(&ProxyMetricsSnapshot {
+                                            uptime: Duration::from_secs(8),
+                                            total_requests: 10,
+                                            ..Default::default()
+                                        });
+                                    }
+                                    let timeline = if state == 1 {
+                                        &Timeline::default()
+                                    } else {
+                                        &timeline
+                                    };
+                                    SetTextColor(dc, 0x123456);
+                                    let before_font = GetCurrentObject(dc, OBJ_FONT as u32);
+                                    let mut before_clip = RECT::default();
+                                    GetClipBox(dc, &mut before_clip);
+                                    canvas.chart(panel, timeline, bytes, state != 2);
+                                    assert_eq!(GetTextColor(dc), 0x123456);
+                                    assert_eq!(GetCurrentObject(dc, OBJ_FONT as u32), before_font);
+                                    let mut after_clip = RECT::default();
+                                    GetClipBox(dc, &mut after_clip);
+                                    assert_eq!(
+                                        (
+                                            before_clip.left,
+                                            before_clip.top,
+                                            before_clip.right,
+                                            before_clip.bottom
+                                        ),
+                                        (
+                                            after_clip.left,
+                                            after_clip.top,
+                                            after_clip.right,
+                                            after_clip.bottom
+                                        )
+                                    );
+                                }
+                                let process = GetCurrentProcess();
+                                let count = GetGuiResources(process, GR_GDIOBJECTS);
+                                for _ in 0..100 {
+                                    canvas.chart(panel, &timeline, bytes, true);
+                                }
+                                assert_eq!(GetGuiResources(process, GR_GDIOBJECTS), count);
+                            }
+                            RestoreDC(dc, level);
+                        }
+                    }
+                }
+                SelectObject(dc, old);
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+            }
         }
     }
 }

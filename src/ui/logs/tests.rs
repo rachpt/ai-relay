@@ -1064,7 +1064,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
         });
         logs.follow = logs.before.clone();
         for dpi in [96, 144, 192] {
-            for (width, height) in [(744, 820), (784, 840), (1100, 1000)] {
+            for (width, height) in [(744, 952), (784, 1000), (1100, 1200)] {
                 logs.layout(dpi, scale(width, dpi), scale(height, dpi));
                 for (i, &(control, _, _, _, _)) in logs.controls.iter().enumerate() {
                     let mut rect = RECT::default();
@@ -1078,7 +1078,7 @@ fn native_controls_layout_filters_pause_and_invalid_preservation() {
                         "empty {id}"
                     );
                     assert!(
-                        rect.bottom <= scale(height - 84, dpi),
+                        rect.bottom <= viewport::content_bottom(dpi, scale(height, dpi)),
                         "bottom clipping {id} at {dpi}"
                     );
                     assert!(

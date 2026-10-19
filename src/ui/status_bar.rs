@@ -326,11 +326,7 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
         let dpi = (*state).dpi;
         let palette = (*state).theme.palette;
         let contrast = (*state).theme.kind == theme::Resolved::Contrast;
-        let background = if (*state).theme.kind == theme::Resolved::Light {
-            0x00f7f7f7
-        } else {
-            palette.surface
-        };
+        let background = palette.background;
         let mut rect = RECT::default();
         GetClientRect(hwnd, &mut rect);
         let brush = GetStockObject(DC_BRUSH);

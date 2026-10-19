@@ -5,12 +5,14 @@ use windows_sys::Win32::{Graphics::Gdi::*, UI::Controls::SetScrollInfo};
 
 const TOP: i32 = 44;
 const FOOTER: i32 = super::status_bar::HEIGHT;
+pub(super) const BOTTOM_PADDING: i32 = 16;
 const ID: usize = 2400;
 const REVEAL: u32 = WM_APP + 80;
 type Proc = Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn SetWindowSubclass(hwnd: HWND, proc: Proc, id: usize, data: usize) -> i32;
+    fn GetWindowSubclass(hwnd: HWND, proc: Proc, id: usize, data: *mut usize) -> i32;
     fn RemoveWindowSubclass(hwnd: HWND, proc: Proc, id: usize) -> i32;
     fn DefSubclassProc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT;
 }
@@ -33,6 +35,32 @@ struct Page {
 }
 pub(super) fn page_height(dpi: u32, height: i32, active: usize) -> i32 {
     height.max(scale(if active == 2 { 848 } else { 820 }, dpi))
+}
+
+pub(super) fn content_bottom(dpi: u32, height: i32) -> i32 {
+    (height - scale(FOOTER + BOTTOM_PADDING, dpi)).max(0)
+}
+
+fn content_extent(dpi: u32, height: i32) -> i32 {
+    (height - scale(TOP + FOOTER, dpi)).max(0)
+}
+
+/// Set the known viewport's full-width native scroll offset without packing a
+/// position into WM_VSCROLL's 16-bit thumb field.
+pub(super) unsafe fn scroll_to(hwnd: HWND, position: i32) {
+    // SAFETY: Owner-thread known viewport; private scalar message, no pointers.
+    unsafe {
+        SendMessageW(hwnd, WM_APP + 85, position.max(0) as WPARAM, 0);
+    }
+}
+
+/// Queue focus revelation after a layout, without moving controls reentrantly.
+pub(super) fn reveal(child: HWND) {
+    // SAFETY: Native queries/posting tolerate stale handles. Consumption verifies
+    // the child's parent, visibility and current focus before changing the offset.
+    unsafe {
+        PostMessageW(GetParent(child), REVEAL, child as WPARAM, 0);
+    }
 }
 
 /// Finish a geometry/visibility transaction without dispatching paint callbacks.
@@ -140,6 +168,18 @@ impl Viewport {
         }
         (rect.right.max(1), page_height(dpi, height, active))
     }
+    pub fn prepare(&self, dpi: u32, virtual_height: i32, active: usize) -> i32 {
+        // SAFETY: Scalar-only messages to the owned host. Resolve native scrollbar
+        // visibility before measuring width, without moving or painting children.
+        unsafe {
+            SendMessageW(self.handle, WM_APP + 81, active, dpi as isize);
+            SendMessageW(self.handle, WM_APP + 84, virtual_height as usize, 0);
+            let mut rect = RECT::default();
+            GetClientRect(self.handle, &mut rect);
+            rect.right.max(1)
+        }
+    }
+
     pub fn arrange(&self, dpi: u32, virtual_height: i32, active: usize) {
         // SAFETY: This private message passes scalars only. Every caller first
         // resets controls to their unscrolled page coordinates via existing layouts.
@@ -292,7 +332,21 @@ unsafe extern "system" fn procedure(
                 DefSubclassProc(hwnd, message, w, l)
             }
             x if x == WM_APP + 81 => {
-                (*page).active = w.min(3);
+                let active = w.min(3);
+                if (*page).active != active {
+                    // A shared HWND is not an interaction identity: the old thumb
+                    // position must never drive the newly selected page.
+                    scroll_theme::cancel(hwnd);
+                    // ReleaseCapture can synchronously destroy/remove this host.
+                    // Do not dereference the old Page unless it is still installed.
+                    let mut current = 0;
+                    if GetWindowSubclass(hwnd, Some(procedure), id, &mut current) == 0
+                        || current != data
+                    {
+                        return 0;
+                    }
+                }
+                (*page).active = active;
                 let next_dpi = (l as u32).max(96);
                 if next_dpi != (*page).dpi {
                     for offset in &mut (*page).offsets {
@@ -305,7 +359,7 @@ unsafe extern "system" fn procedure(
                 0
             }
             x if x == WM_APP + 82 => {
-                (*page).extent = (w as i32 - scale(TOP + FOOTER + 28, (*page).dpi)).max(0);
+                (*page).extent = content_extent((*page).dpi, w as i32);
                 let active = (*page).active;
                 (*page).offsets[active] =
                     (*page).offsets[active].clamp(0, limit((*page).extent, (*page).height));
@@ -326,7 +380,7 @@ unsafe extern "system" fn procedure(
                 0
             }
             x if x == WM_APP + 83 => {
-                (*page).extent = (w as i32 - scale(TOP + FOOTER + 28, (*page).dpi)).max(0);
+                (*page).extent = content_extent((*page).dpi, w as i32);
                 let active = (*page).active;
                 let old = (*page).offsets[active];
                 let next = old.clamp(0, limit((*page).extent, (*page).height));
@@ -343,6 +397,31 @@ unsafe extern "system" fn procedure(
                 };
                 SetScrollInfo(hwnd, SB_VERT, &info, 1);
                 redraw(hwnd);
+                0
+            }
+            x if x == WM_APP + 84 => {
+                let extent = content_extent((*page).dpi, w as i32);
+                let mut info = SCROLLINFO {
+                    cbSize: size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_RANGE | SIF_PAGE,
+                    ..Default::default()
+                };
+                GetScrollInfo(hwnd, SB_VERT, &mut info);
+                let maximum = extent.saturating_sub(1);
+                let height = (*page).height.max(1) as u32;
+                if info.nMin != 0 || info.nMax != maximum || info.nPage != height {
+                    info.nMin = 0;
+                    info.nMax = maximum;
+                    info.nPage = height;
+                    // SetScrollInfo may resize the host when the bar appears or
+                    // disappears. Offsets/child translation stay with arrange or
+                    // refresh; this pass only settles the width used for layout.
+                    SetScrollInfo(hwnd, SB_VERT, &info, 0);
+                }
+                0
+            }
+            x if x == WM_APP + 85 => {
+                scroll(hwnd, page, w.min(i32::MAX as usize) as i32);
                 0
             }
             WM_VSCROLL => {
@@ -430,7 +509,7 @@ unsafe extern "system" fn focus_proc(
     // dialog navigation never holds a State borrow while scrolling child windows.
     unsafe {
         if message == WM_SETFOCUS {
-            PostMessageW(GetParent(hwnd), REVEAL, hwnd as usize, 0);
+            reveal(hwnd);
         }
         if message == WM_NCDESTROY {
             RemoveWindowSubclass(hwnd, Some(focus_proc), id);
@@ -655,7 +734,7 @@ mod tests {
             let tops = [
                 scale(64, dpi),
                 scale(320, dpi),
-                virtual_height - scale(FOOTER + 28 + 24, dpi),
+                virtual_height - scale(FOOTER + 24, dpi),
             ];
             for (control, y) in self.controls.into_iter().zip(tops) {
                 // SAFETY: Reset live children to original page coordinates before
@@ -687,10 +766,10 @@ mod tests {
             assert!(scale(560 - TOP - FOOTER, dpi) > 0);
             assert_eq!(
                 limit(
-                    scale(848 - TOP - FOOTER - 28, dpi),
+                    scale(848 - TOP - FOOTER, dpi),
                     scale(560 - TOP - FOOTER, dpi)
                 ),
-                scale(260, dpi)
+                scale(288, dpi)
             );
         }
     }
@@ -728,10 +807,7 @@ mod tests {
             );
             let before = scroll_info(native.viewport.handle);
             assert_eq!(before.nPos, 0);
-            assert_eq!(
-                before.nMax + 1,
-                virtual_height - scale(TOP + FOOTER + 28, dpi)
-            );
+            assert_eq!(before.nMax + 1, virtual_height - scale(TOP + FOOTER, dpi));
             assert_eq!(before.nPage as i32, scale(360 - TOP - FOOTER, dpi));
             assert!(rect_in(native.controls[2], native.viewport.handle).top >= before.nPage as i32);
             scroll_command(native.viewport.handle, SB_BOTTOM);
@@ -947,6 +1023,14 @@ mod tests {
         let native = NativeViewport::new();
         native.layout_reset_arrange(96, 0);
         scroll_command(native.viewport.handle, SB_BOTTOM);
+        let previous = rect_in(native.controls[0], native.viewport.handle);
+        native.viewport.prepare(96, 360, 0);
+        assert_eq!(scroll_info(native.viewport.handle).nPos, 0);
+        assert_eq!(
+            rect_in(native.controls[0], native.viewport.handle).top,
+            previous.top,
+            "width preparation must not translate children after native clamping"
+        );
         native.viewport.refresh(96, 360, 0);
         assert_eq!(scroll_info(native.viewport.handle).nPos, 0);
         assert_eq!(

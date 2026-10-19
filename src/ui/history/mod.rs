@@ -276,7 +276,7 @@ pub(super) unsafe fn draw(state: *mut State, l: LPARAM) -> bool {
             (*state).dpi,
             (*state).font.0,
             (*state).heading_font.0,
-            (*state).theme.palette,
+            &(*state).theme,
             (*state).history.report.as_deref(),
             (*state).history.pending.is_some(),
         );

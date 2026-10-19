@@ -295,18 +295,26 @@ pub(crate) fn worker(
                     .and_then(|path| open_directory(&path))
             }
             Command::Load => session.load(&options).map(|config| {
-                if matches!(
+                let message = if matches!(
                     options.command,
                     super::super::Command::Start | super::super::Command::Restart
-                ) || (session.saved.is_some()
-                    && config.proxy.auto_start
-                    && !config.upstream.url.is_empty()
-                    && config.listen.address.is_loopback())
-                {
+                ) {
                     next = Some(Command::Start(Box::default()));
-                }
+                    "配置已加载；正在按命令启动已保存配置……"
+                } else if session.saved.is_none() {
+                    "首次打开：尚无已保存配置；请先完成设置并保存。"
+                } else if !config.proxy.auto_start {
+                    "配置已加载；已关闭打开软件后自动启动代理，可手动启动。"
+                } else if config.upstream.url.is_empty() {
+                    "配置已加载；上游未配置，请先填写并保存有效配置。"
+                } else if !config.listen.address.is_loopback() {
+                    "配置已加载；非回环监听需要手动启动并确认风险，未自动启动。"
+                } else {
+                    next = Some(Command::Start(Box::default()));
+                    "配置已加载；正在使用已保存配置自动启动代理……"
+                };
                 loaded = Some(config);
-                "配置已加载；代理已停止。非回环监听需点击启动并确认风险。".to_string()
+                message.to_string()
             }),
             Command::Save {
                 config,

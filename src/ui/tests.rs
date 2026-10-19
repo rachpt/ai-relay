@@ -63,7 +63,7 @@ impl NativeState {
             page_geometry: [false; 4],
             page_positioned: [false; 4],
             pages_prelaid: false,
-            layout_size: (0, 0, 0),
+            layout_size: (0, 0, 0, 0),
             taskbar_created: u32::MAX,
             tray_present: false,
             close_notice_shown: false,
@@ -227,7 +227,7 @@ fn native_initial_log_cache_uses_its_own_minimum_height() {
         let editor = unsafe { GetDlgItem(native.state.viewport.handle, logs::CONTENT as i32) };
         assert!(!editor.is_null());
         let first = native.rect(editor);
-        assert_eq!(first.bottom - first.top, scale(96, dpi));
+        assert_eq!(first.bottom - first.top, scale(240, dpi));
         native.state.layout(native.hwnd, true);
         let forced = native.rect(editor);
         assert_eq!(first.top, forced.top);
@@ -335,6 +335,379 @@ fn native_history_commands_rearrange_revealed_controls_without_drift() {
             assert_eq!(native.scroll(SB_ENDSCROLL), offset);
             assert_eq!(settings::text(draft), "127.0.0.2");
         }
+    }
+}
+
+fn resize_client(native: &mut NativeState, width: i32, height: i32, dpi: u32) {
+    native.state.dpi = dpi;
+    // SAFETY: Hidden test-owned top-level. Compute its current native frame
+    // rather than assuming title-bar metrics or changing the real monitor DPI.
+    unsafe {
+        let mut outer = RECT::default();
+        let mut client = RECT::default();
+        assert_ne!(GetWindowRect(native.hwnd, &mut outer), 0);
+        assert_ne!(GetClientRect(native.hwnd, &mut client), 0);
+        assert_ne!(
+            SetWindowPos(
+                native.hwnd,
+                null_mut(),
+                0,
+                0,
+                scale(width, dpi) + outer.right - outer.left - client.right,
+                scale(height, dpi) + outer.bottom - outer.top - client.bottom,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            ),
+            0
+        );
+    }
+    native.state.layout(native.hwnd, true);
+}
+
+fn assert_bottom_padding(native: &NativeState, tail: u32) {
+    // SAFETY: Live test-owned footer and viewport, actual full HWND rectangles;
+    // no clipping/intersection can mask a tail behind the fixed status bar.
+    unsafe {
+        let mut host = RECT::default();
+        GetClientRect(native.state.viewport.handle, &mut host);
+        let footer = native.rect(native.state.status_label);
+        let last = native.rect(native.control(tail));
+        assert_eq!(footer.top, host.bottom, "viewport must meet the footer");
+        assert_eq!(
+            footer.top - last.bottom,
+            scale(viewport::BOTTOM_PADDING, native.state.dpi),
+            "page {} tail {tail} has an extra gap or clips the footer",
+            native.state.tabs.active
+        );
+        assert!(last.top < host.bottom && last.bottom > 0 && last.bottom <= host.bottom);
+    }
+}
+
+#[test]
+fn native_stretched_pages_share_bottom_padding_at_short_tall_and_threshold_sizes() {
+    let mut native = NativeState::new();
+    for dpi in [96, 144, 192] {
+        for height in [560, 680, 792, 819, 820, 848, 1000] {
+            resize_client(&mut native, 1000, height, dpi);
+            for (page, tail) in [(0, 2109), (1, 2337), (2, 2221)] {
+                native.state.show_page(page);
+                native.scroll(SB_BOTTOM);
+                assert_bottom_padding(&native, tail);
+                let offset = native.scroll(SB_ENDSCROLL);
+                native.state.layout(native.hwnd, true);
+                assert_bottom_padding(&native, tail);
+                native.state.show_page(3);
+                native.state.show_page(page);
+                assert_eq!(native.scroll(SB_ENDSCROLL), offset);
+                assert_bottom_padding(&native, tail);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_history_subviews_keep_the_full_tail_above_the_footer() {
+    let mut native = NativeState::new();
+    for dpi in [96, 144, 192] {
+        for height in [560, 820, 1000] {
+            resize_client(&mut native, 1000, height, dpi);
+            native.state.show_page(1);
+            native.command(2300, Some(0));
+            for advanced in [false, true] {
+                if advanced {
+                    native.command(2318, None);
+                }
+                for (view, tail) in [(0, 2337), (1, 2337), (2, 2330), (3, 2331)] {
+                    native.command(2338, Some(view));
+                    native.scroll(SB_BOTTOM);
+                    assert_bottom_padding(&native, tail);
+                }
+            }
+            native.command(2318, None);
+            native.command(2339, None);
+            native.scroll(SB_BOTTOM);
+            assert_bottom_padding(&native, 2325);
+            let storage = native.rect(native.control(2351));
+            let status = native.rect(native.control(2325));
+            assert_eq!(status.top - storage.bottom, scale(8, dpi));
+            native.command(2339, None);
+            native.command(2300, Some(1));
+            native.scroll(SB_BOTTOM);
+            assert_bottom_padding(&native, 2020);
+            native.state.show_page(0);
+            native.state.show_page(1);
+            assert_bottom_padding(&native, 2020);
+            native.command(2300, Some(0));
+        }
+    }
+}
+
+#[test]
+fn native_settings_scroll_extent_tracks_category_instead_of_an_empty_page() {
+    let mut native = NativeState::new();
+    native.state.show_page(3);
+    let draft = native.control(2040);
+    settings::set_text(draft, "[\"127.0.0.1\"]");
+    for dpi in [96, 144, 192] {
+        for height in [560, 680, 820, 1000] {
+            resize_client(&mut native, 1000, height, dpi);
+            for category in [2, 0, 4, 1, 5, 3] {
+                native.command(2039, Some(category));
+                // SAFETY: Actual host width after native scrollbar visibility
+                // changes; the stretched category navigation must use this width.
+                let mut host = RECT::default();
+                unsafe { GetClientRect(native.state.viewport.handle, &mut host) };
+                assert_eq!(
+                    native.rect(native.control(2039)).right,
+                    host.right - scale(24, dpi),
+                    "category {category} was laid out using the previous scrollbar width"
+                );
+                let offset = native.scroll(SB_BOTTOM);
+                let last = native.rect(native.control(2001));
+                let footer = native.rect(native.state.status_label);
+                let bottom = scale([326, 416, 640, 464, 594, 536][category], dpi);
+                let expected = (bottom + scale(status_bar::HEIGHT + viewport::BOTTOM_PADDING, dpi)
+                    - scale(height, dpi))
+                .max(0);
+                assert_eq!(
+                    offset, expected,
+                    "category {category} has phantom scroll space"
+                );
+                if offset > 0 {
+                    assert_bottom_padding(&native, 2001);
+                } else {
+                    assert!(footer.top - last.bottom >= scale(viewport::BOTTOM_PADDING, dpi));
+                }
+                native.state.show_page(0);
+                native.state.show_page(3);
+                assert_eq!(native.scroll(SB_ENDSCROLL), expected);
+                assert_eq!(native.rect(native.control(2001)).bottom, last.bottom);
+                assert_eq!(
+                    native.rect(native.control(2039)).right,
+                    host.right - scale(24, dpi)
+                );
+                assert_eq!(settings::text(draft), "[\"127.0.0.1\"]");
+            }
+        }
+    }
+}
+
+#[test]
+fn native_log_height_grip_preserves_content_selection_and_manual_dip_height() {
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCapture() -> HWND;
+    }
+    let mut native = NativeState::new();
+    native.state.show_page(2);
+    let editor = native.control(2200);
+    let grip = native.control(2230);
+    let text = (0..90)
+        .map(|n| format!("synthetic {n} 日志文字\r\n"))
+        .collect::<String>();
+    settings::set_text(editor, &text);
+    // SAFETY: Only hidden private HWNDs, local scalar messages. No clipboard,
+    // live log service or user configuration is touched by this isolated fixture.
+    unsafe {
+        SendMessageW(editor, 0xb1, 3, 17);
+        for dpi in [96, 144, 192] {
+            resize_client(&mut native, 1000, 1000, dpi);
+            let selected = SendMessageW(editor, 0xb0, 0, 0);
+            let start = native.state.logs.viewer_height();
+            let mut point = POINT {
+                x: scale(50, dpi),
+                y: scale(6, dpi),
+            };
+            let packed = |p: POINT| ((p.x as u16 as u32) | ((p.y as u16 as u32) << 16)) as LPARAM;
+            SendMessageW(grip, WM_LBUTTONDOWN, 1, packed(point));
+            assert_eq!(GetCapture(), grip);
+            ClientToScreen(grip, &mut point);
+            point.y += scale(48, dpi);
+            for _ in 0..2 {
+                let mut local = point;
+                ScreenToClient(grip, &mut local);
+                SendMessageW(grip, WM_MOUSEMOVE, 1, packed(local));
+                assert_eq!(GetCapture(), grip);
+                assert_eq!(native.state.logs.viewer_height(), start + 48);
+                assert_eq!(
+                    native.rect(editor).bottom - native.rect(editor).top,
+                    scale(start + 48, dpi)
+                );
+            }
+            SendMessageW(grip, WM_KEYDOWN, 0x1b, 0);
+            assert_ne!(GetCapture(), grip);
+            assert_eq!(native.state.logs.viewer_height(), start);
+            for _ in 0..40 {
+                SendMessageW(grip, WM_KEYDOWN, 0x28, 0);
+            }
+            assert_eq!(native.state.logs.viewer_height(), 720);
+            native.scroll(SB_BOTTOM);
+            assert_bottom_padding(&native, 2221);
+            for _ in 0..40 {
+                SendMessageW(grip, WM_KEYDOWN, 0x26, 0);
+            }
+            assert_eq!(native.state.logs.viewer_height(), 120);
+            native.state.show_page(0);
+            native.state.show_page(2);
+            assert_eq!(native.state.logs.viewer_height(), 120);
+            SendMessageW(grip, WM_KEYDOWN, 0x24, 0);
+            assert_eq!(native.state.logs.viewer_height(), 240);
+            resize_client(&mut native, 1000, 560, dpi);
+            assert_eq!(
+                native.rect(editor).bottom - native.rect(editor).top,
+                scale(240, dpi)
+            );
+            assert_eq!(settings::text(editor), text);
+            assert_eq!(SendMessageW(editor, 0xb0, 0, 0), selected);
+            assert_ne!(
+                GetWindowLongPtrW(editor, GWL_STYLE) as u32 & ES_READONLY as u32,
+                0
+            );
+        }
+    }
+}
+
+fn dispatch_focus_reveals(host: HWND) -> usize {
+    let mut count = 0;
+    let mut message = MSG::default();
+    // SAFETY: Only drain this test viewport's copied-scalar reveal messages;
+    // no timer, theme refresh, user input or other window messages are pumped.
+    unsafe {
+        while PeekMessageW(&mut message, host, WM_APP + 80, WM_APP + 80, PM_REMOVE) != 0 {
+            assert!(count < 32, "focus revelation must not loop");
+            DispatchMessageW(&message);
+            count += 1;
+        }
+    }
+    count
+}
+
+#[test]
+fn native_log_keyboard_height_keeps_the_focused_grip_inside_short_viewports() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetFocus() -> HWND;
+    }
+    let mut native = NativeState::new();
+    native.state.show_page(2);
+    let grip = native.control(2230);
+    let editor = native.control(2200);
+    let host = native.state.viewport.handle;
+    settings::set_text(
+        editor,
+        "synthetic log text preserved during keyboard resizing",
+    );
+    // SAFETY: Test-owned offscreen window; show without activation so actual
+    // focus/visibility can be checked. No clipboard, GUI timers or live worker.
+    unsafe {
+        ShowWindow(native.hwnd, SW_SHOWNOACTIVATE);
+        SendMessageW(editor, 0xb1, 2, 9);
+        let selection = SendMessageW(editor, 0xb0, 0, 0);
+        for dpi in [96, 144, 192] {
+            for height in [560, 680] {
+                resize_client(&mut native, 1000, height, dpi);
+                SendMessageW(grip, WM_KEYDOWN, 0x24, 0);
+                native.scroll(SB_TOP);
+                SetFocus(grip);
+                viewport::reveal(grip);
+                dispatch_focus_reveals(host);
+                for key in std::iter::repeat_n(0x28, 25)
+                    .chain(std::iter::repeat_n(0x26, 27))
+                    .chain([0x24, 0x28, 0x26])
+                {
+                    assert_eq!(GetFocus(), grip);
+                    let offset = GetScrollPos(host, SB_VERT);
+                    SendMessageW(grip, WM_KEYDOWN, key, 0);
+                    // Layout is synchronous, but scrolling must wait until its
+                    // State borrow ends and the queued reveal is dispatched.
+                    let mut info = SCROLLINFO {
+                        cbSize: size_of::<SCROLLINFO>() as u32,
+                        fMask: SIF_RANGE | SIF_PAGE,
+                        ..Default::default()
+                    };
+                    GetScrollInfo(host, SB_VERT, &mut info);
+                    let limit = (info.nMax - info.nPage as i32 + 1).max(0);
+                    assert_eq!(GetScrollPos(host, SB_VERT), offset.min(limit));
+                    assert!(dispatch_focus_reveals(host) > 0);
+                    let mut bounds = RECT::default();
+                    GetClientRect(host, &mut bounds);
+                    let rect = native.rect(grip);
+                    assert!(
+                        rect.top >= 0 && rect.bottom <= bounds.bottom,
+                        "DPI {dpi}, height {height}, key {key}: grip {}..{} outside 0..{}",
+                        rect.top,
+                        rect.bottom,
+                        bounds.bottom
+                    );
+                    assert_eq!(GetFocus(), grip);
+                    assert_eq!(SendMessageW(editor, 0xb0, 0, 0), selection);
+                    assert_eq!(
+                        settings::text(editor),
+                        "synthetic log text preserved during keyboard resizing"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_app_edits_have_real_nonclient_frames_without_clipping_input() {
+    use windows_sys::Win32::Graphics::Gdi::*;
+    let mut native = NativeState::new();
+    native.state.show_page(3);
+    // SAFETY: All HWNDs, memory DC/bitmap and scratch region are test-owned;
+    // the isolated controller is stopped and no real user settings are loaded.
+    unsafe {
+        let dc = CreateCompatibleDC(null_mut());
+        let bitmap = CreateBitmap(1024, 256, 1, 32, null());
+        assert!(!dc.is_null() && !bitmap.is_null());
+        let old = SelectObject(dc, bitmap);
+        let region = CreateRectRgn(0, 0, 0, 0);
+        assert!(!region.is_null());
+        let mut edits = Vec::new();
+        let mut child = GetWindow(native.state.viewport.handle, GW_CHILD);
+        while !child.is_null() {
+            let mut class = [0u16; 16];
+            let count = GetClassNameW(child, class.as_mut_ptr(), class.len() as i32);
+            if String::from_utf16_lossy(&class[..count.max(0) as usize]) == "Edit" {
+                edits.push(child);
+            }
+            child = GetWindow(child, GW_HWNDNEXT);
+        }
+        assert!(edits.len() >= 30);
+        for child in edits {
+            assert_ne!(
+                GetWindowLongPtrW(child, GWL_EXSTYLE) as u32 & WS_EX_CLIENTEDGE,
+                0
+            );
+            let style = GetWindowLongPtrW(child, GWL_STYLE);
+            let extended = GetWindowLongPtrW(child, GWL_EXSTYLE);
+            let selection = SendMessageW(child, 0xb0, 0, 0);
+            for mode in [
+                crate::config::ThemeMode::Light,
+                crate::config::ThemeMode::Dark,
+            ] {
+                native.state.theme.mode = mode;
+                theme::refresh(native.hwnd, &mut *native.state);
+                assert_eq!(GetWindowLongPtrW(child, GWL_STYLE), style);
+                assert_eq!(GetWindowLongPtrW(child, GWL_EXSTYLE), extended);
+                assert_eq!(SendMessageW(child, 0xb0, 0, 0), selection);
+                assert_eq!(GetWindowRgn(child, region), 0);
+                SendMessageW(child, WM_PRINT, dc as WPARAM, PRF_NONCLIENT as LPARAM);
+                let palette = native.state.theme.palette;
+                let border = if settings::is_enabled(child) != 0 {
+                    palette.border
+                } else {
+                    theme::blend(palette.border, palette.surface, 50)
+                };
+                assert_eq!(GetPixel(dc, 0, 0), border);
+            }
+        }
+        DeleteObject(region);
+        SelectObject(dc, old);
+        DeleteObject(bitmap);
+        DeleteDC(dc);
     }
 }
 

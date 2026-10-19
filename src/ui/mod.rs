@@ -1,4 +1,5 @@
 //! Win32 设置与代理控制；所有磁盘和网络初始化由后台控制器执行。
+mod buttons;
 mod cell_table;
 mod choices;
 mod control_theme;
@@ -6,7 +7,9 @@ mod date_picker;
 mod files;
 mod history;
 mod history_chart;
+mod input_frame;
 mod logs;
+mod menu_theme;
 mod overview;
 mod overview_dashboard;
 mod rounded;
@@ -223,7 +226,7 @@ struct State {
     page_geometry: [bool; 4],
     page_positioned: [bool; 4],
     pages_prelaid: bool,
-    layout_size: (i32, i32, u32),
+    layout_size: (i32, i32, u32, i32),
     taskbar_created: u32,
     tray_present: bool,
     close_notice_shown: bool,
@@ -272,6 +275,19 @@ impl State {
         }
     }
 
+    fn page_height(&self, height: i32, active: usize) -> i32 {
+        if active == 2 {
+            self.logs.page_height(self.dpi, height)
+        } else if active == 3 {
+            height.max(
+                self.settings.document_bottom(self.dpi)
+                    + scale(status_bar::HEIGHT + viewport::BOTTOM_PADDING, self.dpi),
+            )
+        } else {
+            viewport::page_height(self.dpi, height, active)
+        }
+    }
+
     fn layout(&mut self, hwnd: HWND, force: bool) {
         // Creation can deliver WM_SIZE before the page tree exists. Do not cache
         // a successful prelayout of null HWNDs before initial control creation.
@@ -283,32 +299,36 @@ impl State {
         if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
             return;
         }
-        let size = (rect.right, rect.bottom, self.dpi);
+        let active = self.tabs.active;
+        let page_height = self.page_height(rect.bottom, active);
+        if (rect.right, rect.bottom, self.dpi)
+            != (self.layout_size.0, self.layout_size.1, self.layout_size.2)
+        {
+            self.logs.cancel_resize();
+            self.viewport
+                .layout(self.dpi, rect.right, rect.bottom, active);
+        }
+        let page_width = self.viewport.prepare(self.dpi, page_height, active);
+        let size = (rect.right, rect.bottom, self.dpi, page_width);
         if size != self.layout_size {
             self.layout_size = size;
             self.page_geometry = [false; 4];
             self.page_positioned = [false; 4];
         }
-        let active = self.tabs.active;
-        let virtual_height = viewport::page_height(self.dpi, rect.bottom, active);
         let session = active == 1 && self.history.session;
         if !force && !session && self.page_positioned[active] && self.page_geometry[active] {
             // Fast path for an already-positioned page: no header/control geometry
             // changed, only the viewport's active page and scroll metadata.
-            self.viewport.refresh(self.dpi, virtual_height, active);
+            self.viewport.refresh(self.dpi, page_height, active);
             return;
         }
-        let (page_width, page_height) =
-            self.viewport
-                .layout(self.dpi, rect.right, rect.bottom, active);
         let margin = scale(24, self.dpi);
         let width = (page_width - margin * 2).max(1);
         if !self.pages_prelaid {
             // Pay the first native-layout cost once, while the window is still
             // hidden. Every page then only needs one arrange pass on first show.
-            let heights = std::array::from_fn::<_, 4, _>(|page| {
-                viewport::page_height(self.dpi, rect.bottom, page)
-            });
+            let heights =
+                std::array::from_fn::<_, 4, _>(|page| self.page_height(rect.bottom, page));
             self.overview.layout(self.dpi, page_width, heights[0]);
             self.history.layout(self.dpi, page_width, heights[1]);
             self.logs.layout(self.dpi, page_width, heights[2]);
@@ -548,7 +568,7 @@ pub(crate) fn run(
         page_geometry: [false; 4],
         page_positioned: [false; 4],
         pages_prelaid: false,
-        layout_size: (0, 0, 0),
+        layout_size: (0, 0, 0, 0),
         taskbar_created,
         tray_present: false,
         close_notice_shown: false,
@@ -604,7 +624,7 @@ pub(crate) fn run(
     let result = (|| {
         // SAFETY: hwnd is a live window owned by this thread.
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-        let texts = ["AI Relay 开发版", "代理已停止；正在后台加载配置。"];
+        let texts = ["运行概览", "代理已停止；正在后台加载配置。"];
         let static_class = wide("STATIC");
         for text in texts {
             let text = wide(text);
@@ -1091,9 +1111,18 @@ unsafe extern "system" fn window_proc(
         // SAFETY: Forward untouched Win32 callback arguments to the default handler.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
+    // SAFETY: Menu draw/measure payloads are handled before control IDs, which
+    // are not a menu namespace. No State borrow crosses native menu tracking.
+    if matches!(message, WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR)
+        && let Some(result) = unsafe { (*state).title_menu.message(message, wparam, lparam) }
+    {
+        return result;
+    }
     // SAFETY: Valid WM_DRAWITEM payload, handled before theme's generic owner drawing.
     if message == WM_DRAWITEM
-        && unsafe { history::draw(state, lparam) || overview::draw(state, lparam) }
+        && unsafe {
+            logs::draw(lparam) || history::draw(state, lparam) || overview::draw(state, lparam)
+        }
     {
         return 1;
     }
@@ -1134,6 +1163,18 @@ unsafe extern "system" fn window_proc(
                     let page = (*state).tabs.selection();
                     SetFocus((*state).tabs.handle);
                     (*state).show_page(page);
+                }
+                0
+            }
+            logs::HEIGHT_CHANGED => {
+                if lparam == 2230
+                    && (*state).tabs.active == 2
+                    && (*state).exiting.is_none()
+                    && (*state)
+                        .logs
+                        .set_viewer_height(wparam.min(i32::MAX as usize) as i32)
+                {
+                    (*state).layout(hwnd, true);
                 }
                 0
             }

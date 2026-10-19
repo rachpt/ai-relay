@@ -5,6 +5,25 @@ use crate::{
     config::SecretStorage,
 };
 
+pub(super) fn proxy_status(running: bool, message: &str) -> Option<String> {
+    // 启动时自动查询登录启动项，结果只属独立设置，不能覆盖代理启动失败的原因。
+    if message.contains("独立")
+        || message.contains("配置操作")
+        || message.starts_with("登录自启操作")
+    {
+        return None;
+    }
+    Some(format!(
+        "{}\r\n{}",
+        if running {
+            "代理状态：运行中"
+        } else {
+            "代理状态：已停止"
+        },
+        message
+    ))
+}
+
 pub unsafe fn poll(hwnd: HWND, state: *mut State) {
     // SAFETY: Owner-thread raw State; no references cross modal preview confirmations.
     unsafe {
@@ -246,19 +265,8 @@ pub unsafe fn poll(hwnd: HWND, state: *mut State) {
                     ),
                 );
             }
-            if !event.message.contains("独立") && !event.message.contains("配置操作") {
-                set_text(
-                    status_label,
-                    &format!(
-                        "{}\r\n{}",
-                        if event.running {
-                            "代理状态：运行中"
-                        } else {
-                            "代理状态：已停止"
-                        },
-                        event.message
-                    ),
-                );
+            if let Some(status) = proxy_status(event.running, &event.message) {
+                set_text(status_label, &status);
             }
             if exiting {
                 settings.busy = true;

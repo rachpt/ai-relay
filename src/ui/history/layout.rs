@@ -21,7 +21,11 @@ impl History {
         // SAFETY: UI-owned parent/module and copied strings; ID is not a pointer.
         let h = unsafe {
             CreateWindowExW(
-                0,
+                if class == "EDIT" && style & WS_BORDER != 0 {
+                    WS_EX_CLIENTEDGE
+                } else {
+                    0
+                },
                 wide(class).as_ptr(),
                 wide(title).as_ptr(),
                 WS_CHILD | style,
@@ -502,9 +506,8 @@ impl History {
         }
     }
     pub fn layout(&self, dpi: u32, width: i32, height: i32) {
-        // Reserve the parent's persistent status area, including at minimum window size.
         let chart_top = scale(312, dpi);
-        let bottom = height - scale(92, dpi);
+        let bottom = viewport::content_bottom(dpi, height);
         let chart_height = scale(200, dpi);
         let gap = scale(8, dpi);
         // Expanding filters temporarily replaces the chart, not the usable table.
@@ -526,7 +529,7 @@ impl History {
                 CLEAR_CONFIRM => (scale(y, dpi), scale(ht, dpi)),
                 STORAGE_TEXT => (
                     scale(y, dpi),
-                    (bottom - scale(y + 48, dpi)).max(scale(70, dpi)),
+                    (bottom - scale(y + 34 + 8, dpi)).max(scale(70, dpi)),
                 ),
                 _ if (ALIAS_PICK..=STORAGE_TEXT).contains(&id) || id == MANAGEMENT_LABEL => {
                     (scale(y, dpi), scale(ht, dpi))
@@ -537,7 +540,7 @@ impl History {
                 ),
                 2325 => (
                     if self.management {
-                        height - scale(132, dpi)
+                        bottom - scale(34, dpi)
                     } else {
                         scale(if self.advanced { 424 } else { 270 }, dpi)
                     },

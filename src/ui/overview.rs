@@ -145,7 +145,7 @@ impl Overview {
             scale(24, dpi),
             scale(282, dpi),
             (width - scale(48, dpi)).max(1),
-            (height - scale(282 + 84, dpi)).max(1),
+            (viewport::content_bottom(dpi, height) - scale(282, dpi)).max(1),
         );
         moves.commit();
     }

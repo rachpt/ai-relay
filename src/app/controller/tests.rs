@@ -1,3 +1,5 @@
+mod startup;
+
 use super::*;
 use super::{
     history::{HistoryOwner, export_history, history_error, history_options},

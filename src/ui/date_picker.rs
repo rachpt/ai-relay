@@ -4,10 +4,9 @@
 //! WM_SETTEXT accepts only ISO YYYY-MM-DD or empty; WM_GETTEXT always returns
 //! that value, never the display prefix. No history query or app State is used.
 //!
-//! Dark rendering covers only the unfocused, closed, enabled control. Native
-//! field editing/focus, disabled/high-contrast rendering and accessibility stay
-//! native. The popup uses documented month-calendar colors; Windows versions
-//! may retain system-colored navigation, borders or other themed details.
+//! Dark presentation recolors the native picker/calendar raster, preserving
+//! focused fields, hit testing, navigation and DPI-dependent themed geometry.
+//! Light/high contrast retain the native renderer without recoloring.
 #![cfg(windows)]
 
 use super::theme::{Palette, Resolved};
@@ -19,6 +18,8 @@ use windows_sys::Win32::{
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{Controls::*, WindowsAndMessaging::*},
 };
+
+mod tint;
 
 const PROPERTY: &[u16] = &[
     65, 73, 82, 101, 108, 97, 121, 46, 68, 97, 116, 101, 80, 105, 99, 107, 101, 114, 46, 118, 49, 0,
@@ -303,6 +304,10 @@ pub(super) unsafe fn apply(hwnd: HWND, kind: Resolved, palette: Palette, dpi: u3
             palette,
             dpi: dpi.clamp(96, 768),
         });
+        // Keep visual styles/geometry intact; tint changes the native raster,
+        // not the control's theme metrics or native field-selection model.
+        SetWindowTheme(hwnd, null(), null());
+        tint::apply(hwnd, kind, palette);
         popup_colors(hwnd);
         InvalidateRect(hwnd, null(), 1);
     }
@@ -313,36 +318,26 @@ unsafe fn popup_colors(hwnd: HWND) {
     // native font handles only; the control owns its ephemeral month calendar.
     unsafe {
         let value = appearance(hwnd);
-        let dark = value
-            .filter(|a| a.kind == Resolved::Dark)
-            .filter(|_| !high_contrast() && IsWindowEnabled(hwnd) != 0);
+
         let calendar = SendMessageW(hwnd, DTM_GETMONTHCAL, 0, 0) as HWND;
         if !calendar.is_null() {
-            // Preserve native popup styles. Disabling them at dropdown time can
-            // break its DPI-dependent layout/painting on current Common Controls.
-            // Documented colors below are best effort; a system-colored calendar
-            // is preferable to clipped days or an unreliable selection surface.
+            // Preserve themed native metrics; recolor after native painting
+            // instead of disabling the theme and clipping high-DPI day columns.
             SetWindowTheme(calendar, null(), null());
+            if let Some(value) = value {
+                tint::apply(calendar, value.kind, value.palette);
+            }
         }
-        let colors = if let Some(a) = dark {
-            [
-                a.palette.surface,
-                a.palette.text,
-                a.palette.accent_surface,
-                a.palette.text,
-                a.palette.surface,
-                a.palette.disabled,
-            ]
-        } else {
-            [
-                GetSysColor(COLOR_WINDOW),
-                GetSysColor(COLOR_WINDOWTEXT),
-                GetSysColor(COLOR_ACTIVECAPTION),
-                GetSysColor(COLOR_CAPTIONTEXT),
-                GetSysColor(COLOR_WINDOW),
-                GetSysColor(COLOR_GRAYTEXT),
-            ]
-        };
+        // Recoloring requires the native light raster as its source. Keep
+        // documented colors native too (including theme-disabled OS fallbacks).
+        let colors = [
+            GetSysColor(COLOR_WINDOW),
+            GetSysColor(COLOR_WINDOWTEXT),
+            GetSysColor(COLOR_ACTIVECAPTION),
+            GetSysColor(COLOR_CAPTIONTEXT),
+            GetSysColor(COLOR_WINDOW),
+            GetSysColor(COLOR_GRAYTEXT),
+        ];
         for (part, color) in [
             MCSC_BACKGROUND,
             MCSC_TEXT,
@@ -459,7 +454,11 @@ unsafe fn dark_snapshot(hwnd: HWND) -> Option<(Appearance, String)> {
     // native focus/field highlights, an in-place child editor or an open popup.
     unsafe {
         let value = appearance(hwnd)?;
-        if value.kind != Resolved::Dark || high_contrast() || IsWindowEnabled(hwnd) == 0 {
+        if tint::active(hwnd)
+            || value.kind != Resolved::Dark
+            || high_contrast()
+            || IsWindowEnabled(hwnd) == 0
+        {
             return None;
         }
         let focus = GetFocus();

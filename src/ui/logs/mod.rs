@@ -9,9 +9,12 @@ use crate::{
 use windows_sys::Win32::{Foundation::HINSTANCE, Graphics::Gdi::HFONT};
 
 mod filter;
+mod resize;
 use filter::{
     Filters, LIMIT, MAX_LINES, bounded_file_text, filter, filter_live, local_bound, status_range,
 };
+pub(in crate::ui) use resize::CHANGED as HEIGHT_CHANGED;
+pub(in crate::ui) use resize::{apply as apply_grip, draw};
 #[cfg(test)]
 mod tests;
 
@@ -81,6 +84,8 @@ pub(super) const CONTENT: u32 = 2200;
 pub(super) struct Logs {
     controls: Vec<(HWND, i32, i32, i32, i32)>,
     content: HWND,
+    resize_grip: HWND,
+    viewer_height: Option<i32>,
     snapshot: Option<LogViewSnapshot>,
     live_text: String,
     live_entries: Vec<LogEntry>,
@@ -118,7 +123,11 @@ impl Logs {
         // SAFETY: Live parent/module; strings are copied during creation; id is a child identifier.
         let control = unsafe {
             CreateWindowExW(
-                0,
+                if class == "EDIT" && style & WS_BORDER != 0 {
+                    WS_EX_CLIENTEDGE
+                } else {
+                    0
+                },
                 wide(class).as_ptr(),
                 wide(title).as_ptr(),
                 WS_CHILD | style,
@@ -267,6 +276,8 @@ impl Logs {
         unsafe {
             SendMessageW(self.content, 0x00c5, LIMIT, 0);
         }
+        self.resize_grip = resize::create(parent, instance)?;
+        self.controls.push((self.resize_grip, 24, 422, 696, 12));
         for (title, id, x, w) in [
             ("删除历史日志…", 2210, 24, 180),
             ("清空全部应用日志…", 2211, 216, 220),
@@ -826,13 +837,62 @@ impl Logs {
             }
         }
     }
+    pub fn cancel_resize(&self) {
+        // SAFETY: Owner-thread UI child; no controller/disk/network work.
+        unsafe {
+            resize::cancel(self.resize_grip);
+        }
+    }
+
+    pub fn viewer_height(&self) -> i32 {
+        self.viewer_height.unwrap_or(resize::DEFAULT_HEIGHT)
+    }
+
+    pub fn set_viewer_height(&mut self, height: i32) -> bool {
+        let height = resize::clamp(height);
+        if self.viewer_height() == height {
+            return false;
+        }
+        self.viewer_height = Some(height);
+        true
+    }
+
+    pub fn page_height(&self, dpi: u32, height: i32) -> i32 {
+        height.max(scale(
+            656 + self.viewer_height() + status_bar::HEIGHT + viewport::BOTTOM_PADDING,
+            dpi,
+        ))
+    }
+
     pub fn layout(&self, dpi: u32, width: i32, height: i32) {
-        let extra = (height - scale(848, dpi)).max(-scale(32, dpi));
+        // Resizing the main window must not silently replace the user's chosen
+        // viewer height. Extra space expands only the final read-only detail.
+        let viewer_height = self.viewer_height();
+        let shift = scale(viewer_height - 96 + 8, dpi);
+        let document_bottom = scale(656 + viewer_height, dpi);
+        let detail_extra = (viewport::content_bottom(dpi, height) - document_bottom).max(0);
+        // SAFETY: Live grip, scalar presentation update without native callbacks.
+        unsafe {
+            resize::set_height(self.resize_grip, viewer_height, dpi);
+        }
         let mut moves = MoveBatch::with_capacity(self.controls.len());
         for &(control, x, y, w, h) in &self.controls {
             let wide = w == 696 || w == 700;
-            let y = scale(y, dpi) + if y >= 432 { extra } else { 0 };
-            let h = scale(h, dpi) + if control == self.content { extra } else { 0 };
+            let (y, h) = if control == self.content {
+                (scale(324, dpi), scale(viewer_height, dpi))
+            } else if control == self.resize_grip {
+                (scale(324 + viewer_height + 2, dpi), scale(12, dpi))
+            } else {
+                (
+                    scale(y, dpi) + if y >= 432 { shift } else { 0 },
+                    scale(h, dpi)
+                        + if unsafe { GetDlgCtrlID(control) } == 2221 {
+                            detail_extra
+                        } else {
+                            0
+                        },
+                )
+            };
             moves.add(
                 control,
                 scale(x, dpi),

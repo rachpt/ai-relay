@@ -111,6 +111,80 @@ fn visible(control: HWND) -> bool {
 }
 
 #[test]
+fn native_auto_start_checkbox_keeps_saved_preference_and_login_separate() {
+    let mut native = NativeSettings::new();
+    let settings = &mut native.settings;
+    assert!(settings.config.as_ref().unwrap().proxy.auto_start);
+    // SAFETY: Test-owned hidden controls, scalar checkbox messages only; no system Startup access.
+    unsafe {
+        assert_eq!(GetDlgCtrlID(settings.auto_start) as u32, AUTO_START);
+        assert_eq!(
+            text(settings.auto_start),
+            "打开软件后自动启动代理（使用已保存配置）"
+        );
+        assert_eq!(GetDlgCtrlID(settings.login) as u32, LOGIN);
+        let login = SendMessageW(settings.login, BM_GETCHECK, 0, 0);
+        for enabled in [true, false] {
+            let mut saved = Config::default();
+            saved.proxy.auto_start = enabled;
+            settings.populate(saved.clone());
+            assert_eq!(
+                SendMessageW(settings.auto_start, BM_GETCHECK, 0, 0),
+                isize::from(enabled)
+            );
+            select(settings.category, 4);
+            settings.show_page(3);
+            assert!(visible(settings.auto_start));
+            assert_eq!(settings.draft().unwrap(), saved);
+            // 隐藏父窗口不参与真实点击；直接设置草稿勾选状态，验证读取与切页保留。
+            SendMessageW(settings.auto_start, BM_SETCHECK, usize::from(!enabled), 0);
+            for category in [0, 5, 4] {
+                select(settings.category, category);
+                settings.show_page(3);
+                assert_eq!(visible(settings.auto_start), category == 4);
+                let draft = settings.draft().unwrap();
+                assert_eq!(draft.proxy.auto_start, !enabled);
+                assert_eq!(draft.system, saved.system);
+                assert_eq!(SendMessageW(settings.login, BM_GETCHECK, 0, 0), login);
+                assert_eq!(settings.config.as_ref(), Some(&saved));
+            }
+            settings.populate(saved.clone());
+            assert_eq!(settings.draft().unwrap(), saved);
+        }
+    }
+}
+
+#[test]
+fn login_startup_probe_cannot_replace_proxy_launch_result() {
+    use super::events::proxy_status;
+    for message in [
+        "配置已加载；正在使用已保存配置自动启动代理……",
+        "配置已加载；已关闭打开软件后自动启动代理，可手动启动。",
+        "操作失败：无法监听指定 IP 和端口，请检查地址、端口占用及权限。",
+        "配置已加载；非回环监听需要手动启动并确认风险，未自动启动。",
+        "操作失败：保存应用不得改变登录自启；请单独操作。",
+    ] {
+        let status = proxy_status(false, message).unwrap();
+        assert!(status.starts_with("代理状态：已停止\r\n"));
+        assert!(status.ends_with(message));
+    }
+    let running = "代理运行中；实际监听回环地址，使用已保存配置。";
+    assert_eq!(
+        proxy_status(true, running).unwrap(),
+        format!("代理状态：运行中\r\n{running}")
+    );
+    for message in [
+        "登录自启操作完成；实际状态见独立自启事件。",
+        "登录自启操作失败：系统操作失败，请重新查询。",
+        "历史策略独立保存并应用；代理未停止。",
+        "配置操作完成；详情见独立配置事件。",
+    ] {
+        assert!(proxy_status(false, message).is_none());
+        assert!(proxy_status(true, message).is_none());
+    }
+}
+
+#[test]
 fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
     let mut native = NativeSettings::new();
     let settings = &mut native.settings;

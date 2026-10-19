@@ -188,8 +188,8 @@ public static class Native {
                 byte[] mask=File.ReadAllBytes(Path.Combine(maskDirectory,assets[i]+".mask"));
                 if(mask.Length<334 || mask[0]!=78 || mask[1]!=65 || mask[2]!=86 || mask[3]!=49 || BitConverter.ToUInt16(mask,4)!=18 || BitConverter.ToUInt32(mask,6)!=324) throw new Exception("Unexpected SVG-derived NAV1 mask");
                 bool active=N.Message(tabs,pid,0x130B,0,0)==i;
-                Color fg=theme=="dark"?(active?Color.FromArgb(120,192,255):Color.FromArgb(238,242,245)):(active?Color.FromArgb(0,120,215):Color.FromArgb(32,34,38));
-                Color bg=theme=="dark"?(active?Color.FromArgb(41,62,84):Color.FromArgb(30,32,36)):(active?Color.FromArgb(229,240,252):Color.White);
+                Color fg=theme=="dark"?(active?Color.FromArgb(155,186,255):Color.FromArgb(161,175,197)):(active?Color.FromArgb(49,92,206):Color.FromArgb(90,106,128));
+                Color bg=theme=="dark"?(active?Color.FromArgb(41,57,81):Color.FromArgb(21,25,34)):(active?Color.FromArgb(232,239,255):Color.FromArgb(245,247,251));
                 int best=Int32.MaxValue,bx=0,by=0;
                 int cy=item.Top+(item.Height-18)/2;
                 for(int sy=cy-1;sy<=cy+1;sy++) for(int sx=item.Left+4;sx<=item.Right-22;sx++) {
@@ -376,7 +376,7 @@ try {
     Page 2
     $logRect=[TitleMenuSmoke.Native]::Outer((Control 2200),[uint32]$ownedPid)
     Record 'first-visit log editor DIP height' $logRect.Height
-    Assert-True ($logRect.Height -eq 96) 'First-visit logs editor must be 96 DIP, not stale pre-layout geometry'
+    Assert-True ($logRect.Height -eq 240) 'First-visit logs editor must keep its default 240 DIP user-adjustable height, not stale pre-layout geometry'
     Screen 'light-logs-first-visit' | Out-Null
     $stage='history result/session coordinates'
     Page 1
