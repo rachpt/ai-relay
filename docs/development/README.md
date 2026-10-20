@@ -4,6 +4,7 @@
 
 - [当前状态与下一步](STATUS.md)
 - [批次记录模板](TEMPLATE.md)
+- [2026-10-20-03：清理可重建开发产物并核验最新Release](2026-10-20-03-target-cleanup.md)
 - [2026-10-20-02：提交前独立review与原生绘制回归修复](2026-10-20-02-precommit-review.md)
 - [2026-10-20-01：修复深色日期选择框与弹出月历](2026-10-20-01-dark-date-picker.md)
 - [2026-10-19-08：修复待提交 review 的四项交互与冒烟问题](2026-10-19-08-review-interaction-fixes.md)

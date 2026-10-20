@@ -47,6 +47,8 @@
 
 ## 最近验证
 
+- target清理／Release核验：HEAD 5ec6c36静态CRT `cargo build --release --locked --offline` 0.51秒确认新鲜、EXE哈希保持5278316C…33846；包级dev清理5,408文件，目录项9.190→4.497 GiB、硬链接去重8.013→4.251 GiB（估计释放3.762 GiB）。当前Debug／Release及旧显式target共6个EXE/PDB哈希不变，2,472证据文件聚合哈希不变，Debug／Release `--version`均通过。未重跑全套、未改源码/profile/dist，最新程序是 `target/release/ai-relay.exe`，显式target和dist仍旧。见[清理记录](2026-10-20-03-target-cleanup.md)。
+
 - 提交前review：fmt/check/246库＋153集成（399项）/严格Clippy/Debug与静态CRT Release／PE检查通过；7工具ValidateOnly与Debug modern 16／24／24矩阵通过。加强版日期Debug84离屏内容通过、物理6通过6遮挡跳过／GDI恒99；首轮Debug及最终Release因浅色翻月页脚缺失失败。菜单PrintWindow纯黑被新增守卫拒绝，未声称最新菜单视觉复验通过。原失败报告保留、秘密规则仅既有虚构fixture、未加入配置／target／dist。见[提交前review记录](2026-10-20-02-precommit-review.md)。
 
 - 深色日期框／月历：最终fmt/all-targets check/9项日期（4新增）/240库＋153集成（393项，分段无skip）/严格Clippy/Debug及静态CRT Release与PE检查通过。两构建96 DPI浅→深→浅四日期框各84离屏＋12物理图均通过，聚焦／展开／翻月／原生PageDown/Right/Enter／清空及ISO值不变，配置哈希不变并正常退出；8轮GUI GDI恒99、30轮原生精确资源回归通过。144/192为字体参数测试，不代表实机缩放；Complete=false。最新Debug/Release更新，dist未变，见[日期修复记录](2026-10-20-01-dark-date-picker.md)。
@@ -135,6 +137,8 @@
 6. 在保持行为不变的前提下，继续按领域拆分 `controller`/`logs` 的测试与轮询代码，并补必要的模块边界回归。
 
 ## 最近记录
+
+- [2026-10-20-03：清理可重建开发产物并核验最新Release](2026-10-20-03-target-cleanup.md)
 
 - [2026-10-20-02：提交前独立review与原生绘制回归修复](2026-10-20-02-precommit-review.md)
 
