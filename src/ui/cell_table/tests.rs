@@ -377,6 +377,92 @@ fn injected_copy_writes_only_one_cell_and_obeys_selection_and_visibility() {
 }
 
 #[test]
+fn scroll_theme_light_dark_light_preserves_active_cell_and_full_copy() {
+    use super::super::theme::{Resolved, Theme};
+    use crate::config::ThemeMode;
+
+    let host = Host::new(&[100, 100], 2);
+    let text = format!("{}😀中文\tline\r\n{}🦀", "a".repeat(254), "𐐷".repeat(500));
+    host.text(0, 1, "never copy this row");
+    host.text(1, 0, "never copy this column");
+    host.text(1, 1, &text);
+    host.show();
+    // SAFETY: theme changes target the owned, same-thread offscreen HWND;
+    // the injected writer only stores local strings, never clipboard data.
+    unsafe {
+        let target = host.select(1, 1);
+        assert_eq!(target.cell, Cell { row: 1, column: 1 });
+        let style = GetWindowLongPtrW(host.list, GWL_EXSTYLE);
+        assert_eq!(style & WS_EX_COMPOSITED as isize, 0);
+        let mut writes = Vec::new();
+        for (kind, mode) in [
+            (Resolved::Light, ThemeMode::Light),
+            (Resolved::Dark, ThemeMode::Dark),
+            (Resolved::Light, ThemeMode::Light),
+        ] {
+            let palette = Theme::new(mode).unwrap().palette;
+            super::super::scroll_theme::apply(host.list, kind, palette, 96);
+
+            assert_eq!(
+                GetWindowLongPtrW(host.list, GWL_EXSTYLE),
+                style
+                    | if kind == Resolved::Dark {
+                        WS_EX_COMPOSITED as isize
+                    } else {
+                        0
+                    }
+            );
+            assert_eq!(interaction(host.list).unwrap().column, Some(1));
+            assert_eq!(current(host.list), Some(target));
+            assert!(
+                copy_current(host.list, |owner, text| {
+                    assert_eq!(owner, host.list);
+                    writes.push(text.to_owned());
+                    Ok(())
+                })
+                .unwrap()
+            );
+            assert_eq!(current(host.list), Some(target));
+        }
+        assert_eq!(writes, vec![text; 3]);
+    }
+}
+
+#[test]
+fn other_extended_style_changes_invalidate_active_cell_and_copy() {
+    let host = Host::new(&[100, 100], 2);
+    host.text(1, 1, "must not reach the writer after invalidation");
+    host.show();
+    // SAFETY: mutate only the test-owned HWND on its owner thread; writers
+    // deliberately panic if an invalid current or saved target reaches them.
+    unsafe {
+        let style = GetWindowLongPtrW(host.list, GWL_EXSTYLE);
+        for toggled in [
+            WS_EX_CONTROLPARENT,
+            0,
+            WS_EX_CONTROLPARENT | WS_EX_COMPOSITED,
+            0,
+        ] {
+            let target = host.select(1, 1);
+            let next = style ^ toggled as isize;
+            assert_ne!(
+                (GetWindowLongPtrW(host.list, GWL_EXSTYLE) ^ next) & !(WS_EX_COMPOSITED as isize),
+                0
+            );
+            SetWindowLongPtrW(host.list, GWL_EXSTYLE, next);
+            assert_eq!(GetWindowLongPtrW(host.list, GWL_EXSTYLE), next);
+            let value = interaction(host.list).unwrap();
+            assert!(value.column.is_none());
+            assert_ne!(value.stamp(), target.stamp);
+            assert_eq!(value.changing, 0);
+            assert!(current(host.list).is_none());
+            assert!(!copy_current(host.list, |_, _| panic!("invalid current write")).unwrap());
+            assert!(!copy_target(host.list, target, |_, _| panic!("stale target write")).unwrap());
+        }
+    }
+}
+
+#[test]
 fn horizontal_keys_follow_visual_order_skip_hidden_columns_and_reveal() {
     let host = Host::new(&[170, 170, 170, 0], 3);
     host.show();

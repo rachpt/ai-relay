@@ -83,6 +83,16 @@ public static class Native {
         try { if(GetWindowRgn(h,r)!=0) throw new Exception("REGRESSION: Edit has an application-owned clipping region"); }
         finally { DeleteObject(r); }
     }
+    public static string NativeDate(IntPtr h,uint pid) {
+        N.Check(h,pid);
+        if(!String.Equals(N.Class(h),"SysDateTimePick32",StringComparison.OrdinalIgnoreCase)) throw new Exception("Not a native SysDateTimePick32");
+        var r=CreateRectRgn(0,0,0,0); if(r==IntPtr.Zero) throw new Exception("Local date region allocation failed");
+        try {
+            N.Check(h,pid);
+            if(GetWindowRgn(h,r)!=0) throw new Exception("REGRESSION: date picker has a clipping region truncating its native border");
+            return "Native date picker; no window region (not a pixel-perfect border proof)";
+        } finally { if(!DeleteObject(r)) throw new Exception("Local date region release failed"); }
+    }
     public static EditState Edit(IntPtr h,uint pid) {
         NoEditRegion(h,pid);
         long style=unchecked((uint)GetWindowLongW(h,-16))&0xFFFFFF;
@@ -101,7 +111,7 @@ public static class Native {
         N.Check(h,pid); var box=N.Outer(h,pid); int d=Math.Min(Math.Min(box.Width,box.Height),(int)((12*N.GetDpiForWindow(h)+48)/96));
         var actual=CreateRectRgn(0,0,0,0); var expected=CreateRoundRectRgn(0,0,box.Width+1,box.Height+1,d,d);
         if(actual==IntPtr.Zero || expected==IntPtr.Zero) throw new Exception("Region allocation failed");
-        try { if(GetWindowRgn(h,actual)!=3 || !EqualRgn(actual,expected)) throw new Exception("REGRESSION: rounded button/combo/date region differs from native 6-DIP raster"); }
+        try { if(GetWindowRgn(h,actual)!=3 || !EqualRgn(actual,expected)) throw new Exception("REGRESSION: rounded button/combo region differs from native 6-DIP raster"); }
         finally { DeleteObject(actual); DeleteObject(expected); }
         return N.Class(h)+"; "+box+"; exact 6-DIP rounded region";
     }
@@ -277,7 +287,7 @@ function Choice([int]$Id,[int]$Index) {
     Start-Sleep -Milliseconds 20
     Assert-True ((Msg $h 0x130B) -eq $Index) "Choice $Id selection did not persist"
 }
-function Theme([int]$Index) { Page 3; Choice 2039 5; Choice 2030 $Index; Start-Sleep -Milliseconds 40 }
+function Theme([int]$Index) { Page 3; Choice 2039 5; Choice 2030 $Index; Start-Sleep -Milliseconds 40; All-DateRegions }
 function Offset { Guard; [TitleMenuSmoke.Native]::Offset((Control 2400),[uint32]$ownedPid) }
 function Geometry([int]$Id,[int]$DocumentTop) {
     $h=Control $Id; $r=[TitleMenuSmoke.Native]::Outer($h,[uint32]$ownedPid); $p=[TitleMenuSmoke.Native]::Origin((Control 2400),[uint32]$ownedPid); $offset=Offset
@@ -286,7 +296,7 @@ function Geometry([int]$Id,[int]$DocumentTop) {
     Record 'HWND geometry' $proof
     Assert-True ($actual -eq $expected -and $proof.Visible) "Control $Id actual viewport Y=$actual expected=$expected"
 }
-function Resize([int]$Width,[int]$Height) { Guard; [UiRegression.Native]::Resize($window,[uint32]$ownedPid,$Width,$Height); Start-Sleep -Milliseconds 140 }
+function Resize([int]$Width,[int]$Height) { Guard; [UiRegression.Native]::Resize($window,[uint32]$ownedPid,$Width,$Height); Start-Sleep -Milliseconds 140; All-DateRegions }
 function Screen([string]$Name) {
     Guard; $path=Join-Path $output ($Name+'.png')
     try { $bounds=[UiRegression.Native]::Screen($window,[uint32]$ownedPid,$path); Record ('physical '+$Name) @{Path=$path;Bounds=$bounds}; return $path }
@@ -316,8 +326,23 @@ function All-EditRegions {
     }
     Record 'all native Edit HWNDs have no clipping region' $count
 }
+function All-DateRegions([switch]$Log) {
+    Guard
+    $seen=[Collections.Generic.HashSet[int]]::new()
+    # Recursive enumeration includes all pages, not only visible controls.
+    foreach($h in [TitleMenuSmoke.Native]::Children($window,[uint32]$ownedPid,$true)) {
+        if([TitleMenuSmoke.Native]::Class($h) -ne 'SysDateTimePick32') { continue }
+        Guard
+        $id=[TitleMenuSmoke.Native]::GetDlgCtrlID($h)
+        Assert-True ($id -in @(2224,2225,2302,2303) -and $seen.Add($id)) "Unexpected/duplicate native date picker ID $id"
+        $proof=[UiRegression.Native]::NativeDate($h,[uint32]$ownedPid)
+        if($Log) { Record "native date $id without clipping region (including hidden HWNDs)" $proof }
+    }
+    foreach($id in @(2224,2225,2302,2303)) { Assert-True ($seen.Contains($id)) "Missing native date picker $id in owned descendant HWNDs" }
+}
 function Assert-Edits {
     All-EditRegions
+    All-DateRegions
     foreach($old in $editBaseline) {
         $now=Edit-State ([IntPtr]$old.Handle)
         foreach($key in @('Style','ExStyle','Selection','Margins','Mask','Limit','Length','Text','Password')) { Assert-True ($now.$key -ceq $old.$key) "Edit $($old.Handle) changed $key during presentation/navigation" }
@@ -401,7 +426,7 @@ try {
     }
     Screen 'light-history-summary-scrolled' | Out-Null
     Choice 2301 4
-    Record 'rounded date' ([UiRegression.Native]::Rounded((Control 2302),[uint32]$ownedPid))
+    All-DateRegions -Log
     Msg (Control 2318) 0xF5 | Out-Null
     Record 'rounded combo' ([UiRegression.Native]::Rounded((Control 2310),[uint32]$ownedPid))
     Record 'rounded button' ([UiRegression.Native]::Rounded((Control 2320),[uint32]$ownedPid))

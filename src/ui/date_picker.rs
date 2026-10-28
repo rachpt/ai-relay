@@ -4,9 +4,9 @@
 //! WM_SETTEXT accepts only ISO YYYY-MM-DD or empty; WM_GETTEXT always returns
 //! that value, never the display prefix. No history query or app State is used.
 //!
-//! Dark presentation recolors the native picker/calendar raster, preserving
-//! focused fields, hit testing, navigation and DPI-dependent themed geometry.
-//! Light/high contrast retain the native renderer without recoloring.
+//! Dark presentation tints the themed picker and uses native classic calendar
+//! colors, including direct navigation animation paths. Native font/minimum and
+//! popup-host sizing preserve the full grid/footer; light/contrast restore themes.
 #![cfg(windows)]
 
 use super::theme::{Palette, Resolved};
@@ -318,26 +318,46 @@ unsafe fn popup_colors(hwnd: HWND) {
     // native font handles only; the control owns its ephemeral month calendar.
     unsafe {
         let value = appearance(hwnd);
+        let dark = value.filter(|value| value.kind == Resolved::Dark && !high_contrast());
 
         let calendar = SendMessageW(hwnd, DTM_GETMONTHCAL, 0, 0) as HWND;
         if !calendar.is_null() {
-            // Preserve themed native metrics; recolor after native painting
-            // instead of disabling the theme and clipping high-DPI day columns.
-            SetWindowTheme(calendar, null(), null());
+            // Native month navigation uses a TimerProc that paints outside the
+            // window procedure. Give that renderer dark source colors rather
+            // than tinting only WM_PAINT/PRINT and leaving its final frame white.
             if let Some(value) = value {
-                tint::apply(calendar, value.kind, value.palette);
+                tint::apply(calendar, Resolved::Light, value.palette);
             }
+            let empty = [0u16];
+            let theme = if dark.is_some() {
+                empty.as_ptr()
+            } else {
+                null()
+            };
+            SetWindowTheme(calendar, theme, theme);
         }
-        // Recoloring requires the native light raster as its source. Keep
-        // documented colors native too (including theme-disabled OS fallbacks).
-        let colors = [
-            GetSysColor(COLOR_WINDOW),
-            GetSysColor(COLOR_WINDOWTEXT),
-            GetSysColor(COLOR_ACTIVECAPTION),
-            GetSysColor(COLOR_CAPTIONTEXT),
-            GetSysColor(COLOR_WINDOW),
-            GetSysColor(COLOR_GRAYTEXT),
-        ];
+        let colors = if let Some(value) = dark {
+            let p = value.palette;
+            // Classic monthcal reuses TITLEBK as weekday text ink. It must
+            // contrast with MONTHBK as well as with the month title's text.
+            [
+                p.surface,
+                p.text,
+                p.accent,
+                p.on_accent(),
+                p.surface,
+                p.disabled,
+            ]
+        } else {
+            [
+                GetSysColor(COLOR_WINDOW),
+                GetSysColor(COLOR_WINDOWTEXT),
+                GetSysColor(COLOR_ACTIVECAPTION),
+                GetSysColor(COLOR_CAPTIONTEXT),
+                GetSysColor(COLOR_WINDOW),
+                GetSysColor(COLOR_GRAYTEXT),
+            ]
+        };
         for (part, color) in [
             MCSC_BACKGROUND,
             MCSC_TEXT,
@@ -350,6 +370,9 @@ unsafe fn popup_colors(hwnd: HWND) {
         .zip(colors)
         {
             SendMessageW(hwnd, DTM_SETMCCOLOR, part as WPARAM, color as LPARAM);
+            if !calendar.is_null() {
+                SendMessageW(calendar, MCM_SETCOLOR, part as WPARAM, color as LPARAM);
+            }
         }
         let font = SendMessageW(hwnd, WM_GETFONT, 0, 0);
         let font = if font == 0 {
@@ -373,8 +396,9 @@ unsafe fn popup_colors(hwnd: HWND) {
                 && GetWindowRect(calendar, &mut outer) != 0
                 && GetClientRect(calendar, &mut client) != 0
             {
-                let width =
-                    minimum.right - minimum.left + (outer.right - outer.left - client.right).max(0);
+                let today_width = SendMessageW(calendar, MCM_GETMAXTODAYWIDTH, 0, 0) as i32;
+                let width = (minimum.right - minimum.left).max(today_width)
+                    + (outer.right - outer.left - client.right).max(0);
                 let height = minimum.bottom - minimum.top
                     + (outer.bottom - outer.top - client.bottom).max(0);
                 SetWindowPos(
@@ -386,7 +410,75 @@ unsafe fn popup_colors(hwnd: HWND) {
                     height,
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                 );
+                fit_popup_host(calendar);
             }
+            RedrawWindow(
+                calendar,
+                null(),
+                std::ptr::null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME,
+            );
+        }
+    }
+}
+
+unsafe fn fit_popup_host(calendar: HWND) {
+    // SAFETY: the native picker may embed the calendar in its own DropDown
+    // popup. Resize only that same-thread native host, never the app/viewport.
+    // Resizing just the child leaves its last columns/footer clipped by the
+    // smaller themed host after switching the calendar renderer or DPI font.
+    unsafe {
+        if GetWindowLongPtrW(calendar, GWL_STYLE) as u32 & WS_CHILD == 0 {
+            return;
+        }
+        let host = GetParent(calendar);
+        let mut class = [0u16; 32];
+        let count = GetClassNameW(host, class.as_mut_ptr(), class.len() as i32);
+        if count <= 0
+            || !String::from_utf16_lossy(&class[..count as usize]).eq_ignore_ascii_case("DropDown")
+            || GetWindowThreadProcessId(host, std::ptr::null_mut()) != GetCurrentThreadId()
+            || GetWindowLongPtrW(host, GWL_STYLE) as u32 & WS_POPUP == 0
+        {
+            return;
+        }
+        let mut child = RECT::default();
+        let mut outer = RECT::default();
+        let mut client = RECT::default();
+        let mut origin = POINT::default();
+        if GetWindowRect(calendar, &mut child) == 0
+            || GetWindowRect(host, &mut outer) == 0
+            || GetClientRect(host, &mut client) == 0
+            || ClientToScreen(host, &mut origin) == 0
+        {
+            return;
+        }
+        let inset_x = (child.left - origin.x).max(0);
+        let inset_y = (child.top - origin.y).max(0);
+        let width =
+            child.right - origin.x + inset_x + (outer.right - outer.left - client.right).max(0);
+        let height =
+            child.bottom - origin.y + inset_y + (outer.bottom - outer.top - client.bottom).max(0);
+        let (mut x, mut y) = (outer.left, outer.top);
+        if let Some(work) = super::overview::work_area(host) {
+            x = x.clamp(work.left, (work.right - width).max(work.left));
+            y = y.clamp(work.top, (work.bottom - height).max(work.top));
+        }
+        if width > 0
+            && height > 0
+            && (width != outer.right - outer.left
+                || height != outer.bottom - outer.top
+                || x != outer.left
+                || y != outer.top)
+        {
+            SetWindowPos(
+                host,
+                std::ptr::null_mut(),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
     }
 }

@@ -49,6 +49,7 @@ public static class Native {
     }
     [StructLayout(LayoutKind.Sequential)] struct MonitorInfo { public uint Size; public N.Rect Monitor,Work; public uint Flags; }
     [StructLayout(LayoutKind.Sequential)] struct ContrastInfo { public uint Size,Flags; public IntPtr Scheme; }
+
     [DllImport("user32.dll")] static extern bool GetScrollInfo(IntPtr h,int axis,ref ScrollInfo info);
     [DllImport("user32.dll")] static extern bool GetScrollBarInfo(IntPtr h,int objectId,ref BarInfo info);
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread,ref GuiInfo info);
@@ -95,6 +96,14 @@ public static class Native {
     public static int DocumentBottom(int clientHeight,int height) { return Math.Max(656+height,clientHeight-56); }
     public static int Extent(int clientHeight,int height) { return Math.Max(clientHeight,656+height+40+16)-44-40; }
     public static long Style(IntPtr h,uint pid) { N.Check(h,pid); return unchecked((uint)GetWindowLongW(h,-16)); }
+    // WS_HSCROLL/WS_VSCROLL are presentation state, not the Edit's semantic contract.
+    public static long ViewerSemantics(long style) { return style&0x000108C4; }
+    public static bool BarMatches(BarInfo bar,long style,int axis,bool visible) {
+        if(axis!=0 && axis!=1) throw new ArgumentOutOfRangeException("axis");
+        bool styled=(style&(axis==0?0x00100000:0x00200000))!=0;
+        return visible?styled && bar.Visible && (bar.State0&1)==0:
+            !styled && !bar.Visible && (bar.State0&0x8000)!=0;
+    }
     public static void Tree(IntPtr main,IntPtr h,uint pid) {
         N.Check(main,pid);
         for(int i=0;i<64 && h!=IntPtr.Zero;i++,h=N.GetParent(h)) { N.Check(h,pid); if(h==main) return; }
@@ -152,6 +161,7 @@ public static class Native {
             throw new Exception("Bounded WM_GETTEXT timed out/truncated/changed");
         return text.ToString();
     }
+
     public static int ComboIndex(IntPtr combo,uint pid,string value) {
         N.Check(combo,pid); if(N.Class(combo)!="ComboBox") throw new Exception("Expected a native file ComboBox");
         UIntPtr result;
@@ -166,7 +176,7 @@ public static class Native {
         N.Check(edit,pid); if(N.Class(edit)!="Edit") throw new Exception("2200 must remain a native Edit");
         long style=Style(edit,pid); string text=Text(edit,pid); string hash;
         using(var sha=SHA256.Create()) hash=BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(text))).Replace("-","");
-        return new ViewerState { Handle=edit.ToInt64(),SemanticStyle=style&0x003108C4,ReadOnly=(style&0x800)!=0,Multiline=(style&4)!=0,
+        return new ViewerState { Handle=edit.ToInt64(),SemanticStyle=ViewerSemantics(style),ReadOnly=(style&0x800)!=0,Multiline=(style&4)!=0,
             Length=text.Length,TextSha256=hash,Selection=N.Message(edit,pid,0xB0,0,0),FirstLine=N.Message(edit,pid,0xCE,0,0),
             Vertical=Scroll(edit,pid,1),Horizontal=Scroll(edit,pid,0) };
     }
@@ -271,6 +281,18 @@ public static class Native {
         if(DocumentBottom(641,240)!=896 || DocumentBottom(952,240)!=896 || DocumentBottom(953,240)!=897 || DocumentBottom(1600,120)!=1544)
             throw new Exception("Detail tail must stretch only beyond the minimum log document bottom");
         if(new ScrollInfo { Min=0,Max=867,Page=557 }.Limit!=311) throw new Exception("Inclusive scroll range self-check failed");
+        foreach(long scrollStyle in new long[] { 0,0x00100000,0x00200000,0x00300000 })
+            if(ViewerSemantics(0x508108C4|scrollStyle)!=0x000108C4) throw new Exception("Dynamic scrollbar bits must not change viewer semantics");
+        foreach(long semanticBit in new long[] { 4,0x40,0x80,0x800 })
+            if(ViewerSemantics(0x50B108C4^semanticBit)==0x000108C4) throw new Exception("Multiline/read-only/auto-scroll semantics must remain checked");
+        var visibleBar=new BarInfo { Rect=new N.Rect { Left=0,Top=0,Right=17,Bottom=200 } };
+        var hiddenBar=new BarInfo { State0=0x8000 };
+        if(!BarMatches(visibleBar,0x00100000,0,true) || !BarMatches(visibleBar,0x00200000,1,true) ||
+           !BarMatches(hiddenBar,0,0,false) || !BarMatches(hiddenBar,0,1,false) ||
+           BarMatches(visibleBar,0,0,true) || BarMatches(hiddenBar,0x00100000,0,false) ||
+           BarMatches(new BarInfo { State0=0x10000 },0,0,false) ||
+           BarMatches(new BarInfo { Rect=visibleBar.Rect,State0=1 },0x00100000,0,true))
+            throw new Exception("Scrollbar acceptance must distinguish visible, disabled, invisible and offscreen states");
         if((ResizeFlags&0x4000)==0 || (ResizeFlags&0x14)!=0x14) throw new Exception("Resize must post asynchronously without activation/z-order changes");
         var requested=new N.Rect { Left=-20,Top=30,Right=880,Bottom=770 };
         if(!ResizeCompleted(requested,requested) || ResizeCompleted(new N.Rect { Left=-20,Top=30,Right=880,Bottom=769 },requested) ||
@@ -287,7 +309,7 @@ public static class Native {
         if(Analyze(colors,17,120,true).LargeWhite) throw new Exception("Small glyph pixel self-check failed");
         for(int y=20;y<100;y++) colors[y*17+8]=0xFFFFFF;
         if(!Analyze(colors,17,120,true).LargeWhite) throw new Exception("Long narrow white stripe self-check failed");
-        return "x64 layouts 28/60/72; async resize flags/completion; process Path pending/match/mismatch; 120..720 clamp, 240 default, dynamic extent, signed screen/thumb coordinates and dark/white pixel rules";
+        return "x64 layouts 28/60/72; viewer semantics exclude dynamic WS_SCROLL bits; scrollbar style/visible/disabled/invisible/offscreen rules; async resize flags/completion; process Path pending/match/mismatch; 120..720 clamp, 240 default, dynamic extent, signed screen/thumb coordinates and dark/white pixel rules";
     }
 }
 }
@@ -411,7 +433,12 @@ function Assert-Dark { Assert-True ((Msg (Control 2030) 0x130B) -eq 2) 'Expected
 function Scroll([int]$Action) { Msg (Control 2400) 0x115 ([uint64]$Action) | Out-Null }
 function Reach([int]$Id) {
     $h=Control $Id
-    Assert-True ([TitleMenuSmoke.Native]::IsWindowVisible($h) -and [TitleMenuSmoke.Native]::IsWindowEnabled($h)) "Input target $Id hidden/disabled"
+    # Auto-hide coalesces NC geometry after async layout and briefly disables
+    # redraw (which clears WS_VISIBLE). Await completion before sending input;
+    # a persistently hidden/disabled target still fails within the bounded wait.
+    Wait-State "Input target $Id visible/enabled after layout transaction" {
+        [TitleMenuSmoke.Native]::IsWindowVisible($h) -and [TitleMenuSmoke.Native]::IsWindowEnabled($h)
+    } 1500
     for ($i=0;$i -lt 40;$i++) {
         Guard; $r=[TitleMenuSmoke.Native]::Outer($h,[uint32]$ownedPid)
         $p=[TitleMenuSmoke.Native]::Origin($hostWindow,[uint32]$ownedPid); $c=[TitleMenuSmoke.Native]::Client($hostWindow,[uint32]$ownedPid)
@@ -459,6 +486,50 @@ function Assert-Viewer([string]$Name) {
         Assert-True ($now.$key -ceq $viewerBaseline.$key) "$Name changed native viewer $key"
     }
     Assert-True ($now.ReadOnly -and $now.Multiline) "$Name lost native read-only multiline behavior"
+}
+function Set-ViewerFixture([string]$Value,[string]$Name) {
+    # Only mutate the already-paused, private file viewer; no worker/file changes.
+    Assert-True ((Text 2202) -ceq '恢复显示' -and (Text 2220).Contains('已暂停')) "$Name requires the private paused fixture"
+    Assert-True ($Value.Length -le 262144) "$Name exceeds the bounded viewer fixture"
+    $h=Control 2200; $semantics=$viewerBaseline.SemanticStyle
+    Assert-True ([TitleMenuSmoke.Native]::GetDlgCtrlID($h) -eq 2200) 'Fixture writes are limited to pinned Edit2200'
+    Guard; [TitleMenuSmoke.Native]::SetText($h,[uint32]$ownedPid,$Value)
+    Wait-State "$Name bounded WM_SETTEXT observed" { (Text 2200) -ceq $Value } 1500
+    Msg $h 0xB1 0 ([Math]::Min(12,$Value.Length)) | Out-Null
+    $script:viewerBaseline=[LogsInteraction.Native]::Viewer($h,[uint32]$ownedPid)
+    Assert-True ($viewerBaseline.SemanticStyle -eq $semantics -and $viewerBaseline.ReadOnly -and $viewerBaseline.Multiline) "$Name changed native Edit semantic styles"
+}
+function Assert-ViewerBars([string]$Name,[bool]$Horizontal,[bool]$Vertical,[switch]$Exercise) {
+    Reach 2200; $h=Control 2200
+    Wait-State "$Name actual style and SCROLLBARINFO visibility" {
+        $style=[LogsInteraction.Native]::Style($h,[uint32]$ownedPid)
+        [LogsInteraction.Native]::BarMatches([LogsInteraction.Native]::Bar($h,[uint32]$ownedPid,0),$style,0,$Horizontal) -and
+            [LogsInteraction.Native]::BarMatches([LogsInteraction.Native]::Bar($h,[uint32]$ownedPid,1),$style,1,$Vertical)
+    } 1500
+    Assert-Viewer $Name
+    $motions=@()
+    foreach ($axis in @(0,1)) {
+        $expected=if ($axis -eq 0) { $Horizontal } else { $Vertical }
+        if (-not $expected) { continue } # Hidden-axis cached ranges are NOT overflow proof.
+        $info=[LogsInteraction.Native]::Scroll($h,[uint32]$ownedPid,$axis)
+        Assert-True ($info.Limit -gt $info.Min) "$Name/$axis visible bar must have real native scroll travel"
+        if ($Exercise) {
+            $code=if ($axis -eq 0) { 0x114 } else { 0x115 }
+            Msg $h $code 6 | Out-Null
+            $before=[LogsInteraction.Native]::Scroll($h,[uint32]$ownedPid,$axis)
+            Msg $h $code 1 | Out-Null
+            Wait-State "$Name/$axis native line-down advances position" { [LogsInteraction.Native]::Scroll($h,[uint32]$ownedPid,$axis).Position -gt $before.Position } 1000
+            $after=[LogsInteraction.Native]::Scroll($h,[uint32]$ownedPid,$axis)
+            Assert-True ($after.Position -le $after.Limit) "$Name/$axis scroll exceeded native limit"
+            Msg $h $code 6 | Out-Null
+            Assert-True ([LogsInteraction.Native]::Scroll($h,[uint32]$ownedPid,$axis).Position -eq $before.Min) "$Name/$axis native scroll-to-start did not restore position"
+            $motions+=@{Axis=$axis;Before=$before;After=$after}
+        }
+    }
+    Assert-Viewer $Name
+    $style=[LogsInteraction.Native]::Style($h,[uint32]$ownedPid)
+    Assert-True ([LogsInteraction.Native]::BarMatches([LogsInteraction.Native]::Bar($h,[uint32]$ownedPid,0),$style,0,$Horizontal) -and [LogsInteraction.Native]::BarMatches([LogsInteraction.Native]::Bar($h,[uint32]$ownedPid,1),$style,1,$Vertical)) "$Name changed expected bar visibility after native scrolling"
+    Record ('viewer scrollbars '+$Name) @{Theme=(Msg (Control 2030) 0x130B);ExpectedH=$Horizontal;ExpectedV=$Vertical;Style=[LogsInteraction.Native]::Style($h,[uint32]$ownedPid);H=[LogsInteraction.Native]::Bar($h,[uint32]$ownedPid,0);V=[LogsInteraction.Native]::Bar($h,[uint32]$ownedPid,1);Viewer=[LogsInteraction.Native]::Viewer($h,[uint32]$ownedPid);NativeMotion=$motions}
 }
 function Assert-Height([int]$Height,[string]$Name) {
     $proof=[LogsInteraction.Native]::Layout($window,(Control 2400),(Control 2200),(Control 2230),[uint32]$ownedPid,$Height)
@@ -782,6 +853,66 @@ try {
     Grip-Key 0x24 240 'Home restores initial viewer before scrollbar matrix'
     Resize 900 740 | Out-Null
 
+    $stage='Edit2200 dynamic scrollbar visibility and native motion (light/dark)'
+    $pausedBody=Text 2200; $pausedBaseline=$viewerBaseline
+    $fitBody="fit fixture row 00`r`nfit fixture row 01`r`nfit fixture row 02"
+    $horizontalBody=[string]::new([char]'W',512)
+    $verticalBody=[string]::Join("`r`n",[string[]]@(0..79 | ForEach-Object { 'short-row-'+$_.ToString('00') }))
+    foreach ($themeCase in @(@(1,'light'),@(2,'dark'))) {
+        Theme $themeCase[0]; $label=$themeCase[1]
+        foreach ($contentCase in @(
+            @{Name='fits';Body=$fitBody;H=$false;V=$false},
+            @{Name='horizontal-only';Body=$horizontalBody;H=$true;V=$false},
+            @{Name='vertical-only';Body=$verticalBody;H=$false;V=$true},
+            @{Name='both';Body=$pausedBody;H=$true;V=$true},
+            @{Name='clear';Body='';H=$false;V=$false},
+            @{Name='both-again';Body=$pausedBody;H=$true;V=$true},
+            @{Name='shorten';Body=$fitBody;H=$false;V=$false}
+        )) {
+            $name=$label+'-'+$contentCase.Name
+            Set-ViewerFixture $contentCase.Body $name
+            Assert-ViewerBars $name $contentCase.H $contentCase.V -Exercise
+            if ($contentCase.Name -eq 'fits' -or $contentCase.Name -eq 'clear') {
+                Physical ($name+'-no-scrollbars-REFERENCE')
+            }
+        }
+    }
+    # Resize transitions use only the dark round; both themes already prove
+    # content-driven hiding/restoration and actual V/H native scroll motion.
+    $heightBody=[string]::Join("`r`n",[string[]]@(0..15 | ForEach-Object { 'height-row-'+$_.ToString('00') }))
+    Set-ViewerFixture $heightBody 'height-resize'
+    Assert-ViewerBars 'height-before-grow' $false $true -Exercise
+    Grip-Key 0x28 384 'visibility matrix grows viewer through genuine grip keys' 6
+    Assert-ViewerBars 'height-grown-hides-V' $false $false
+    Grip-Key 0x24 240 'visibility matrix restores height through Home'
+    Assert-ViewerBars 'height-shrunk-restores-V' $false $true -Exercise
+    Set-ViewerFixture $horizontalBody 'width-native-measurement'
+    Assert-ViewerBars 'width-native-measurement' $true $false
+    # Scale only synthetic text length from the real overflowing native range;
+    # never write ranges or reuse another process's GDI font handle.
+    $widthInfo=[LogsInteraction.Native]::Scroll((Control 2200),[uint32]$ownedPid,0)
+    $unitWidth=([double]$widthInfo.Max-$widthInfo.Min)/$horizontalBody.Length
+    Assert-True ($unitWidth -gt 0 -and $widthInfo.Page -gt 0) 'Width fixture requires a measured overflowing native range/page'
+    $widthCount=[int][Math]::Ceiling(($widthInfo.Page+48)/$unitWidth)
+    Assert-True ($widthCount -gt 0 -and $widthCount -lt $horizontalBody.Length) 'Width fixture count must be bounded by the measured synthetic line'
+    $widthBody=[string]::new([char]'W',$widthCount)
+    Set-ViewerFixture $widthBody 'width-resize'
+    Assert-ViewerBars 'width-before-grow' $true $false -Exercise
+    $narrowWidth=[TitleMenuSmoke.Native]::Outer((Control 2200),[uint32]$ownedPid).Width
+    Resize 1100 740 | Out-Null
+    $wideWidth=[TitleMenuSmoke.Native]::Outer((Control 2200),[uint32]$ownedPid).Width
+    if ($wideWidth-$narrowWidth -ge 96) { Assert-ViewerBars 'width-grown-hides-H' $false $false }
+    else { Limit 'Dynamic scrollbar width resize: work-area clamp prevented the required +96px viewer width; no hide/recovery acceptance claimed' }
+    Resize 900 740 | Out-Null
+    Assert-True ([TitleMenuSmoke.Native]::Outer((Control 2200),[uint32]$ownedPid).Width -eq $narrowWidth) 'Width matrix failed to restore actual narrow viewer width'
+    Assert-ViewerBars 'width-shrunk-restores-H' $true $false -Exercise
+    Set-ViewerFixture $pausedBody 'restore real paused worker body before held checks'
+    Msg (Control 2200) 0xB1 8 40 | Out-Null
+    $viewerBaseline=$pausedBaseline
+    Assert-Viewer 'original worker body/hash/selection restored before unchanged held matrix'
+    Assert-ViewerBars 'restored-dark-worker-fixture' $true $true
+    Assert-Height 240 'visibility matrix restores default presentation'; Assert-Dark; Assert-Files
+
     $stage='dark Edit V/H and viewport V held thumb matrix'
     foreach ($target in @(@(2200,1),@(2200,0),@(2400,1))) { Drag-NC $target[0] $target[1] }
     $stage='real owner timer arrow/page repeat while held'
@@ -814,7 +945,7 @@ try {
     $defaultRestored=$true
     Assert-True ([TitleMenuSmoke.Native]::IsWindowEnabled((Control 2102)) -and -not [TitleMenuSmoke.Native]::IsWindowEnabled((Control 2103))) 'Proxy must remain stopped throughout'
     Physical 'final-dark-default-REFERENCE-NOT-held-acceptance'
-    Record 'scope' 'No direct WM_APP+90 height command, no manufactured scroll ranges, no WM_TIMER injection, no forced repaint/PrintWindow for acceptance. Height changes are driven by owned native grip keys/mouse; JSONL is loaded through the real read worker.'
+    Record 'scope' 'No direct WM_APP+90 height command, no manufactured scroll ranges, no WM_TIMER injection, no forced repaint/PrintWindow for acceptance. Height changes are driven by owned native grip keys/mouse; JSONL is loaded through the real read worker. Dynamic visibility uses bounded WM_SETTEXT only in the paused private Edit2200, restores original text/hash/selection before held checks, and never calls ShowScrollBar/SetScrollInfo.'
     $matrixFinished=$true
 } catch {
     $reason=$_.Exception.GetBaseException().Message
@@ -870,7 +1001,7 @@ try {
         Limits=@(
             'HWND-local scalar mouse/key messages, NOT physical hardware/SendInput/real pointer/button-state or physical Tab acceptance. Capture, native pos and native thumb are independently checked while no up has been sent.'
             'Physical captures are bounded samples after moves and during holds, not continuous video or proof against every sub-frame flash. Occlusion/offscreen skips never use PrintWindow as replacement and keep Complete=false.'
-            'Only native Edit2200 V/H and viewport2400 V tracking/repeat are exercised; ListView report driver, other edit controls and light native modal scrollbar interactions are NOT exercised.'
+            'Light/dark Edit2200 content-driven visibility and scalar native V/H scroll motion are checked; height/width hiding/restoration uses the dark round. Held tracking/repeat remains dark Edit2200 V/H and viewport2400 V only; ListView, other edits and light native modal interactions are NOT exercised.'
             'Keyboard Home/up/down/Escape are directed to owned grip; not an IsDialogMessage/physical keyboard or screen-reader acceptance. Selection/read-only style and full bounded body hash are preserved, clipboard is untouched.'
             'Page-tab transitions can release previous capture before hide; this checks transition cleanup, not an isolated WM_SHOWWINDOW cause. WM_THEMECHANGED reapplication is tested without changing OS theme.'
             'Resize requests use SWP_ASYNCWINDOWPOS and bounded full-rectangle plus active-log descendant layout observation. This assumes separate input queues (the harness never attaches them); it is not an arbitrary hostile/attached-queue timeout guarantee. Startup waits only for empty managed Path metadata while raw handle/PID/start time/actual EXE remain strict.'

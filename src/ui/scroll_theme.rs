@@ -3,10 +3,13 @@
 //!
 //! Call `apply` on the owning UI thread after native/control theme selection and
 //! again on theme/DPI changes. Only multiline Edit, report ListView and the known
-//! viewport have mouse adapters; no styles, regions or client pixels are changed.
+//! viewport have mouse adapters. Dark report lists use local composited painting;
+//! native client pixels, window regions and scrolling state are not replaced.
 //! Light/high contrast retain native tracking. PrintWindow implementations which
 //! omit WM_PRINT/PRF_NONCLIENT cannot include the non-client overlay.
 #![cfg(windows)]
+
+mod paint;
 
 use super::theme::{Palette, Resolved};
 use crate::windows::scale;
@@ -19,6 +22,7 @@ use windows_sys::Win32::{
 
 const SUBCLASS_ID: usize = 0x5343_5448;
 const TRACK_TIMER: usize = SUBCLASS_ID;
+const SYNC_STYLE: u32 = WM_APP + 94;
 const REPEAT_DELAY: u32 = 400;
 const REPEAT_INTERVAL: u32 = 50;
 type SubclassProc =
@@ -113,6 +117,9 @@ struct Appearance {
     painting: bool,
     redraw: bool,
     defer_paint: u32,
+    composited: bool,
+    changing_style: bool,
+    style_queued: bool,
     hover: Option<Hit>,
     tracking_leave: bool,
     tracking: Option<Tracking>,
@@ -159,7 +166,13 @@ unsafe fn supported_window(hwnd: HWND) -> bool {
             return false;
         }
         let class = String::from_utf16_lossy(&name[..count as usize]);
-        supported(&class, GetWindowLongPtrW(hwnd, GWL_STYLE) as u32)
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        supported(&class, style)
+            // The log viewer hides both native bars when content fits. Retain
+            // dark presentation so later overflow is themed before its paint.
+            || (class.eq_ignore_ascii_case("Edit")
+                && GetDlgCtrlID(hwnd) == super::logs::CONTENT as i32
+                && style & ES_MULTILINE as u32 != 0)
             // SetScrollInfo removes WS_VSCROLL while short settings pages fit.
             // Keep this known host themed so a later page can restore its bar.
             || (class.eq_ignore_ascii_case("Static")
@@ -204,7 +217,11 @@ unsafe fn detach(hwnd: HWND, state: &State) {
         value.enabled = false;
         state.set(value);
         stop_tracking(hwnd, state);
+        paint::synchronize(hwnd, state);
         value = state.get();
+        if value.changing_style || value.enabled || value.composited {
+            return;
+        }
         if value.attached && RemoveWindowSubclass(hwnd, Some(procedure), SUBCLASS_ID) != 0 {
             value.attached = false;
             state.set(value);
@@ -252,7 +269,6 @@ pub(super) unsafe fn apply(hwnd: HWND, kind: Resolved, palette: Palette, dpi: u3
             return;
         }
         let state = if let Some(state) = previous {
-            stop_tracking(hwnd, &state);
             let mut value = state.get();
             if !value.attached || IsWindow(hwnd) == 0 {
                 return;
@@ -261,6 +277,7 @@ pub(super) unsafe fn apply(hwnd: HWND, kind: Resolved, palette: Palette, dpi: u3
             value.dpi = dpi.clamp(96, 768);
             value.enabled = true;
             state.set(value);
+            stop_tracking(hwnd, &state);
             state
         } else {
             let state = Rc::new(Cell::new(Appearance {
@@ -271,6 +288,9 @@ pub(super) unsafe fn apply(hwnd: HWND, kind: Resolved, palette: Palette, dpi: u3
                 painting: false,
                 redraw: true,
                 defer_paint: 0,
+                composited: false,
+                changing_style: false,
+                style_queued: false,
                 hover: None,
                 tracking_leave: false,
                 tracking: None,
@@ -285,6 +305,14 @@ pub(super) unsafe fn apply(hwnd: HWND, kind: Resolved, palette: Palette, dpi: u3
             }
             state
         };
+        paint::synchronize(hwnd, &state);
+        if !state.get().attached || state.get().changing_style || IsWindow(hwnd) == 0 {
+            return;
+        }
+        if !state.get().enabled {
+            detach(hwnd, &state);
+            return;
+        }
         if state.get().redraw && state.get().defer_paint == 0 {
             RedrawWindow(
                 hwnd,
@@ -565,6 +593,12 @@ unsafe fn driver(hwnd: HWND) -> Option<Driver> {
         }
     }
 }
+/// Native EDIT's horizontal EM_LINESCROLL unit; query only, owner UI thread.
+pub(super) unsafe fn edit_scroll_unit(hwnd: HWND) -> Option<i32> {
+    // SAFETY: Caller supplies a live owner-thread Edit; no interaction state kept.
+    unsafe { edit_character_width(hwnd, None) }
+}
+
 unsafe fn edit_character_width(hwnd: HWND, interaction: Option<(&State, Tracking)>) -> Option<i32> {
     // SAFETY: borrowed native font, selected only into this acquired DC. SavedDc
     // restores the selected object before WindowDc releases the DC, on all exits.
@@ -1370,6 +1404,11 @@ std::thread_local! {
 }
 
 unsafe fn overlay(hwnd: HWND, state: &State, print_dc: HDC) {
+    // SAFETY: caller supplies an owner-thread HWND and optional borrowed print DC.
+    unsafe { overlay_dc(hwnd, state, print_dc, !print_dc.is_null()) }
+}
+
+unsafe fn overlay_dc(hwnd: HWND, state: &State, dc: HDC, printing: bool) {
     // SAFETY: retained Rc survives synchronous detach/destruction. No Cell borrow
     // spans FFI, and painting suppresses recursive overlays, not native messages.
     unsafe {
@@ -1377,23 +1416,25 @@ unsafe fn overlay(hwnd: HWND, state: &State, print_dc: HDC) {
         if !value.attached
             || !value.enabled
             || value.painting
-            || (print_dc.is_null() && (!value.redraw || value.defer_paint != 0))
+            || (!printing && (!value.redraw || value.defer_paint != 0))
             || !supported_window(hwnd)
         {
             return;
         }
         value.painting = true;
         state.set(value);
-        if print_dc.is_null() {
+        if !printing {
             #[cfg(test)]
             SCREEN_PASSES.with(|count| count.set(count.get() + 1));
+        }
+        if dc.is_null() {
             let dc = GetWindowDC(hwnd);
             if !dc.is_null() {
                 let _dc = WindowDc(hwnd, dc);
                 draw(hwnd, dc, value);
             }
         } else {
-            draw(hwnd, print_dc, value);
+            draw(hwnd, dc, value);
         }
         // Do not overwrite colors/enabled/attached changed by a nested callback.
         value = state.get();
@@ -1483,6 +1524,16 @@ unsafe extern "system" fn procedure(
             drop(Rc::from_raw(pointer));
             return DefSubclassProc(hwnd, message, w, l);
         }
+        if message == SYNC_STYLE {
+            let mut value = state.get();
+            value.style_queued = false;
+            state.set(value);
+            paint::synchronize(hwnd, &state);
+            if !state.get().enabled {
+                detach(hwnd, &state);
+            }
+            return 0;
+        }
         if message == WM_NCHITTEST && driver(hwnd).is_some() {
             let point = mouse_point(l);
             // STATIC hosts otherwise return a client/transparent hit even on
@@ -1534,7 +1585,17 @@ unsafe extern "system" fn procedure(
         let print = message == WM_PRINT && w != 0 && l & PRF_NONCLIENT as LPARAM != 0;
         let saved = if print { SavedDc::new(w as HDC) } else { None };
         let can_print = saved.is_some();
-        let result = DefSubclassProc(hwnd, message, w, l);
+        let scroll_paint = paint::ScrollPaint::begin(hwnd, &state, message, w);
+        let result = if message == WM_NCPAINT
+            && state.get().enabled
+            && state.get().redraw
+            && state.get().defer_paint == 0
+            && driver(hwnd) == Some(Driver::Report)
+        {
+            paint::nonclient(hwnd, w, l).unwrap_or_else(|| DefSubclassProc(hwnd, message, w, l))
+        } else {
+            DefSubclassProc(hwnd, message, w, l)
+        };
         drop(saved);
         drop(deferred);
         if !state.get().attached || IsWindow(hwnd) == 0 {
@@ -1553,7 +1614,11 @@ unsafe extern "system" fn procedure(
                 overlay(hwnd, &state, w as HDC);
             }
         } else if repaints_bar(message) {
-            overlay(hwnd, &state, std::ptr::null_mut());
+            if let Some(paint) = &scroll_paint {
+                overlay_dc(hwnd, &state, paint.dc(), false);
+            } else {
+                overlay(hwnd, &state, std::ptr::null_mut());
+            }
         }
         // WM_PRINTCLIENT is intentionally forwarded without any NC overlay.
         result
@@ -1563,6 +1628,9 @@ unsafe extern "system" fn procedure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod paint_tests {
+        include!("scroll_theme/paint_tests.rs");
+    }
     use std::ptr::null_mut;
     use windows_sys::Win32::System::Threading::{
         GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources,

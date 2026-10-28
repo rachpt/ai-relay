@@ -1,7 +1,10 @@
 use super::*;
+mod navigation_tests {
+    include!("navigation_tests.rs");
+}
 use crate::{
     config::ThemeMode,
-    ui::date_picker,
+    ui::{date_picker, rounded},
     windows::{Font, scale, wide},
 };
 use windows_sys::Win32::{
@@ -147,6 +150,16 @@ unsafe fn value(hwnd: HWND) -> String {
         String::from_utf16(&buffer[..n as usize]).unwrap()
     }
 }
+unsafe fn assert_unclipped(hwnd: HWND) {
+    // SAFETY: Owner-thread picker; only the local scratch region is deleted.
+    unsafe {
+        let region = CreateRectRgn(0, 0, 0, 0);
+        assert!(!region.is_null());
+        let result = GetWindowRgn(hwnd, region);
+        assert_ne!(DeleteObject(region), 0);
+        assert_eq!(result, ERROR, "native date border must not be clipped");
+    }
+}
 #[test]
 fn native_picker_print_focus_disable_none_and_theme_fallback_preserve_value_styles_and_dc() {
     let host = Host::new();
@@ -168,9 +181,12 @@ fn native_picker_print_focus_disable_none_and_theme_fallback_preserve_value_styl
                 0
             );
             date_picker::apply(picker, Resolved::Dark, p, dpi);
+            rounded::apply(picker, Resolved::Dark, p, dpi);
+            assert_unclipped(picker);
             assert!(active(picker));
             for enabled in [true, false, true] {
                 EnableWindow(picker, i32::from(enabled));
+                assert_unclipped(picker);
                 for message in [WM_PRINTCLIENT, WM_PRINT] {
                     let frame = paint(picker, message);
                     dark(&frame);
@@ -181,6 +197,7 @@ fn native_picker_print_focus_disable_none_and_theme_fallback_preserve_value_styl
             ShowWindow(host.0, SW_SHOWNOACTIVATE);
             SetFocus(picker);
             assert_eq!(GetFocus(), picker);
+            assert_unclipped(picker);
             let frame = paint(picker, WM_PRINTCLIENT);
             dark(&frame);
             drop(frame);
@@ -195,8 +212,11 @@ fn native_picker_print_focus_disable_none_and_theme_fallback_preserve_value_styl
             dark(&frame);
             drop(frame);
             assert_eq!(value(picker), "");
+            assert_unclipped(picker);
             for kind in [Resolved::Light, Resolved::Contrast] {
                 date_picker::apply(picker, kind, p, dpi);
+                rounded::apply(picker, kind, p, dpi);
+                assert_unclipped(picker);
                 assert!(!active(picker));
                 assert_eq!(GetWindowLongPtrW(picker, GWL_STYLE), styles.0);
                 assert_eq!(GetWindowLongPtrW(picker, GWL_EXSTYLE), styles.1);

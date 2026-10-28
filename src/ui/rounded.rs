@@ -1,7 +1,7 @@
 //! Presentation-only clipping for closed native controls. Call after native theme
 //! selection, and repeat on theme/DPI changes; values and input remain native.
-//! Edit keeps its native rectangular border: clipping cannot paint a complete arc
-//! and must not interfere with native text, caret, IME or accessibility behavior.
+//! Edit and date pickers keep their complete native borders: clipping cannot
+//! connect their rectangular edges with an arc, and must not affect native input.
 #![cfg(windows)]
 
 use super::theme::{self, Palette};
@@ -27,7 +27,6 @@ unsafe extern "system" {
 enum Control {
     Button,
     Combo,
-    Date,
 }
 
 fn identify(class: &str, style: u32) -> Option<Control> {
@@ -43,8 +42,6 @@ fn identify(class: &str, style: u32) -> Option<Control> {
         }
     } else if class.eq_ignore_ascii_case("ComboBox") {
         (style & 3 == CBS_DROPDOWNLIST as u32).then_some(Control::Combo)
-    } else if class.eq_ignore_ascii_case("SysDateTimePick32") {
-        Some(Control::Date)
     } else {
         None
     }
@@ -109,7 +106,7 @@ unsafe fn detach(hwnd: HWND, state: &State) {
         value.busy = true;
         state.set(value);
         // Only a retained instance of our subclass reaches this path. In particular,
-        // an excluded Edit without our state may have a foreign region: leave it alone.
+        // an excluded Edit/Date without our state may have a foreign region: leave it alone.
         let cleared = SetWindowRgn(hwnd, null_mut(), 1) != 0;
         value = state.get();
         value.busy = false;
@@ -188,7 +185,7 @@ unsafe fn apply_geometry(hwnd: HWND, state: &State) {
 }
 
 /// Apply only to supported native controls; repeat after theme/DPI changes.
-/// Edits remain native rectangles; any existing module-owned clipping is detached.
+/// Edits/dates keep native borders; existing module-owned clipping is detached.
 ///
 /// # Safety
 /// `hwnd` must be a live native control on the calling UI thread. This module
@@ -394,7 +391,10 @@ mod tests {
             Some(Control::Combo)
         );
         assert!(identify("ComboBox", CBS_DROPDOWN as u32).is_none());
-        assert_eq!(identify("SysDateTimePick32", 0), Some(Control::Date));
+        for style in [0, DTS_SHOWNONE, DTS_SHORTDATEFORMAT | DTS_SHOWNONE] {
+            assert!(identify("SysDateTimePick32", style).is_none());
+            assert!(identify("sysdatetimepick32", style).is_none());
+        }
         for class in [
             "SysListView32",
             "SysTabControl32",
@@ -445,13 +445,23 @@ mod tests {
     }
 
     #[test]
-    fn excluded_edits_leave_foreign_regions_untouched() {
+    fn excluded_edits_and_dates_leave_foreign_regions_untouched() {
         // SAFETY: all HWNDs and scratch regions belong to this test thread. A
         // successful SetWindowRgn transfers ownership; scratch copies stay ours.
         unsafe {
+            let init = INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_DATE_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&init), 0);
             let parent = window("STATIC", WS_POPUP, null_mut());
-            for style in [0, ES_MULTILINE as u32, ES_PASSWORD as u32] {
-                let edit = window("EDIT", WS_CHILD | WS_BORDER | style, parent);
+            for (class, style) in [
+                ("EDIT", 0),
+                ("EDIT", ES_MULTILINE as u32),
+                ("EDIT", ES_PASSWORD as u32),
+                ("SysDateTimePick32", DTS_SHOWNONE),
+            ] {
+                let edit = window(class, WS_CHILD | WS_BORDER | style, parent);
                 let foreign = CreateRectRgn(2, 3, 180, 60);
                 assert!(!foreign.is_null());
                 let applied = SetWindowRgn(edit, foreign, 0);
@@ -484,9 +494,9 @@ mod tests {
         }
     }
 
-    // Recreate a region/subclass left by the former Edit eligibility policy. The
-    // cleanup rechecks the HWND class, so no obsolete Edit tag is needed.
-    unsafe fn legacy_edit_region(hwnd: HWND) -> State {
+    // Recreate our former Edit/Date clipping. Cleanup rechecks the HWND class,
+    // so the retained presentation tag need not identify the excluded control.
+    unsafe fn legacy_region(hwnd: HWND) -> State {
         // SAFETY: test-owned HWND on this thread; one owning Rc is transferred to
         // the real subclass, and a successful SetWindowRgn transfers its HRGN to OS.
         unsafe {
@@ -510,7 +520,7 @@ mod tests {
             if SetWindowSubclass(hwnd, Some(procedure), SUBCLASS_ID, data as usize) == 0 {
                 drop(Rc::from_raw(data));
                 DeleteObject(region);
-                panic!("cannot install legacy Edit subclass");
+                panic!("cannot install legacy clipping subclass");
             }
             let applied = SetWindowRgn(hwnd, region, 1);
             if applied == 0 {
@@ -557,8 +567,13 @@ mod tests {
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW as u32,
                 parent,
             );
-            let date = window("SysDateTimePick32", WS_CHILD | DTS_SHORTDATEFORMAT, parent);
+            let date = window(
+                "SysDateTimePick32",
+                WS_CHILD | DTS_SHORTDATEFORMAT | DTS_SHOWNONE,
+                parent,
+            );
             let controls = [edit, multiline, password, combo, button, date];
+            let native_edges = [edit, multiline, password, date];
             let label = [b'A' as u16, 0];
             SendMessageW(combo, CB_ADDSTRING, 0, label.as_ptr() as LPARAM);
             SendMessageW(combo, CB_SETCURSEL, 0, 0);
@@ -615,19 +630,19 @@ mod tests {
                     theme::Resolved::Contrast,
                 ] {
                     for hwnd in controls {
-                        if edits.contains(&hwnd) {
+                        if native_edges.contains(&hwnd) {
                             apply(hwnd, kind, p, dpi);
                             assert!(state(hwnd).is_none());
                             assert!(region_bounds(hwnd).is_none());
                         }
-                        let legacy = edits.contains(&hwnd).then(|| legacy_edit_region(hwnd));
+                        let legacy = native_edges.contains(&hwnd).then(|| legacy_region(hwnd));
                         apply(hwnd, kind, p, dpi);
                         if let Some(legacy) = legacy {
                             assert!(!legacy.get().attached);
                             assert!(legacy.get().geometry.is_none());
                             assert_eq!(Rc::strong_count(&legacy), 1);
                         }
-                        if kind == theme::Resolved::Contrast || edits.contains(&hwnd) {
+                        if kind == theme::Resolved::Contrast || native_edges.contains(&hwnd) {
                             assert!(state(hwnd).is_none());
                             assert!(region_bounds(hwnd).is_none());
                         } else {
@@ -648,8 +663,8 @@ mod tests {
                             );
                         }
                     }
-                    for hwnd in edits {
-                        let legacy = legacy_edit_region(hwnd);
+                    for hwnd in native_edges {
+                        let legacy = legacy_region(hwnd);
                         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
                         // Exercise a real native WM_STYLECHANGED, not a synthetic
                         // message with a missing STYLESTRUCT pointer.
@@ -705,10 +720,14 @@ mod tests {
                 (date_after.wYear, date_after.wMonth, date_after.wDay)
             );
 
-            apply(edit, theme::Resolved::Dark, p, 96);
-            assert_ne!(MoveWindow(edit, 0, 0, 210, 36, 0), 0);
-            assert!(state(edit).is_none());
-            assert!(region_bounds(edit).is_none());
+            for hwnd in native_edges {
+                apply(hwnd, theme::Resolved::Dark, p, 96);
+                let legacy = legacy_region(hwnd);
+                assert_ne!(MoveWindow(hwnd, 0, 0, 210, 36, 0), 0);
+                assert!(!legacy.get().attached);
+                assert!(state(hwnd).is_none());
+                assert!(region_bounds(hwnd).is_none());
+            }
             // Resize/DPI tracking still belongs to the supported rounded controls.
             apply(button, theme::Resolved::Dark, p, 96);
             assert_ne!(MoveWindow(button, 0, 0, 210, 36, 0), 0);
@@ -720,8 +739,10 @@ mod tests {
             assert_eq!(state(button).unwrap().get().geometry, Some((210, 36, 18)));
             SendMessageW(button, WM_DPICHANGED_AFTERPARENT, 0, 0);
             assert_eq!(state(button).unwrap().get().dpi, GetDpiForWindow(button));
-            for hwnd in edits {
+            for hwnd in native_edges {
+                let legacy = legacy_region(hwnd);
                 SendMessageW(hwnd, WM_DPICHANGED, 144 | (144 << 16), 0);
+                assert!(!legacy.get().attached);
                 SendMessageW(hwnd, WM_DPICHANGED_AFTERPARENT, 0, 0);
                 SendMessageW(hwnd, WM_NCPAINT, 1, 0);
                 assert!(state(hwnd).is_none());
@@ -730,8 +751,8 @@ mod tests {
             // Warm native theme/DC caches before resource accounting.
             for _ in 0..20 {
                 for hwnd in controls {
-                    if edits.contains(&hwnd) {
-                        drop(legacy_edit_region(hwnd));
+                    if native_edges.contains(&hwnd) {
+                        drop(legacy_region(hwnd));
                     }
                     apply(hwnd, theme::Resolved::Dark, p, 96);
                 }
@@ -748,16 +769,17 @@ mod tests {
                     theme::Resolved::Dark
                 };
                 for hwnd in controls {
-                    if edits.contains(&hwnd) {
-                        drop(legacy_edit_region(hwnd));
+                    if native_edges.contains(&hwnd) {
+                        drop(legacy_region(hwnd));
                     }
                     apply(hwnd, kind, p, [96, 144, 192][index % 3]);
-                    if edits.contains(&hwnd) {
+                    if native_edges.contains(&hwnd) {
                         assert!(state(hwnd).is_none());
                         assert!(region_bounds(hwnd).is_none());
                     }
                 }
                 MoveWindow(edit, 0, 0, 210 + (index % 2) as i32, 36, 0);
+                MoveWindow(date, 0, 0, 210 + (index % 2) as i32, 36, 0);
                 MoveWindow(button, 0, 0, 210 + (index % 2) as i32, 36, 0);
                 SendMessageW(edit, WM_NCPAINT, 1, 0);
             }
@@ -767,7 +789,7 @@ mod tests {
             let after = GetGuiResources(process, GR_GDIOBJECTS);
             assert_eq!(
                 before, after,
-                "repeated legacy Edit detach/apply/resize/NC paint leaked GDI objects"
+                "repeated legacy Edit/Date detach/apply/resize/NC paint leaked GDI objects"
             );
             println!("GDI objects over 600 apply cycles: {before} -> {after}");
 

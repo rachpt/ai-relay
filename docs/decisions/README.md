@@ -34,6 +34,10 @@
 
 - [0016：保留原生布局的深色日期框与月历](0016-dark-native-date-picker.md)
 
+- [0017：暗色统计表滚动的局部合成呈现](0017-dark-report-scroll-presentation.md)
+
+- [0018：原生深色月历颜色与翻月呈现](0018-native-dark-calendar-navigation.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

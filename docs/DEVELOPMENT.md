@@ -78,6 +78,8 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 深色日期专项：先运行 `powershell.exe -NoProfile -NonInteractive -File tools/smoke-dark-date-picker-ui.ps1 -ValidateOnly`，再用默认Debug或 `-ExePath target/release/ai-relay.exe` 执行，不与其他GUI测试并行。私有停止配置／无网络，浅→深→浅遍历日志与统计四日期框，检查闭合／聚焦／展开／翻月／选日／清空、原生日期值与最小尺寸；84张OFFSCREEN及最多12张有遮挡保护的物理图，正文及月历标题／日期网格／今天页脚逐区检查前景；ValidateOnly拒绝纯色和逐区缺失合成图，8轮主题＋弹窗GDI及正常退出／配置不变。遮挡会跳过物理图，不当作通过；实际高DPI／高对比度／读屏保持待验收。旧 `smoke-date-picker-ui.ps1` 有过时的父窗口／设置分类及允许白色弹窗断言，不替代本专项。
 
+日期翻月专项可额外使用 `tools/smoke-dark-date-picker-ui.ps1 -NavigationOnly -ExePath target/release/ai-relay.exe`：私有暗色停止配置，四日期框各自新开popup，在PageDown后只做实际屏幕采样再执行稳定内容／选日检查；不在观察段打印／强制重绘。0ms只证明暗色栅格与亮白上限，50/350/1000ms还要求标题／星期／日期／今天页脚完整；报告记录实际开始／结束时间，计划时间不冒称精确采样时间。遮挡或前台请求拒绝使必需采样失败，`NavigationOnly`不替代完整浅深／状态／GDI矩阵；历史失败保留。原生物理回归亦须显式串行执行，不与其他GUI测试并行。
+
 提交前复核中菜单纯黑捕获／浅色月历翻月页脚缺失曾被严格检查拒绝，最新Release日期专项未通过；不以早轮成功或普通测试代替，当前限制及失败证据见[提交前review记录](development/2026-10-20-02-precommit-review.md)。
 
 补充冒烟：`smoke-history-ui.ps1`、`smoke-settings-ui.ps1`、`smoke-cli.ps1`，使用临时目录和本地mock，真实Startup未修改。迁移目前覆盖文件/历史快照及失败回退单测，未对真实软件/标准目录执行破坏性迁移。

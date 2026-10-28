@@ -10,6 +10,7 @@ use windows_sys::Win32::{Foundation::HINSTANCE, Graphics::Gdi::HFONT};
 
 mod filter;
 mod resize;
+mod scrollbars;
 use filter::{
     Filters, LIMIT, MAX_LINES, bounded_file_text, filter, filter_live, local_bound, status_range,
 };
@@ -275,6 +276,7 @@ impl Logs {
         // SAFETY: Live EDIT; fixed input limit, no retained pointers.
         unsafe {
             SendMessageW(self.content, 0x00c5, LIMIT, 0);
+            scrollbars::attach(self.content)?;
         }
         self.resize_grip = resize::create(parent, instance)?;
         self.controls.push((self.resize_grip, 24, 422, 696, 12));

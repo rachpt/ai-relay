@@ -2,8 +2,8 @@
 # 仅本脚本固定句柄的子进程；不构建、不联网、不启动代理、不保存设置。
 # 先运行：powershell.exe -NoProfile -File tools\smoke-rounded-ui.ps1 -ValidateOnly
 # 收到构建完成通知后再去掉 -ValidateOnly；不会执行其他 smoke 脚本的 body。
-# Edit 使用可靠的原生矩形边框；仅按钮/闭合 Combo/日期框要求圆角 region。
-# 高对比度及旧 Edit 自有 region 清理由原生测试负责；本脚本不切换系统设置。
+# Edit/日期框保留完整原生边框且无 region；仅按钮/闭合 Combo 要求圆角 region。
+# 高对比度及旧 Edit/日期框自有 region 清理由原生测试负责；本脚本不切换系统设置。
 [CmdletBinding()]
 param(
     [string]$ExePath,
@@ -130,6 +130,21 @@ public static class RoundedNative {
             if(!DeleteObject(copy)) throw new Exception("Local Edit HRGN probe release failed");
         }
     }
+    public static string NativeDate(IntPtr pinned,uint pid,IntPtr date) {
+        Guard(pinned,pid,date);
+        if(!String.Equals(ProxyUiSmoke.Class(date),"SysDateTimePick32",StringComparison.OrdinalIgnoreCase))
+            throw new Exception("Expected a native SysDateTimePick32 HWND");
+        IntPtr copy=CreateRectRgn(0,0,0,0);
+        if(copy==IntPtr.Zero) throw new Exception("Cannot allocate local date HRGN probe");
+        try {
+            Guard(pinned,pid,date);
+            if(GetWindowRgn(date,copy)!=0)
+                throw new Exception("Date picker must retain its complete native border without a clipping region");
+            return "Native date picker; no window region (not a pixel-perfect border proof)";
+        } finally {
+            if(!DeleteObject(copy)) throw new Exception("Local date HRGN probe release failed");
+        }
+    }
     public static bool Caret(IntPtr pinned,uint pid,IntPtr edit) {
         Guard(pinned,pid,edit); uint actual;
         uint thread=GetWindowThreadProcessId(edit,out actual);
@@ -180,6 +195,7 @@ public static class RoundedNative {
             if(seen) {
                 foreach(int id in new int[]{2320,2304,2310,2302,2303}) {
                     IntPtr h=ProxyUiSmoke.GetDlgItem(parent,id); Guard(pinned,pid,h);
+                    if(id==2302 || id==2303) NativeDate(pinned,pid,h);
                     if(ProxyUiSmoke.IsWindowEnabled(h)) {
                         if(Operation(pinned,pid,parent)["idle"]==1) { seen=false; break; }
                         throw new Exception("Actual pending control not disabled: "+id);
@@ -358,6 +374,7 @@ function Theme([int]$Index) {
     Segment 2030 $Index
     Page 1 2300
     Assert-ConfigUnchanged
+    DateRegions
 }
 function Assert-ConfigUnchanged {
     Assert-Child
@@ -412,10 +429,28 @@ function Assert-Edit {
         if ($now.$key -cne $editBaseline.$key) { throw "History Edit text/selection/native semantics changed: $key" }
     }
 }
+function DateRegions([switch]$Log) {
+    Assert-Child
+    [ProxyUiSmoke]::CheckOwner($window,[uint32]$ownedPid)
+    $seen=[Collections.Generic.HashSet[int]]::new()
+    # EnumChildWindows includes hidden pages and pickers; never ShowWindow them.
+    foreach ($h in [ProxyUiSmoke]::Children($window,'SysDateTimePick32')) {
+        Assert-Child
+        [ProxyUiSmoke]::CheckOwner($h,[uint32]$ownedPid)
+        $id=[ClarityNative]::GetDlgCtrlID($h)
+        if ($id -notin @(2224,2225,2302,2303) -or -not $seen.Add($id)) { throw "Unexpected/duplicate native date picker ID $id" }
+        $proof=[RoundedNative]::NativeDate($childHandle,[uint32]$ownedPid,$h)
+        if ($Log) { Record "native date $id without clipping region (including hidden HWNDs)" $proof }
+    }
+    foreach ($id in @(2224,2225,2302,2303)) {
+        if (-not $seen.Contains($id)) { throw "Missing native date picker $id in owned descendant HWNDs" }
+    }
+}
 function Regions([switch]$Log) {
     $editProof=[RoundedNative]::NativeEdit($childHandle,[uint32]$ownedPid,(Control 2304))
     if ($Log) { Record '2304 native rectangular Edit without clipping region' $editProof }
-    foreach ($id in @(2320,2310,2302)) {
+    DateRegions -Log:$Log
+    foreach ($id in @(2320,2310)) {
         $proof=[RoundedNative]::Region($childHandle,[uint32]$ownedPid,(Control $id))
         if ($Log) { Record "region $id full-window/corners/middle/6-DIP" $proof }
     }
@@ -598,6 +633,7 @@ try {
         [DatePickerNative]::MousePart($childHandle,[uint32]$ownedPid,(Control 2302),$true)
         Wait-State '2302 actual month-calendar popup' { (Calendar-Handle) -ne [IntPtr]::Zero -and [ProxyUiSmoke]::IsWindowVisible((Calendar-Handle)) }
         $calendar=Calendar-Handle
+        DateRegions
         if ([ProxyUiSmoke]::Class($calendar) -ne 'SysMonthCal32') { throw 'Date dropdown is not a native month calendar' }
         $minimum=[DatePickerNative]::CalendarMinimum($childHandle,[uint32]$ownedPid,$calendar)
         $client=[StatusBarNative]::Client($calendar,[uint32]$ownedPid)
@@ -607,6 +643,7 @@ try {
         Fence
         if ((Calendar-Handle) -ne [IntPtr]::Zero) { Message 2302 0x100D | Out-Null }
         Wait-State 'native date popup closed' { (Calendar-Handle) -eq [IntPtr]::Zero }
+        DateRegions
         if ((Text 2302) -cne $dateText -or ([ProxyUiSmoke]::GetWindowLongW((Control 2302),-16) -band 0xFFFF) -ne $dateStyle) { throw 'Date native style/value changed' }
         Record "$name native calendar popup preserves styles/value" @{ Client="$client"; Minimum="$minimum"; Note='Native visual styles retained; light popup in dark mode is allowed.' }
         Page 0 2109
@@ -620,6 +657,7 @@ try {
     Wait-Idle
     $pending=[RoundedNative]::Query($childHandle,[uint32]$ownedPid,$window)
     Wait-Idle
+    DateRegions
     if (-not $pending.PendingSeen -or -not $pending.Completed -or -not (Text 2325).Contains('匹配 0 请求') -or (Message 2337 0x1004) -ne 0) {
         throw "Real empty query/pending/completion failed: $(Text 2325)"
     }
@@ -703,11 +741,11 @@ try {
         Passed=($null -eq $failure -and $cleanupErrors.Count -eq 0); Exe=$exe; PID=$ownedPid; Failure=$detail
         CleanupErrors=@($cleanupErrors.ToArray()); Checks=@($checks.ToArray()); Screenshots=@($shots.ToArray()); GDI=@($gdiSamples.ToArray())
         Seconds=[Math]::Round($overall.Elapsed.TotalSeconds,2)
-        Limits='Only current physical monitor DPI; no multi-monitor/DPI matrix, physical keyboard/SendInput, screen reader or system high-contrast switch. High-contrast detach/region-removal tests are NOT run here. Targeted native key/character messages are not physical keyboard acceptance. Password settings are initially empty: mask/length/selection/style retention only, not proof for nonempty secrets. Corner crops are visual evidence, not automated pixel-perfect border/surface/caret rendering proof; Edit is checked for NO window region, while button/combo/date GDI rounded region geometry is checked independently. Legacy module-owned Edit detach, IME and accessibility acceptance are NOT exercised by this script. Native focused date/month-calendar visual styles may remain light in dark mode. Empty private history only; no record-boundary membership/performance/load acceptance. No Cargo, mock, network requests, config Save, Startup/firewall changes, global input, other-instance IPC or kill.'
+        Limits='Only current physical monitor DPI; no multi-monitor/DPI matrix, physical keyboard/SendInput, screen reader or system high-contrast switch. High-contrast detach/region-removal tests are NOT run here. Targeted native key/character messages are not physical keyboard acceptance. Password settings are initially empty: mask/length/selection/style retention only, not proof for nonempty secrets. Corner crops are visual evidence, not automated pixel-perfect border/surface/caret rendering proof; Edit and all four date HWNDs (including hidden pages) are checked for NO window region, while button/combo GDI rounded region geometry is checked independently. Legacy module-owned Edit/date detach, IME and accessibility acceptance are NOT exercised by this script. Native focused date/month-calendar visual styles may remain light in dark mode. Empty private history only; no record-boundary membership/performance/load acceptance. No Cargo, mock, network requests, config Save, Startup/firewall changes, global input, other-instance IPC or kill.'
     }
     [IO.File]::WriteAllText((Join-Path $output 'results.json'),($report | ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($true))
     Write-Output "Rounded UI artifacts: $output"
 }
 if ($null -ne $failure) { throw $failure }
 if ($cleanupErrors.Count -gt 0) { throw ($cleanupErrors -join '; ') }
-Write-Output 'PASS: native rectangular Edits without clipping regions, 6-DIP rounded button/combo/date regions and resize, Edit text/margins/selection/caret, unchanged empty masked settings, native combo/calendar popup, observed real pending/completion with zero records, disabled buttons, light/dark physical corner/overview/history evidence, 100 bounded GDI theme+resize cycles and byte-identical config.'
+Write-Output 'PASS: native rectangular Edits and four native date pickers without clipping regions (including hidden HWNDs), 6-DIP rounded button/combo regions and resize, Edit text/margins/selection/caret, unchanged empty masked settings, native combo/calendar popup, observed real pending/completion with zero records, disabled buttons, light/dark physical corner/overview/history evidence, 100 bounded GDI theme+resize cycles and byte-identical config.'

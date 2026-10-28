@@ -726,7 +726,12 @@ unsafe extern "system" fn procedure(
             }
             return DefSubclassProc(hwnd, message, w, l);
         }
-        if resets_cells(message) {
+        let compositing_only =
+            message == WM_STYLECHANGED && w == GWL_EXSTYLE as WPARAM && l != 0 && {
+                let style = &*(l as *const STYLESTRUCT);
+                (style.styleOld ^ style.styleNew) & !WS_EX_COMPOSITED == 0
+            };
+        if resets_cells(message) && !compositing_only {
             let Some(mut value) = interaction(hwnd) else {
                 return DefSubclassProc(hwnd, message, w, l);
             };
