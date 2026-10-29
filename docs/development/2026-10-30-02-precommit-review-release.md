@@ -45,7 +45,7 @@
 
 ## 提交与Release计划
 
-本记录写入时review和提交前验证已完成，commit／push及其后的Release尚待执行，不将计划记为成功。Release沿用既有单次进程静态CRT及编译路径映射，以 `cargo build --release --locked --offline` 更新 `target/release/ai-relay.exe`，不改Cargo profile、版本、dist或显式target历史产物；构建后核对x64 PE32+／动态依赖、SHA256与 `--version`。真实执行结果另补记录。
+本记录写入时review和提交前验证已完成，commit／push及其后的Release尚待执行，不将计划记为成功。Release沿用既有单次进程静态CRT及编译路径映射，以 `cargo build --release --locked --offline` 更新 `target/release/ai-relay.exe`，不改Cargo profile、版本、dist或显式target历史产物；构建后核对x64 PE32+／动态依赖、SHA256与 `--version`。真实执行结果另补记录。后续已提交并推送 `ec7295f`，随后静态CRT Release构建及PE／版本核验通过；详见[03构建记录](2026-10-30-03-release-build.md)，本段保留提交前计划时点，不把Release GUI改记为通过。
 
 ## 限制与下一步
 

@@ -64,7 +64,9 @@
 
 ## 最近验证
 
-- 提交前复核（2026-10-30）：fmt／check／458项串行及doc／严格Clippy、diagnostics通过；三工具ValidateOnly通过，概览完整自检96正例／352反例76.74秒，修正后Debug GUI55.37秒、23次OFFSCREEN捕获／21本地请求／7 HTTP400／隐藏启停／GDI最终88／配置不变并正常退出，Complete=false。完整synthetic只在ValidateOnly执行，真实GUIguard不跳过。两次120秒外部超时保留；未重跑日期／modernGUI或physical，不继承前批为本次通过。提交及其后Release结果待实际执行，见[记录](2026-10-30-02-precommit-review-release.md)。
+- 最新Release及推送（2026-10-30）：独立复核并修复工具3项P2后，UI代码提交 `ec7295f` 已正常推送origin/master，远端哈希确认一致；干净源执行静态CRT／编译路径映射的 `cargo build --release --locked --offline` 通过，166.049秒。`target/release/ai-relay.exe` 7,922,176字节，SHA256 `F5D47E6E…734F8AB`，x64 PE32+／仅系统DLL及 `--version` 退出0、stderr空通过；版本仍2026.10.18，未改dist／显式target历史产物。未重跑Release GUI，不等同全部Windows验收；后续仅文档补记不改运行代码，见[构建记录](2026-10-30-03-release-build.md)。
+
+- 提交前复核（2026-10-30）：fmt／check／458项串行及doc／严格Clippy、diagnostics通过；三工具ValidateOnly通过，概览完整自检96正例／352反例76.74秒，修正后Debug GUI55.37秒、23次OFFSCREEN捕获／21本地请求／7 HTTP400／隐藏启停／GDI最终88／配置不变并正常退出，Complete=false。完整synthetic只在ValidateOnly执行，真实GUIguard不跳过。两次120秒外部超时保留；未重跑日期／modernGUI或physical，不继承前批为本次通过。该验证时点提交及Release尚待执行，后续实际结果已补[03构建记录](2026-10-30-03-release-build.md)；复核细节见[02记录](2026-10-30-02-precommit-review-release.md)。
 
 - 三处UI优化（2026-10-30）：fmt／all-targets check／严格Clippy／305库＋153集成（458项）及doc通过，3项physical默认ignored；本批显式执行15帧翻月及6张outer前后物理取证通过。Debug四日期16screen-only＋4稳定打印／选日通过；概览21本地请求／7 HTTP400、23 OFFSCREEN图、隐藏／启停及6轮GDI最终88通过；modern 96 DPI 16四页／24设置／24统计子视图、168次OFFSCREEN捕获（165个独立PNG）／15 Edit草稿选区／配置不变及正常退出通过。真实STATIC文字更新draw／background 1／1→0／0、缓冲与直接绘图96／192像素对照通过；字体参数不替代真实缩放。最新构建为 `target/debug/ai-relay.exe`，本批未重建Release／dist，不解除旧验收限制。详细首轮失败、取证及工具范围见[记录](2026-10-30-01-ui-width-calendar-chart.md)。
 
@@ -180,7 +182,7 @@
 
 - 项目MIT许可证及Cargo元数据已补齐；GitHub公开/二进制发行前第三方notices已随包附带，继续完成其人工法律及工具链许可审核；新提交重扫，旧部署Key建议轮换，不上传仓库外备份或未审查发布包。
 
-1. 使用包含2026-10-30限宽／月历边沿／图表刷新优化的 `target/debug/ai-relay.exe`，在无遮挡桌面复核连续刷新、实际高DPI／多屏、日志grip／暗色按住滚动、tooltip／自启／跨用户／干净系统；本批未重建Release。现有静态CRT `target/release/ai-relay.exe` 仍为2026-10-29清理后基于 `314ea76` 恢复核验的历史产物（7,913,984字节，SHA256 `4E814BFA…0F6BD57`，版本 `2026.10.18`，仅PE／版本验证），不含本批UI改动；需另行构建及验收，dist／显式target历史产物未改。继续隔离完整日期工具Read text timeout及此前Release历史专项SelectTab超时；本轮modern通过不替代旧专项复现和原因确认。补regressions物理截图跳过项；仅在用户自行准备的空／纯文本剪贴板下复核Ctrl+C及菜单复制，不覆盖现有非文本剪贴板；继续复核不同系统时区。
+1. 使用基于已推送 `ec7295f` 构建的静态CRT `target/release/ai-relay.exe`（7,922,176字节，SHA256 `F5D47E6E…734F8AB`，版本 `2026.10.18`）在无遮挡桌面复核连续图表刷新／月历宿主边沿、实际高DPI／多屏、日志grip／暗色按住滚动、tooltip／自启／跨用户／干净系统；当前Release仅完成构建／PE／版本检查，Debug限定GUI不能替代Release验收，dist／显式target历史产物未改。继续隔离完整日期工具Read text timeout及此前Release历史专项SelectTab超时；本轮modern通过不替代旧专项复现和原因确认。补regressions物理截图跳过项；仅在用户自行准备的空／纯文本剪贴板下复核Ctrl+C及菜单复制，不覆盖现有非文本剪贴板；继续复核不同系统时区。
 2. 补退出草稿提示和辅助功能细节，优化大数据报表耗时。
 3. 执行长稳/完整基准和许可证审核，再制定正式发布基线。
 4. 对最新一体分段/按钮/switch/下拉/表格及Edit非客户区边框补150%/200%实际GUI、多屏DPI、真实高对比度与IME组合/读屏验收；纯几何/打印测试不替代实机，保持未执行项未完成。
@@ -188,6 +190,8 @@
 6. 在保持行为不变的前提下，继续按领域拆分 `controller`/`logs` 的测试与轮询代码，并补必要的模块边界回归。
 
 ## 最近记录
+
+- [2026-10-30-03：提交推送后构建并核验Release](2026-10-30-03-release-build.md)
 
 - [2026-10-30-02：独立复核、工具回归加固与提交前验证](2026-10-30-02-precommit-review-release.md)
 
