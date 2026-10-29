@@ -1,6 +1,5 @@
-//! Recolor the native date/calendar raster, not its geometry or input model.
-//! Keeping the themed native renderer avoids the classic-calendar DPI clipping
-//! caused by disabling visual styles at dropdown time.
+//! Recolor the themed picker's raster, not its geometry or input model.
+//! The classic popup uses native colors and keeps its original navigation.
 use super::{Palette, Resolved, high_contrast};
 use std::{cell::RefCell, mem::size_of, ptr::null_mut, rc::Rc};
 use windows_sys::Win32::{

@@ -4,6 +4,10 @@
 
 - [当前状态与下一步](STATUS.md)
 - [批次记录模板](TEMPLATE.md)
+- [2026-10-30-02：独立复核、工具回归加固与提交前验证](2026-10-30-02-precommit-review-release.md)
+- [2026-10-30-01：分段限宽、深色月历白边与概览稳定刷新](2026-10-30-01-ui-width-calendar-chart.md)
+- [2026-10-29-04：清理开发中间文件并核验保留产物](2026-10-29-04-target-cleanup.md)
+- [2026-10-29-03：构建并核验最新Release](2026-10-29-03-release-build.md)
 - [2026-10-29-02：明暗UI精修提交前独立复核](2026-10-29-02-precommit-ui-review.md)
 - [2026-10-29-01：明暗主题与 Windows 原生组件精修](2026-10-29-01-fluent-theme-polish.md)
 - [2026-10-25-04：修复暗色月历翻月后变亮](2026-10-25-04-dark-calendar-navigation.md)

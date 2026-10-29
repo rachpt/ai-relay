@@ -63,15 +63,7 @@ public static class DashboardNative {
         if(!InvalidateRect(h,IntPtr.Zero,false)) throw new Exception("Dashboard invalidation failed");
     }
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h,ref StatusBarNative.Point point);
-    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
-    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
-    [DllImport("gdi32.dll",CharSet=CharSet.Unicode,ExactSpelling=true)] static extern IntPtr CreateFontW(int height,int width,int escapement,int orientation,int weight,uint italic,uint underline,uint strikeout,uint charset,uint outputPrecision,uint clipPrecision,uint quality,uint pitchAndFamily,string face);
-    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
-    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc,IntPtr obj);
-    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
-    [DllImport("user32.dll")] static extern uint GetGuiResources(IntPtr process,uint flags);
-    [DllImport("gdi32.dll",CharSet=CharSet.Unicode)] static extern bool GetTextExtentPoint32W(IntPtr dc,string text,int length,out Size size);
-    [StructLayout(LayoutKind.Sequential)] struct Size { public int Width,Height; }
+
     public static IntPtr[] Descendants(IntPtr root,uint pid) {
         ProxyUiSmoke.CheckOwner(root,pid);
         var found=new List<IntPtr>(); var pending=new Queue<IntPtr>(); var seen=new HashSet<IntPtr>();
@@ -103,74 +95,7 @@ public static class DashboardNative {
             return new StatusBarNative.Rect { Left=p.X,Top=p.Y,Right=p.X+r.Width,Bottom=p.Y+r.Height };
         } finally { StatusBarNative.RestoreDpi(previous); }
     }
-    public const string ExpectedFontWidthScope="Harness-owned memory DC/CreateFontW reproduces src/windows/mod.rs Font::new: height=-scale(14,dpi), weight=400, charset=1, quality=5, face=Microsoft YaHei UI, other parameters=0. Expected painter-font contract budgets only; NOT target HFONT measurement, font-identity verification, internal painter rectangles or actual-fit proof.";
-    sealed class ExpectedContractFontDc : IDisposable {
-        public IntPtr Dc { get; private set; }
-        IntPtr font,previous;
-        public ExpectedContractFontDc(uint dpi) {
-            if(dpi==0) throw new ArgumentException("Expected font contract requires actual nonzero DPI");
-            Dc=CreateCompatibleDC(IntPtr.Zero);
-            if(Dc==IntPtr.Zero) throw new InvalidOperationException("Cannot create harness-owned font measurement memory DC");
-            try {
-                // This process owns BOTH objects. A remote WM_GETFONT result is
-                // opaque and must NEVER be selected into a harness DC.
-                font=CreateFontW(-ModernNative.Scale(14,dpi),0,0,0,400,0,0,0,1,0,0,5,0,"Microsoft YaHei UI");
-                if(font==IntPtr.Zero) throw new InvalidOperationException("Cannot create harness expected painter-font contract");
-                previous=SelectObject(Dc,font);
-                if(previous==IntPtr.Zero || previous==new IntPtr(-1)) {
-                    previous=IntPtr.Zero;
-                    throw new InvalidOperationException("Cannot select harness-owned expected-contract font");
-                }
-            } catch { Dispose(); throw; }
-        }
-        public void Dispose() {
-            bool cleanup=true;
-            if(Dc!=IntPtr.Zero) {
-                if(previous!=IntPtr.Zero) {
-                    var restored=SelectObject(Dc,previous);
-                    if(restored==IntPtr.Zero || restored==new IntPtr(-1)) cleanup=false;
-                    previous=IntPtr.Zero;
-                }
-                // Destroy the private DC before its font, also detaching the font
-                // if restoring the original selection unexpectedly failed.
-                if(!DeleteDC(Dc)) cleanup=false;
-                Dc=IntPtr.Zero;
-            }
-            if(font!=IntPtr.Zero) { if(!DeleteObject(font)) cleanup=false; font=IntPtr.Zero; }
-            if(!cleanup) throw new InvalidOperationException("Harness expected-font/DC restore or deletion failed");
-        }
-    }
-    static int[] ExpectedContractTextWidths(uint dpi,string[] text) {
-        using(var owned=new ExpectedContractFontDc(dpi)) {
-            if(text==null || text.Length<1 || text.Length>16) throw new ArgumentException("Expected-contract text batch exceeds bound");
-            var widths=new int[text.Length];
-            for(int i=0;i<text.Length;i++) {
-                Size size;
-                if(String.IsNullOrEmpty(text[i]) || text[i].Length>512) throw new ArgumentException("Expected-contract text length invalid");
-                if(!GetTextExtentPoint32W(owned.Dc,text[i],text[i].Length,out size) || size.Width<=0)
-                    throw new InvalidOperationException("Harness expected painter-font contract measurement failed");
-                widths[i]=size.Width;
-            }
-            return widths;
-        }
-    }
-    public static string ValidateExpectedFont() {
-        var text=new[]{"请求 0","错误 未知","上传 100.00","下载 0","区间均值 · 次/s","区间均值 · B/s"};
-        var dpis=new uint[]{96,120,144,192}; var warm=new List<int[]>();
-        foreach(uint dpi in dpis) warm.Add(ExpectedContractTextWidths(dpi,text));
-        uint before=GetGuiResources(GetCurrentProcess(),0);
-        for(int round=0;round<4;round++) for(int i=0;i<dpis.Length;i++) {
-            var widths=ExpectedContractTextWidths(dpis[i],text);
-            for(int j=0;j<widths.Length;j++) if(widths[j]!=warm[i][j]) throw new Exception("Harness expected-font contract width was unstable");
-        }
-        int rejected=0;
-        foreach(uint dpi in dpis) {
-            try { ExpectedContractTextWidths(dpi,new[]{String.Empty}); } catch(ArgumentException) { rejected++; }
-        }
-        uint after=GetGuiResources(GetCurrentProcess(),0);
-        if(rejected!=dpis.Length || after!=before) throw new Exception("Harness expected-font/DC success/error cleanup self-check failed: GDI "+before+" -> "+after);
-        return "harness-owned expected-font/memory-DC self-checks at 96/120/144/192 DPI: 16 repeated measurements and four invalid-text cleanup paths; own-process GDI "+before+" -> "+after+"; NOT target-font, HWND, painter-fit or visual acceptance";
-    }
+
     public sealed class CaptureAnalysis {
         public string Path,Scope="Read-only saved PNG analysis; NOT a new capture, HWND/font test or acceptance pass";
         public int Width,Height,Colors,Samples,Bright,Untouched,Tiles,BrightTiles,FirstUntouchedY=-1,LastUntouchedY=-1;
@@ -341,60 +266,70 @@ public static class DashboardNative {
         }
         return String.Join(Environment.NewLine,lines.ToArray());
     }
-    public sealed class RegionProof {
-        public string Name,Role,WidthScope;
-        public int X,Y,Width,Height,Blue,Red,Ink,Colored,NeutralInk,NeutralSurface,ExpectedContractTextWidth,ExpectedLayoutTextBudget;
+    public const string VisualRegionScope="Actual complete crop dimensions/window DPI with fixed full-width header/legend/status bands and an 88-DIP plot top. Legend markers require exact application light/dark series color and bounded 14-DIP GDI dash/dot or hollow-square geometry at the fixed center y; the second x is discovered, not inferred from text. Neutral body ink is counted only outside both detected marker rectangles. ClearType fringe color counts alone cannot establish a marker. Latest WM_GETTEXT rates cannot recover the 120-second historical peak/RateScale, display units or rounded/approximate labels. Header and legend-body ink remain coarse band evidence, not individual label/unit/value glyph identification, exact text-fit or compact-layout proof. Native production font/layout regressions and system high contrast are separate, not run here.";
+    public sealed class MarkerProof {
+        public int X,Y,Width,Height;
+        public string Rgb,Shape;
     }
-    // Actual full HWND/PNG/DPI, but font widths are HARNESS-OWNED expected contract
-    // budgets, never target-HFONT measurements or exported painter rectangles.
-    // Pixel presence is NOT OCR, glyph identity or actual-fit proof.
-    public static RegionProof[] Inspect(string path,IntPtr dashboard,uint pid,bool dark,string[] labels,bool unknownReason) {
+    public sealed class RegionProof {
+        public string Name,Role;
+        public int X,Y,Width,Height,Blue,Red,Ink,Colored,NeutralInk,NeutralSurface;
+        public MarkerProof FirstMarker,SecondMarker;
+        public int SecondMarkerMatches,NeutralBodyInk;
+    }
+    public static RegionProof[] Inspect(string path,IntPtr dashboard,uint pid,bool dark) {
         ProxyUiSmoke.CheckOwner(dashboard,pid);
         uint dpi=ClarityNative.GetDpiForWindow(dashboard);
-        if(dpi==0 || labels==null || labels.Length!=4) throw new Exception("Missing actual DPI/metadata labels");
         var client=StatusBarNative.Client(dashboard,pid);
-        if(client.Width<ModernNative.Scale(696,dpi) || client.Height<ModernNative.Scale(350,dpi))
-            throw new Exception("Dashboard is in its real text fallback; no mock plot or curve acceptance allowed");
-        // Read-only assignment check only: do not select/read/delete or replace
-        // the target process's HFONT, and do not claim its identity was verified.
+        // Read-only assignment check only: the cross-process HFONT remains opaque.
         if(ModernNative.Message(dashboard,pid,0x31,0,0)==0) throw new InvalidOperationException("Target dashboard WM_GETFONT returned zero");
-        var contractWidths=ExpectedContractTextWidths(dpi,new[]{labels[0],labels[1],labels[2],labels[3],"区间均值 · 次/s","区间均值 · B/s"});
-        Func<int,int> px=delegate(int dip) { return ModernNative.Scale(dip,dpi); };
-        var result=new List<RegionProof>();
         using(var image=new Bitmap(path)) {
             if(image.Width!=client.Width || image.Height!=client.Height) throw new Exception("PNG dimensions must equal the complete native dashboard, cropped only after full viewport containment");
-            int gap=px(12),cardWidth=(client.Width-3*gap)/4;
-            for(int i=0;i<4;i++) {
-                int x=i*(cardWidth+gap),w=i==3?client.Width-x:cardWidth;
-                result.Add(Region(image,"card-"+i+"-badge","badge",x+px(12),px(12),px(22),px(22),dark));
-                result.Add(Region(image,"card-"+i+"-value","value",x+px(12),px(40),w-px(24),px(36),dark));
-            }
-            int panelWidth=(client.Width-gap)/2,top=px(124),bottom=client.Height-px(24);
-            for(int i=0;i<2;i++) {
-                int panelLeft=i*(panelWidth+gap),panelRight=i==0?panelWidth:client.Width;
-                int left=panelLeft+px(14),right=panelRight-px(14),unitLeft=Math.Max(left,right-contractWidths[4+i]);
-                result.Add(Region(image,"chart-"+i+"-title","title",left,top+px(8),unitLeft-gap-left,px(30)-px(8),dark));
-                var unit=Region(image,"chart-"+i+"-units","units",unitLeft,top+px(8),right-unitLeft,px(30)-px(8),dark);
-                unit.ExpectedContractTextWidth=contractWidths[4+i]; unit.ExpectedLayoutTextBudget=unit.Width; unit.WidthScope=ExpectedFontWidthScope; result.Add(unit);
-                // Expected compact items use CONTRACT extents + 22 DIP (14 glyph + 8 gap),
-                // then a 12-DIP item gap; never divide normal labels into panel halves.
-                int available=Math.Max(0,right-left-gap),marker=px(22);
-                int a=contractWidths[2*i]+marker,b=contractWidths[2*i+1]+marker;
-                int first=a+b<=available?a:Math.Min(a,available/2);
-                int second=Math.Min(b,Math.Max(0,available-first));
-                for(int j=0;j<2;j++) {
-                    int x=j==0?left:left+first+gap,w=j==0?first:second;
-                    string role=i==0?(j==0?"legend-blue":"legend-red"):(j==0?"legend-neutral":"legend-blue");
-                    result.Add(Region(image,"chart-"+i+"-legend-"+j+"-glyph",role,x,top+px(34),px(14),px(20),dark));
-                    var label=Region(image,"chart-"+i+"-legend-"+j+"-text","legend-text",x+marker,top+px(34),w-marker,px(20),dark);
-                    label.ExpectedContractTextWidth=contractWidths[2*i+j]; label.ExpectedLayoutTextBudget=label.Width; label.WidthScope=ExpectedFontWidthScope; result.Add(label);
-                }
-                if(unknownReason) result.Add(Region(image,"chart-"+i+"-unknown-reason","unknown-reason",panelLeft+px(62),top+px(58),right-panelLeft-px(62),px(18),dark));
-                int plotTop=top+px(unknownReason?88:68),plotBottom=bottom-px(32);
-                result.Add(Region(image,"chart-"+i+"-plot","plot",panelLeft+px(62),plotTop,panelRight-px(18)-panelLeft-px(62),plotBottom-plotTop,dark));
-            }
+            return InspectBands(image,dpi,dark);
+        }
+    }
+    // Geometry depends ONLY on complete raster dimensions/DPI, not latest rates,
+    // unknown state, fonts, unit strings or label lengths. No per-item text budget.
+    static RegionProof[] InspectBands(Bitmap image,uint dpi,bool dark) {
+        if(dpi==0 || image.Width>8192 || image.Height>8192) throw new ArgumentException("Invalid complete dashboard size/DPI");
+        Func<int,int> px=delegate(int dip) { return ModernNative.Scale(dip,dpi); };
+        if(image.Width<px(696) || image.Height<px(350))
+            throw new InvalidOperationException("Dashboard is in its real text fallback; no mock plot or curve acceptance allowed");
+        var result=new List<RegionProof>();
+        int gap=px(12),cardWidth=(image.Width-3*gap)/4;
+        for(int i=0;i<4;i++) {
+            int x=i*(cardWidth+gap),w=i==3?image.Width-x:cardWidth;
+            result.Add(Region(image,"card-"+i+"-badge","badge",x+px(12),px(12),px(22),px(22),dark));
+            result.Add(Region(image,"card-"+i+"-value","value",x+px(12),px(40),w-px(24),px(36),dark));
+        }
+        int panelWidth=(image.Width-gap)/2,top=px(124),bottom=image.Height-px(24);
+        for(int i=0;i<2;i++) {
+            int panelLeft=i*(panelWidth+gap),panelRight=i==0?panelWidth:image.Width;
+            int left=panelLeft+px(14),right=panelRight-px(14);
+            result.Add(Region(image,"chart-"+i+"-header-band","header-band",left,top+px(8),right-left,px(30)-px(8),dark));
+            var legend=Region(image,"chart-"+i+"-legend-band",i==0?"request-error-legend-band":"traffic-legend-band",left,top+px(34),right-left,px(20),dark);
+            InspectLegend(image,legend,dpi,dark);
+            result.Add(legend);
+            result.Add(Region(image,"chart-"+i+"-optional-status-band","optional-status-band",panelLeft+px(62),top+px(58),right-panelLeft-px(62),px(18),dark));
+            int plotTop=top+px(88),plotBottom=bottom-px(32);
+            result.Add(Region(image,"chart-"+i+"-plot","plot",panelLeft+px(62),plotTop,panelRight-px(18)-panelLeft-px(62),plotBottom-plotTop,dark));
         }
         return result.ToArray();
+    }
+    public static void RequireRegionInk(RegionProof proof,bool knownRates,bool hasErrors) {
+        if(proof.Role=="badge") RequireBadgeInk(proof,proof.Name=="card-1-badge" && hasErrors);
+        if((proof.Role=="value" || proof.Role=="header-band") && proof.Ink<4)
+            throw new InvalidOperationException("No rough theme-text ink in fixed band (not glyph/value identification): "+proof.Name);
+        if(IsLegend(proof)) {
+            if(proof.FirstMarker==null || proof.SecondMarker==null || proof.SecondMarkerMatches!=1)
+                throw new InvalidOperationException("Missing/ambiguous exact-color dash/dot or hollow-square legend marker: "+proof.Name);
+            if(proof.NeutralBodyInk<4)
+                throw new InvalidOperationException("No neutral legend body ink outside detected markers (not individual-label proof): "+proof.Name);
+        }
+        if(proof.Role=="plot" && knownRates && proof.Colored<4)
+            throw new InvalidOperationException("No real sampled curve color in fixed plot region: "+proof.Name);
+        // The optional status band remains in the proof even without a reason;
+        // its blank content is valid and must never shift the plot or other bands.
     }
     public static void RequireBadgeInk(RegionProof proof,bool error) {
         if(proof.Ink<4 || proof.NeutralSurface<proof.Width*proof.Height/2)
@@ -419,6 +354,214 @@ public static class DashboardNative {
             if(rejected!=2) throw new Exception("Blank or unexpected colored badge was accepted");
         }
         return "neutral badge surface/ink and nonzero-error red checks, blank and unexpected-colored icon rejection in both themes; synthetic helper only";
+    }
+    static bool IsLegend(RegionProof proof) {
+        return proof.Role=="request-error-legend-band" || proof.Role=="traffic-legend-band";
+    }
+    static Color SeriesColor(bool dark,int series) {
+        // Scoped to the application's two explicit themes, not system colors or
+        // ClearType RGB dominance. Production uses a 1px stock GDI DC_PEN.
+        return series==0 ? (dark?Color.FromArgb(96,205,255):Color.FromArgb(0,95,184)) :
+            series==1 ? (dark?Color.FromArgb(228,154,139):Color.FromArgb(179,80,63)) :
+            (dark?Color.FromArgb(197,197,197):Color.FromArgb(97,97,97));
+    }
+    static MarkerProof MatchMarker(Bitmap image,RegionProof band,uint dpi,int x,Color color,bool square) {
+        int width=ModernNative.Scale(14,dpi),cx=x+ModernNative.Scale(7,dpi);
+        int cy=band.Y+band.Height/2,r=Math.Max(2,ModernNative.Scale(2,dpi)),rgb=color.ToArgb();
+        if(x<band.X || x+width>band.X+band.Width || cy-r-1<band.Y || cy+r+1>=band.Y+band.Height) return null;
+        for(int xx=x;xx<x+width;xx++) {
+            bool stroke=!square || xx<=cx-r || xx>=cx+r;
+            if((image.GetPixel(xx,cy).ToArgb()==rgb)!=stroke) return null;
+        }
+        // A horizontal glyph stem/color fringe is not a marker: require the
+        // centered vertical feature and one-pixel-thick, bounded dash wings.
+        if(image.GetPixel(cx,cy-r).ToArgb()!=rgb || image.GetPixel(cx,cy+r).ToArgb()!=rgb ||
+           image.GetPixel(cx,cy-r-1).ToArgb()==rgb || image.GetPixel(cx,cy+r+1).ToArgb()==rgb) return null;
+        foreach(int wing in new[]{x,x+width-1})
+            if(image.GetPixel(wing,cy-1).ToArgb()==rgb || image.GetPixel(wing,cy+1).ToArgb()==rgb) return null;
+        if(square) for(int xx=cx-r;xx<=cx+r;xx++)
+            if(image.GetPixel(xx,cy-r).ToArgb()!=rgb || image.GetPixel(xx,cy+r).ToArgb()!=rgb) return null;
+        return new MarkerProof { X=x,Y=cy-r,Width=width,Height=2*r+1,
+            Rgb=String.Format("#{0:X2}{1:X2}{2:X2}",color.R,color.G,color.B),Shape=square?"14-DIP dash with centered hollow square":"14-DIP dash with centered dot" };
+    }
+    static bool InsideMarker(int x,int y,MarkerProof marker) {
+        return marker!=null && x>=marker.X && x<marker.X+marker.Width && y>=marker.Y && y<marker.Y+marker.Height;
+    }
+    static bool IsNeutralInk(Color color,bool dark) {
+        int span=Math.Max(color.R,Math.Max(color.G,color.B))-Math.Min(color.R,Math.Min(color.G,color.B));
+        int l=(int)(0.2126*color.R+0.7152*color.G+0.0722*color.B);
+        return span<=8 && (dark?l>150:l<125);
+    }
+    static void InspectLegend(Bitmap image,RegionProof band,uint dpi,bool dark) {
+        bool traffic=band.Role=="traffic-legend-band";
+        band.FirstMarker=MatchMarker(image,band,dpi,band.X,SeriesColor(dark,traffic?2:0),false);
+        // Scan a bounded row for the SECOND shape, never its raw-text-derived x.
+        for(int x=band.X+ModernNative.Scale(22,dpi);x<=band.X+band.Width-ModernNative.Scale(14,dpi);x++) {
+            var marker=MatchMarker(image,band,dpi,x,SeriesColor(dark,traffic?0:1),true);
+            if(marker!=null) { band.SecondMarkerMatches++; if(band.SecondMarker==null) band.SecondMarker=marker; }
+        }
+        for(int y=band.Y;y<band.Y+band.Height;y++) for(int x=band.X;x<band.X+band.Width;x++)
+            if(!InsideMarker(x,y,band.FirstMarker) && !InsideMarker(x,y,band.SecondMarker) && IsNeutralInk(image.GetPixel(x,y),dark)) band.NeutralBodyInk++;
+    }
+    static void PaintSyntheticMarker(Bitmap image,uint dpi,int x,int cy,Color color,bool square) {
+        int width=ModernNative.Scale(14,dpi),cx=x+ModernNative.Scale(7,dpi),r=Math.Max(2,ModernNative.Scale(2,dpi));
+        for(int xx=x;xx<x+width;xx++) if(!square || xx<=cx-r || xx>=cx+r) image.SetPixel(xx,cy,color);
+        for(int dy=-r;dy<=r;dy++) for(int dx=-r;dx<=r;dx++)
+            if(square?(Math.Abs(dx)==r || Math.Abs(dy)==r):dx*dx+dy*dy<=r*r) image.SetPixel(cx+dx,cy+dy,color);
+    }
+    static void PaintSyntheticBands(Bitmap image,RegionProof[] regions,uint dpi,bool dark,string[] example,int secondOffset,int missingSeries) {
+        // Deliberately NOT a production painter/font/RateScale recreation. Draw
+        // example glyphs and move the second marker without measuring any text.
+        Func<int,int> px=delegate(int dip) { return ModernNative.Scale(dip,dpi); };
+        using(var graphics=Graphics.FromImage(image))
+        using(var font=new Font(FontFamily.GenericSansSerif,px(12),FontStyle.Regular,GraphicsUnit.Pixel))
+        using(var text=new SolidBrush(dark?Color.FromArgb(197,197,197):Color.FromArgb(97,97,97)))
+        using(var blue=new SolidBrush(dark?Color.FromArgb(96,205,255):Color.FromArgb(0,95,184)))
+        using(var red=new SolidBrush(dark?Color.FromArgb(228,154,139):Color.FromArgb(179,80,63)))
+        using(var surface=new SolidBrush(dark?Color.FromArgb(51,51,51):Color.FromArgb(245,245,245))) {
+            graphics.Clear(dark?Color.FromArgb(43,43,43):Color.White);
+            graphics.TextRenderingHint=System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            foreach(var p in regions) {
+                if(p.Role=="badge") {
+                    graphics.FillRectangle(surface,p.X,p.Y,p.Width,p.Height);
+                    graphics.FillRectangle(p.Name=="card-1-badge"?red:text,p.X+px(5),p.Y+px(10),px(12),px(2));
+                } else if(p.Role=="value") {
+                    graphics.DrawString("12",font,text,p.X,p.Y);
+                } else if(p.Role=="header-band") {
+                    graphics.DrawString("速率 / 区间均值 · "+example[p.Name.StartsWith("chart-0-")?4:5],font,text,p.X,p.Y);
+                } else if(p.Role=="request-error-legend-band" || p.Role=="traffic-legend-band") {
+                    bool traffic=p.Role=="traffic-legend-band"; int series=traffic?2:0;
+                    int second=p.X+px(secondOffset);
+
+                    graphics.DrawString((traffic?"上传 ":"请求 ")+example[series],font,text,p.X+px(22),p.Y);
+                    graphics.DrawString((traffic?"下载 ":"错误 ")+example[series+1],font,text,second+px(22),p.Y);
+                } else if(p.Role=="optional-status-band" && example[0]=="未知") {
+                    graphics.DrawString("未知采样",font,text,p.X,p.Y);
+                } else if(p.Role=="plot" && example[0]!="未知") {
+                    graphics.FillRectangle(blue,p.X+px(8),p.Y+p.Height/2,p.Width-px(16),px(2));
+                }
+            }
+        }
+        // Deterministic adversarial RGB fringes supplement platform-dependent
+        // ClearType rasterization. Each broad red/blue count is >=4 without any
+        // marker; scattered text-edge pixels must not match the bounded shape.
+        foreach(var p in regions) if(IsLegend(p)) {
+            bool traffic=p.Role=="traffic-legend-band"; int series=traffic?2:0,cy=p.Y+p.Height/2;
+            for(int i=0;i<6;i++) {
+                image.SetPixel(p.X+px(23+3*i),cy+px(3),dark?Color.FromArgb(228,145,122):Color.FromArgb(190,70,55));
+                image.SetPixel(p.X+px(24+3*i),cy+px(4),dark?Color.FromArgb(80,170,240):Color.FromArgb(60,90,175));
+            }
+            if(missingSeries!=series) PaintSyntheticMarker(image,dpi,p.X,cy,SeriesColor(dark,traffic?2:0),false);
+            if(missingSeries!=series+1) PaintSyntheticMarker(image,dpi,p.X+px(secondOffset),cy,SeriesColor(dark,traffic?0:1),true);
+        }
+    }
+    static void RequireSyntheticBandFailure(Bitmap image,uint dpi,bool dark,bool knownRates,string expectedRegion) {
+        try {
+            foreach(var p in InspectBands(image,dpi,dark)) RequireRegionInk(p,knownRates,true);
+        } catch(InvalidOperationException error) {
+            if(!error.Message.EndsWith(": "+expectedRegion,StringComparison.Ordinal)) throw;
+            return;
+        }
+        throw new Exception("Blank/missing-series synthetic fixture was accepted: "+expectedRegion);
+    }
+    public static string ValidateBands() {
+        var examples=new[]{
+            new[]{"0","0","0","0","次/s","B/s"},
+            new[]{"2.96","0.99","120.47","138.24","次/s","B/s"},
+            new[]{"≈1.23","≈0.45","≈1.23","≈2.34","K次/s","KiB/s"},
+            // The same latest raw rates could remain in base units or display
+            // below 0.01 in larger units selected by a retained historical peak.
+            new[]{"0.12","0.01","0.12","0.01","次/s","B/s"},
+            new[]{"<0.01","<0.01","<0.01","<0.01","K次/s","KiB/s"},
+            new[]{"未知","未知","未知","未知","K次/s","KiB/s"}
+        };
+        int checkedCases=0,rejected=0;
+        foreach(bool dark in new[]{false,true}) foreach(uint dpi in new uint[]{96,120,144,192}) foreach(int width in new[]{696,936}) {
+            using(var image=new Bitmap(ModernNative.Scale(width,dpi),ModernNative.Scale(350,dpi))) {
+                var geometry=InspectBands(image,dpi,dark);
+                for(int i=0;i<examples.Length;i++) {
+                    bool known=examples[i][0]!="未知";
+                    int offset=110+40*(i%3);
+                    PaintSyntheticBands(image,geometry,dpi,dark,examples[i],offset,-1);
+                    var inspected=InspectBands(image,dpi,dark);
+                    if(inspected.Length!=geometry.Length) throw new Exception("Fixed-band region set depends on synthetic content");
+                    for(int j=0;j<geometry.Length;j++) {
+                        var a=geometry[j]; var b=inspected[j];
+                        if(a.Name!=b.Name || a.Role!=b.Role || a.X!=b.X || a.Y!=b.Y || a.Width!=b.Width || a.Height!=b.Height)
+                            throw new Exception("Units/approximate labels/unknown state changed fixed-band geometry");
+                        RequireRegionInk(b,known,true);
+                    }
+                    checkedCases++;
+                    // Negative fixtures use the SAME guard as GUI captures. Keep
+                    // neutral labels when omitting upload, so text cannot mask it.
+                    if(i==2 || i==5) {
+                        var missing=new[]{"chart-0-legend-band","chart-0-legend-band","chart-1-legend-band","chart-1-legend-band"};
+                        for(int series=0;series<missing.Length;series++) {
+                            PaintSyntheticBands(image,geometry,dpi,dark,examples[i],offset,series);
+                            foreach(var p in InspectBands(image,dpi,dark)) if(p.Name==missing[series] && (p.Blue<4 || p.Red<4 || p.NeutralBodyInk<4))
+                                throw new Exception("Missing-marker fixture must retain RGB fringes and neutral text");
+                            RequireSyntheticBandFailure(image,dpi,dark,known,missing[series]); rejected++;
+                        }
+                        foreach(var p in inspected) if(IsLegend(p)) {
+                            PaintSyntheticBands(image,geometry,dpi,dark,examples[i],offset,-1);
+                            KeepOnlyMarkers(image,p);
+                            var markerOnly=FindRegion(InspectBands(image,dpi,dark),p.Name);
+                            if(markerOnly.FirstMarker==null || markerOnly.SecondMarker==null || markerOnly.SecondMarkerMatches!=1 || markerOnly.NeutralBodyInk!=0)
+                                throw new Exception("Marker-only fixture lost its shapes or retained body ink");
+                            RequireSyntheticBandFailure(image,dpi,dark,known,p.Name); rejected++;
+                        }
+                        foreach(var p in geometry) if(p.Role=="header-band" || IsLegend(p) || (p.Role=="plot" && known)) {
+                            PaintSyntheticBands(image,geometry,dpi,dark,examples[i],offset,-1);
+                            using(var graphics=Graphics.FromImage(image)) using(var blank=new SolidBrush(dark?Color.FromArgb(43,43,43):Color.White))
+                                graphics.FillRectangle(blank,p.X,p.Y,p.Width,p.Height);
+                            RequireSyntheticBandFailure(image,dpi,dark,known,p.Name); rejected++;
+                        }
+                    }
+                }
+            }
+        }
+        if(checkedCases!=96 || rejected!=352) throw new Exception("Fixed-band positive/negative self-check matrix incomplete");
+        return "fixed-band synthetic self-checks: 96 positive cases across both themes, two widths and 96/120/144/192 DPI parameters; nonzero/approximate labels, B/KiB and count/K units, retained-peak alternatives, unknown/known state and varied second-marker positions; 352 rejections including missing shapes with ClearType-style RGB fringes (old red/blue counts >=4), marker-only/no-body bands, blank headers/legends and known plots; exact-color bounded marker geometry and >=4 neutral body pixels outside markers; no target/font/glyph/fit or GUI acceptance";
+    }
+    static RegionProof FindRegion(RegionProof[] regions,string name) {
+        foreach(var region in regions) if(region.Name==name) return region;
+        throw new InvalidOperationException("Missing fixed region: "+name);
+    }
+    static void KeepOnlyMarkers(Bitmap image,RegionProof band) {
+        Color background=image.GetPixel(band.X,band.Y);
+        for(int y=band.Y;y<band.Y+band.Height;y++) for(int x=band.X;x<band.X+band.Width;x++)
+            if(!InsideMarker(x,y,band.FirstMarker) && !InsideMarker(x,y,band.SecondMarker)) image.SetPixel(x,y,background);
+    }
+    // Optional READ-ONLY regression on a caller-selected saved crop. Never used
+    // by ValidateOnly or GUI execution, and no machine-specific path is required.
+    // Caller selects a known-rate/nonzero-error crop; state is not inferred by OCR.
+    public static string ValidateSavedLegendCrop(string path,uint dpi,bool dark) {
+        using(var original=new Bitmap(path)) {
+            var regions=InspectBands(original,dpi,dark);
+            foreach(var p in regions) RequireRegionInk(p,true,true);
+            var results=new List<string>();
+            foreach(var band in regions) if(IsLegend(band)) {
+                using(var missing=(Bitmap)original.Clone()) {
+                    var marker=band.SecondMarker;
+                    using(var graphics=Graphics.FromImage(missing)) using(var background=new SolidBrush(original.GetPixel(band.X,band.Y)))
+                        graphics.FillRectangle(background,marker.X,marker.Y,marker.Width,marker.Height);
+                    var changed=FindRegion(InspectBands(missing,dpi,dark),band.Name);
+                    if(changed.NeutralBodyInk!=band.NeutralBodyInk || changed.Red<4 || changed.Blue<4)
+                        throw new Exception("Saved crop mutation must preserve real text/RGB fringes above the old color thresholds");
+                    RequireSyntheticBandFailure(missing,dpi,dark,true,band.Name);
+                    results.Add(band.Name+": original PASS, missing second marker REJECTED with real text unchanged, red="+changed.Red+", blue="+changed.Blue+", neutral body="+changed.NeutralBodyInk);
+                }
+                using(var markerOnly=(Bitmap)original.Clone()) {
+                    KeepOnlyMarkers(markerOnly,band);
+                    var changed=FindRegion(InspectBands(markerOnly,dpi,dark),band.Name);
+                    if(changed.FirstMarker==null || changed.SecondMarker==null || changed.SecondMarkerMatches!=1 || changed.NeutralBodyInk!=0)
+                        throw new Exception("Saved marker-only crop did not retain both shapes/remove body");
+                    RequireSyntheticBandFailure(markerOnly,dpi,dark,true,band.Name);
+                    results.Add(band.Name+": both markers retained/no body REJECTED");
+                }
+            }
+            return "READ-ONLY saved "+(dark?"dark":"light")+" crop, no GUI/recapture/glyph acceptance: "+String.Join("; ",results.ToArray());
+        }
     }
     static RegionProof Region(Bitmap b,string name,string role,int x,int y,int w,int h,bool dark) {
         if(w<1 || h<1 || x<0 || y<0 || x+w>b.Width || y+h>b.Height) throw new Exception("Expected inspection region outside complete viewport-contained dashboard crop: "+name);
@@ -515,7 +658,10 @@ $joined = $declarations -join "`n"
 $usingPattern = '(?m)^using [^;\r\n]+;\r?$'
 $usings = @([regex]::Matches($joined,$usingPattern) | ForEach-Object { $_.Value.Trim() } | Select-Object -Unique)
 $combined = ($usings -join "`n") + "`n" + [regex]::Replace($joined,$usingPattern,'')
+Write-Output 'PRECHECK: compiling isolated helper declarations (no target process started)'
+$precheckClock=[Diagnostics.Stopwatch]::StartNew()
 Add-Type -ReferencedAssemblies System.dll,System.Core.dll,System.Drawing.dll,Accessibility.dll -TypeDefinition $combined
+Write-Output ('PRECHECK: helper compilation completed in {0:F2}s' -f $precheckClock.Elapsed.TotalSeconds)
 $tokens=$null; $parseErrors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($PSCommandPath,[ref]$tokens,[ref]$parseErrors)
 if ($parseErrors.Count -gt 0) { throw 'PowerShell parser errors' }
@@ -527,14 +673,19 @@ foreach ($call in $ast.FindAll({ param($n) $n -is [Management.Automation.Languag
         }
     }
 }
+Write-Output 'PRECHECK: basic crop/presentation self-checks (no target process started)'
 $cropValidation=[DashboardNative]::ValidateCrop()
-$fontValidation=[DashboardNative]::ValidateExpectedFont()
 $presentationValidation=[DashboardNative]::ValidatePresentation()
 if ($ValidateOnly) {
-    Write-Output "PASS: PowerShell parser/public helper call sites, declaration extraction, combined C# compilation; $cropValidation; $fontValidation; $presentationValidation"
-    Write-Output 'VALIDATION ONLY: local expected-contract memory DC/font lifecycle, synthetic neutral/error ink checks and pure crop helpers only; no target EXE lookup/build, mutex, GUI, target geometry/font/PrintWindow, fixture, mock, network or acceptance tests run'
+    Write-Output 'PRECHECK: full synthetic band matrix (ValidateOnly; no target process started)'
+    $matrixClock=[Diagnostics.Stopwatch]::StartNew()
+    $bandValidation=[DashboardNative]::ValidateBands()
+    Write-Output ('PRECHECK: full synthetic band matrix completed in {0:F2}s' -f $matrixClock.Elapsed.TotalSeconds)
+    Write-Output "PASS: PowerShell parser/public helper call sites, declaration extraction, combined C# compilation; $cropValidation; $presentationValidation; $bandValidation"
+    Write-Output 'VALIDATION ONLY: synthetic in-memory raster/band/series checks and pure crop helpers only; no target EXE lookup/build, mutex, GUI, target geometry/font/PrintWindow, fixture files, mock, network or acceptance tests run. Native production font/layout regressions are separate, not executed here.'
     return
 }
+Write-Output 'PRECHECK: basic self-checks passed; full synthetic matrix NOT run in this GUI invocation. Run -ValidateOnly separately. Real-crop marker/body guards remain active.'
 
 $session=[Diagnostics.Process]::GetCurrentProcess().SessionId
 $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -659,10 +810,8 @@ function Parse-Dashboard([string]$Value) {
         $r=@(1..4 | ForEach-Object { [double]::Parse($rates.Groups[$_].Value,$culture) })
         foreach ($v in $r) { if ([double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -lt 0) { throw 'Invalid rate' } }
     } elseif ($Value -notmatch '首个样本|尚无快照|采样间隔超过 5 秒|计数饱和|计数／时长回退') { throw "Unrecognized rate metadata: $Value" }
-    $labels=if ($rates.Success) { @("请求 $($rates.Groups[1].Value)","错误 $($rates.Groups[2].Value)","上传 $($rates.Groups[3].Value)","下载 $($rates.Groups[4].Value)") }
-        else { @('请求 未知','错误 未知','上传 未知','下载 未知') }
     return [pscustomobject]@{
-        Labels=$labels; UnknownReasonRow=($null -eq $r -and $Value -notmatch '尚无快照')
+        RawRatesText=if ($rates.Success) { $rates.Value } else { $null }; UnknownReasonRow=($null -eq $r -and $Value -notmatch '尚无快照')
         Requests=[long]$m.Groups[1].Value; Errors=[long]$m.Groups[2].Value
         Active=[long]$m.Groups[3].Value; Tunnels=[long]$m.Groups[4].Value; Inbound=[long]$m.Groups[5].Value
         Download=[long]$m.Groups[6].Value; Upload=[long]$m.Groups[7].Value
@@ -910,7 +1059,7 @@ function Assert-DashboardPixels([string]$Name,[bool]$Dark) {
     $dpi=[ClarityNative]::GetDpiForWindow($dashboard)
     $native=[StatusBarNative]::Client($dashboard,[uint32]$ownedPid)
     if ($native.Width -lt [ModernNative]::Scale(696,$dpi) -or $native.Height -lt [ModernNative]::Scale(350,$dpi)) {
-        $limit="$Name real dashboard is below 696x350 DIP and uses text fallback; legend/units/curve pixel assertions NOT run, no mock plot manufactured"
+        $limit="$Name real dashboard is below 696x350 DIP and uses text fallback; fixed header/legend-band/curve pixel assertions NOT run, no mock plot manufactured"
         $limitations.Add($limit); Record 'LIMIT real dashboard fallback' $limit
         Capture-OverviewEndpoints "$Name-text-fallback"
         return $null
@@ -929,19 +1078,13 @@ function Assert-DashboardPixels([string]$Name,[bool]$Dark) {
         $before=Observe
         $shot=Capture-Dashboard "$Name-attempt-$attempt" $dashboard
         $current=Observe
-        if (($before.Labels -join '|') -cne ($current.Labels -join '|') -or $before.UnknownReasonRow -ne $current.UnknownReasonRow) { continue }
-        $proof=[DashboardNative]::Inspect($shot.Path,$dashboard,[uint32]$ownedPid,$Dark,[string[]]$current.Labels,$current.UnknownReasonRow)
-        foreach ($p in $proof) {
-            if ($p.Role -eq 'badge') { [DashboardNative]::RequireBadgeInk($p,($p.Name -eq 'card-1-badge' -and $current.Errors -gt 0)) }
-            if ($p.Role -in @('value','title','units','legend-text') -and $p.Ink -lt 4) { throw "No rough theme-text ink (not a glyph/value identification): $($p.Name)" }
-            if (($p.Role -eq 'legend-blue' -and $p.Blue -lt 4) -or ($p.Role -eq 'legend-red' -and $p.Red -lt 4) -or ($p.Role -eq 'legend-neutral' -and $p.NeutralInk -lt 4)) { throw "No expected compact series glyph ink: $($p.Name)" }
-            if ($p.Role -in @('units','legend-text') -and $p.ExpectedContractTextWidth -gt $p.ExpectedLayoutTextBudget) { throw "Harness expected painter-font contract text exceeds expected inspection budget: $($p.Name); NOT a target-font measurement or painter-rectangle observation" }
-            if ($p.Role -eq 'plot' -and $null -ne $current.Rates -and $p.Colored -lt 4) { throw "No real sampled curve color in expected plot region: $($p.Name)" }
-        }
-        Record "$Name wholewindowoffscreen-completeviewport-containedcrop / rough regions vs exact WM_GETTEXT" @{ Screenshot=$shot; Regions=$proof; MetadataBefore=$before.Text; MetadataAfter=$current.Text; ExpectedCompactLabels=$current.Labels; ExpectedTitleUnits=@('区间均值 · 次/s','区间均值 · B/s'); UnknownReasonRow=$current.UnknownReasonRow; CurveColorAsserted=($null -ne $current.Rates); RegionSource='Actual complete viewport-contained PNG/HWND/DPI; expected regions use harness-owned Font::new contract widths, NOT target-HFONT or internal-painter-rectangle measurements'; WidthScope=[DashboardNative]::ExpectedFontWidthScope; TargetFontCheck='Read-only WM_GETFONT nonzero only; target assignment observed, identity NOT verified, handle never selected into harness DC or changed'; OCR='NOT performed; color/ink presence cannot identify labels, units or numerical glyphs, prove text fit, or establish physical visibility' }
+        if ($before.RawRatesText -cne $current.RawRatesText -or $before.UnknownReasonRow -ne $current.UnknownReasonRow) { continue }
+        $proof=[DashboardNative]::Inspect($shot.Path,$dashboard,[uint32]$ownedPid,$Dark)
+        foreach ($p in $proof) { [DashboardNative]::RequireRegionInk($p,($null -ne $current.Rates),($current.Errors -gt 0)) }
+        Record "$Name wholewindowoffscreen-completeviewport-containedcrop / fixed-band rough ink; raw WM_GETTEXT checked separately" @{ Screenshot=$shot; Regions=$proof; MetadataBefore=$before.Text; MetadataAfter=$current.Text; RawMetadataRates=$current.Rates; RawRatesText=$current.RawRatesText; UnknownReasonRow=$current.UnknownReasonRow; CurveColorAsserted=($null -ne $current.Rates); RegionSource=[DashboardNative]::VisualRegionScope; TargetFontCheck='Read-only WM_GETFONT nonzero assignment only; opaque cross-process handle is never selected, inspected or changed'; OCR='NOT performed: header/title/unit and individual legend label/value glyphs are not identified. Fixed-band ink does not prove exact text fit, compact item positions or physical visibility.' }
         return $shot
     }
-    throw 'Rate labels/unknown-state changed during all three bounded PrintWindow attempts; no stable region assertion made'
+    throw 'Raw latest-rate metadata/unknown-state changed during all three bounded PrintWindow attempts; no stable region assertion made'
 }
 function Assert-DashboardSurfacePair([string]$Name,[object]$Light,[object]$Dark) {
     if ($null -eq $Light -or $null -eq $Dark) {
@@ -1219,9 +1362,10 @@ try {
         Failure=$detail; CleanupErrors=@($cleanupErrors.ToArray()); Checks=@($checks.ToArray()); ObservedLimitations=@($limitations.ToArray())
         ActualSamples=@($samples.ToArray()); Screenshots=@($shots.ToArray()); Seconds=$overall.Elapsed.TotalSeconds
         CaptureKind='PrintWindow OFFSCREEN only; NOT desktop capture or independent child PrintWindow. Full dashboard images use wholewindowoffscreen-completeviewport-containedcrop: exact native full-HWND rectangle inside actual host client and whole outer bounds, checked before/after printing. Oversized dashboards retain top/bottom whole-window renders and skip complete-image pixel acceptance.'
-        GeometryScope='Native HWND rectangles, actual host-client width, absolute screen coordinates, native scroll range and document transforms measured. Chart-region text budgets use a harness-owned expected Font::new contract at actual DPI, NOT target-HFONT measurement, target font-identity verification, exported painter rectangles or OCR/actual-fit proof.'
-        WidthScope=[DashboardNative]::ExpectedFontWidthScope
-        Limits='Complete=false: this bounded smoke is not full acceptance. Current monitor DPI only; no physical visibility/occlusion/residual, physical min-track/input/tray, multi-monitor/high-contrast/screen-reader acceptance. Outer minimum 800x560, default 800x680 and expanded 1000x820 DIP are work-area-clamped and reported; clamped sizes are not exact-size passes. Dashboard larger than its viewport skips only full-PNG pixel acceptance, retains native geometry and top/bottom whole-window renders, and is NOT called text fallback. Real text fallback applies only below 696x350 DIP, never replaced with a mock plot. Crops never intersect/shrink a partial HWND, resize or stitch; dimensions include native non-client origin mapping and unchanged magenta/color guard. Target WM_GETFONT is checked only for nonzero assignment; its opaque cross-process HFONT is never selected, inspected or replaced. Text-width budgets use a temporary harness-owned memory DC/CreateFontW matching the expected Font::new contract, not observed target font realization or painter rectangles. Local lifecycle self-checks do not verify target GDI resources or actual fit. Pixel checks retain rough badge/text/series ink/color thresholds, not unit/label/value glyph identity or compact layout correctness; target-native painter/font/geometry/GDI/printing tests are separate. No induced unknown gap/reset/saturation or 120s/120-point retention acceptance; initial <=1s may be skipped. Copy/directory availability only (no clipboard/Explorer). Short GDI bounds, not long stability. No Cargo, old script execution, real API/key, Startup/firewall/system proxy changes, global input or IPC to another instance.'
+        SyntheticMatrix='NOT executed by this GUI invocation; run -ValidateOnly separately for the full 96-positive/352-negative helper matrix. All real screenshot guards remain active.'
+        GeometryScope='Native HWND rectangles, actual host-client width, absolute screen coordinates, native scroll range and document transforms measured. Chart inspection uses dimension/DPI-only fixed row bands and plot regions, not raw-rate-derived text budgets, unit expectations or second-item coordinates.'
+        VisualRegionScope=[DashboardNative]::VisualRegionScope
+        Limits='Complete=false: this bounded smoke is not full acceptance. Current monitor DPI only; no physical visibility/occlusion/residual, physical min-track/input/tray, multi-monitor/high-contrast/screen-reader acceptance. Outer minimum 800x560, default 800x680 and expanded 1000x820 DIP are work-area-clamped and reported; clamped sizes are not exact-size passes. Dashboard larger than its viewport skips only full-PNG pixel acceptance, retains native geometry and top/bottom whole-window renders, and is NOT called text fallback. Real text fallback applies only below 696x350 DIP, never replaced with a mock plot. Crops never intersect/shrink a partial HWND, resize or stitch; dimensions include native non-client origin mapping and unchanged magenta/color guard. Target WM_GETFONT is checked only for nonzero assignment; its opaque cross-process HFONT is never selected, inspected or replaced. Latest raw rates do not reveal the 120-second historical peak/RateScale: rendered units and rounded/approximate labels are not reconstructed. Fixed full-width header/legend/status bands and plot geometry do not depend on units, labels or unknown state. Each series requires an exact application-color bounded GDI dash/dot or hollow-square marker at the legend center y, with the second x found by scanning rather than text measurement. ClearType fringe color counts are descriptive only. Legend neutral body ink must meet >=4 pixels after excluding both marker rectangles; marker-only bands fail. Crop/blank/theme thresholds are unchanged. No per-title/unit/label glyph identity, exact value/fit or compact item-position acceptance; target-native painter/font/geometry/GDI/printing tests are separate and not run here. No induced unknown gap/reset/saturation or 120s/120-point retention acceptance; initial <=1s may be skipped. Copy/directory availability only (no clipboard/Explorer). Short GDI bounds, not long stability. No Cargo, old script execution, real API/key, Startup/firewall/system proxy changes, global input or IPC to another instance.'
     }
     [IO.File]::WriteAllText((Join-Path $output 'results.json'),($report | ConvertTo-Json -Depth 14),[Text.UTF8Encoding]::new($true))
     Write-Output "Overview dashboard artifacts: $output"

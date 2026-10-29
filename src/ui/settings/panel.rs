@@ -3,6 +3,9 @@ use super::*;
 use crate::config::{Config, InjectionMode, SecretStorage, StorageMode};
 use windows_sys::Win32::{Foundation::HINSTANCE, Graphics::Gdi::HFONT};
 
+const CATEGORY_MAX_WIDTH_DIP: i32 = 864;
+const THEME_MAX_WIDTH_DIP: i32 = 456;
+
 impl Settings {
     #[allow(clippy::too_many_arguments)]
     fn control(
@@ -327,6 +330,14 @@ impl Settings {
                 (width - scale(x - 24, dpi)).max(1)
             } else {
                 scale(w, dpi)
+            };
+            // Bound only the segmented tracks, preserving form anchors and narrow-window fit.
+            let w = if control == self.category {
+                w.min(scale(CATEGORY_MAX_WIDTH_DIP, dpi))
+            } else if control == self.theme {
+                w.min(scale(THEME_MAX_WIDTH_DIP, dpi))
+            } else {
+                w
             };
             moves.add(control, scale(x, dpi), scale(y - 48, dpi), w, scale(h, dpi));
         }

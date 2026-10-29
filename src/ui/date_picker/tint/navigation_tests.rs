@@ -1,5 +1,8 @@
 use super::*;
 use std::time::{Duration, Instant};
+mod chrome_tests {
+    include!("chrome_tests.rs");
+}
 
 unsafe fn pump_for(duration: Duration) {
     // SAFETY: dispatch this test thread's real queue, including TimerProc calls.
@@ -297,6 +300,7 @@ fn calendar_navigation_screen_stays_dark_without_print_or_forced_repaint() {
             );
         }
         assert_popup_layout(calendar);
+        chrome_tests::assert_screen_chrome(calendar);
         let mut samples = Vec::new();
         for navigation in 0..3 {
             if navigation == 0 {
@@ -312,6 +316,7 @@ fn calendar_navigation_screen_stays_dark_without_print_or_forced_repaint() {
             for millis in [0, 30, 100, 350, 1000] {
                 pump_for(Duration::from_millis(millis).saturating_sub(start.elapsed()));
                 samples.push(screen_calendar(calendar));
+                chrome_tests::assert_screen_chrome(calendar);
             }
             assert!(!active(calendar));
         }
@@ -355,8 +360,18 @@ fn native_dark_popup_grid_footer_colors_and_theme_restore_at_three_fonts() {
                 let font = Font::new(dpi).unwrap();
                 MoveWindow(picker, 0, 0, scale(336, dpi), scale(28, dpi), 0);
                 SendMessageW(picker, WM_SETFONT, font.0 as WPARAM, 0);
-                date_picker::apply(picker, Resolved::Dark, palette(), dpi);
+                date_picker::apply(picker, Resolved::Light, palette(), dpi);
                 let calendar = popup(picker);
+                let native_style = GetWindowLongPtrW(calendar, GWL_STYLE);
+                let native_extended = GetWindowLongPtrW(calendar, GWL_EXSTYLE);
+                let native_chrome = paint(calendar, WM_PRINT);
+                let host = date_picker::popup::native_host(calendar).unwrap();
+                let native_host = paint(host, WM_PRINT);
+                date_picker::apply(picker, Resolved::Dark, palette(), dpi);
+                assert!(date_picker::popup::active(calendar));
+                assert!(date_picker::popup::active(host));
+                chrome_tests::assert_printed_chrome(calendar);
+                chrome_tests::assert_printed_chrome(host);
                 assert!(!active(calendar));
                 assert_eq!(GetWindowTheme(calendar), 0);
                 assert_eq!(
@@ -382,6 +397,12 @@ fn native_dark_popup_grid_footer_colors_and_theme_restore_at_three_fonts() {
                 for kind in [Resolved::Light, Resolved::Contrast] {
                     date_picker::apply(picker, kind, palette(), dpi);
                     assert!(!active(calendar));
+                    assert!(!date_picker::popup::active(calendar));
+                    assert!(!date_picker::popup::active(host));
+                    assert_eq!(GetWindowLongPtrW(calendar, GWL_STYLE), native_style);
+                    assert_eq!(GetWindowLongPtrW(calendar, GWL_EXSTYLE), native_extended);
+                    chrome_tests::assert_native_chrome_restored(calendar, &native_chrome);
+                    chrome_tests::assert_native_chrome_restored(host, &native_host);
                     assert_ne!(GetWindowTheme(calendar), 0);
                     assert_eq!(
                         SendMessageW(calendar, MCM_GETCOLOR, MCSC_MONTHBK as WPARAM, 0) as u32,
@@ -402,7 +423,7 @@ fn native_dark_popup_grid_footer_colors_and_theme_restore_at_three_fonts() {
 #[test]
 fn native_popup_open_navigate_theme_close_resources_stay_bounded() {
     use windows_sys::Win32::System::Threading::{
-        GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources,
+        GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentProcess, GetGuiResources,
     };
     let _visual_styles = VisualStyles::new();
     let host = Host::new();
@@ -419,15 +440,23 @@ fn native_popup_open_navigate_theme_close_resources_stay_bounded() {
             SendMessageW(picker, WM_SETTEXT, 0, wide("2026-10-25").as_ptr() as LPARAM);
             date_picker::apply(picker, Resolved::Dark, palette(), 96);
             let calendar = popup(picker);
+            let owner_alive = date_picker::popup::owner_alive(calendar).unwrap();
             SendMessageW(calendar, WM_KEYDOWN, 0x22, 0);
             SendMessageW(calendar, WM_KEYUP, 0x22, 0);
             drop(paint(calendar, WM_PRINTCLIENT));
+            chrome_tests::assert_printed_chrome(calendar);
+            chrome_tests::assert_printed_chrome(date_picker::popup::native_host(calendar).unwrap());
             date_picker::apply(picker, Resolved::Light, palette(), 96);
+            assert!(!owner_alive(), "restored popup retained its border owner");
             drop(paint(calendar, WM_PRINTCLIENT));
             SendMessageW(picker, DTM_CLOSEMONTHCAL, 0, 0);
             assert_eq!(IsWindow(calendar), 0);
+
             GdiFlush();
-            GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS)
+            (
+                GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS),
+                GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS),
+            )
         };
         once();
         let before = once();

@@ -13,6 +13,70 @@ const WINDOW: Duration = Duration::from_secs(120);
 const INTERVAL: Duration = Duration::from_secs(1);
 const MAX_GAP: Duration = Duration::from_secs(5);
 
+struct RateScale {
+    maximum: f64,
+    divisor: f64,
+    unit: &'static str,
+}
+impl RateScale {
+    fn new(peak: f64, bytes: bool) -> Self {
+        let peak = if peak.is_finite() { peak.max(0.0) } else { 0.0 };
+        let (radix, units) = if bytes {
+            (
+                1024.0,
+                ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s", "PiB/s", "EiB/s"],
+            )
+        } else {
+            (
+                1000.0,
+                ["次/s", "K次/s", "M次/s", "G次/s", "T次/s", "P次/s", "E次/s"],
+            )
+        };
+        let mut divisor = 1.0;
+        let mut index = 0;
+        while index < units.len() - 1 && peak / divisor >= radix {
+            divisor *= radix;
+            index += 1;
+        }
+        let desired = (peak / divisor * 1.08).max(1.0);
+        let magnitude = 10.0_f64.powf(desired.log10().floor());
+        let multiple = [1.0, 2.0, 5.0, 10.0]
+            .into_iter()
+            .find(|step| step * magnitude >= desired)
+            .unwrap_or(10.0);
+        Self {
+            maximum: multiple * magnitude * divisor,
+            divisor,
+            unit: units[index],
+        }
+    }
+    fn label(&self, value: f64) -> String {
+        let scaled = value / self.divisor;
+        if scaled == 0.0 {
+            return "0".into();
+        }
+        if scaled < 0.01 {
+            return "<0.01".into();
+        }
+        let rounded = format!("{scaled:.2}");
+        let approximate = ((scaled * 100.0).round() - scaled * 100.0).abs() > 0.000001;
+        format!(
+            "{}{}",
+            if approximate { "≈" } else { "" },
+            rounded.trim_end_matches('0').trim_end_matches('.')
+        )
+    }
+}
+
+fn needs_marker(previous: Option<f64>, value: f64, next: Option<f64>) -> bool {
+    match (previous, next) {
+        (Some(previous), Some(next)) => {
+            (value > previous && value >= next) || (value < previous && value <= next)
+        }
+        _ => true,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rates {
     requests: f64,
@@ -268,7 +332,9 @@ fn window_fraction(now: Duration, at: Duration) -> Option<f64> {
 }
 
 #[cfg(windows)]
-pub(super) use painting::draw;
+mod surface;
+#[cfg(windows)]
+pub(super) use {painting::draw, surface::attach};
 
 #[cfg(windows)]
 mod painting {
@@ -278,10 +344,12 @@ mod painting {
     use windows_sys::Win32::{
         Foundation::{RECT, SIZE},
         Graphics::Gdi::{
-            DC_BRUSH, DC_PEN, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-            DT_VCENTER, DrawTextW, Ellipse, FillRect, GetStockObject, GetTextExtentPoint32W, HDC,
-            HFONT, IntersectClipRect, LineTo, MoveToEx, Rectangle, RestoreDC, RoundRect, SaveDC,
-            SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DC_PEN, DT_CENTER,
+            DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+            DeleteObject, DrawTextW, Ellipse, FillRect, GetStockObject, GetTextExtentPoint32W,
+            HBITMAP, HDC, HFONT, HGDIOBJ, IntersectClipRect, LineTo, MoveToEx, Rectangle,
+            RestoreDC, RoundRect, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetDCBrushColor,
+            SetDCPenColor, SetTextColor, TRANSPARENT,
         },
         UI::Controls::DRAWITEMSTRUCT,
     };
@@ -396,7 +464,8 @@ mod painting {
                 }),
                 plot: RECT {
                     left: panel.left + px(62),
-                    top: panel.top + px(if status { 88 } else { 68 }),
+                    // Keep the plot stationary when the current interval becomes unknown.
+                    top: panel.top + px(88),
                     right: panel.right - px(18),
                     bottom: panel.bottom - px(32),
                 },
@@ -669,14 +738,33 @@ mod painting {
                     [r.requests, r.errors]
                 }
             });
+            let now = timeline.latest.map(|m| m.uptime).unwrap_or_default();
+            let mut peak = 0.0_f64;
+            let mut known = false;
+            if available {
+                for sample in &timeline.samples {
+                    if window_fraction(now, sample.at).is_some()
+                        && let Some(r) = sample.rates
+                    {
+                        let values = if bytes {
+                            [r.upload, r.download]
+                        } else {
+                            [r.requests, r.errors]
+                        };
+                        peak = peak.max(values[0]).max(values[1]);
+                        known = true;
+                    }
+                }
+            }
+            let axis = RateScale::new(peak, bytes);
             let labels = std::array::from_fn::<_, 2, _>(|i| {
                 format!(
                     "{} {}",
                     names[i],
-                    latest.map_or_else(|| "未知".into(), |rates| rate_number(rates[i]))
+                    latest.map_or_else(|| "未知".into(), |rates| axis.label(rates[i]))
                 )
             });
-            let unit = format!("区间均值 · {}", if bytes { "B/s" } else { "次/s" });
+            let unit = format!("区间均值 · {}", axis.unit);
             let layout = ChartLayout::new(
                 panel,
                 self.dpi,
@@ -718,31 +806,14 @@ mod painting {
                 );
             }
             let plot = layout.plot;
-            let now = timeline.latest.map(|m| m.uptime).unwrap_or_default();
-            let mut maximum = 1.0_f64;
-            let mut known = false;
-            if available {
-                for sample in &timeline.samples {
-                    if window_fraction(now, sample.at).is_some()
-                        && let Some(r) = sample.rates
-                    {
-                        let values = if bytes {
-                            [r.upload, r.download]
-                        } else {
-                            [r.requests, r.errors]
-                        };
-                        maximum = maximum.max(values[0]).max(values[1]);
-                        known = true;
-                    }
-                }
-            }
+
             // The header carries the shared axis/legend unit. A unit-sized axis
             // for idle data does not imply a nonzero rate; unknowns remain gaps.
             for i in 0..3 {
                 let y = plot.top + (plot.bottom - plot.top) * i / 2;
                 self.grid_line(plot.left, plot.right, y);
                 self.text(
-                    &rate_number(maximum * (2 - i) as f64 / 2.0),
+                    &axis.label(axis.maximum * (2 - i) as f64 / 2.0),
                     RECT {
                         left: panel.left + self.px(4),
                         top: y - self.px(10),
@@ -791,34 +862,50 @@ mod painting {
                 self.text(message, plot, self.palette.text, false, DT_CENTER);
                 return;
             }
-            for series in 0..2 {
-                let mut previous: Option<((i32, i32), Duration)> = None;
-                for sample in &timeline.samples {
-                    let Some(fraction) = window_fraction(now, sample.at) else {
-                        previous = None;
+            for (series, color) in color.into_iter().enumerate() {
+                let points: Vec<_> = timeline
+                    .samples
+                    .iter()
+                    .map(|sample| {
+                        let fraction = window_fraction(now, sample.at)?;
+                        let r = sample.rates?;
+                        let value = if bytes {
+                            [r.upload, r.download][series]
+                        } else {
+                            [r.requests, r.errors][series]
+                        };
+                        let x =
+                            plot.left + ((plot.right - plot.left) as f64 * fraction).round() as i32;
+                        let y = plot.bottom
+                            - ((plot.bottom - plot.top) as f64
+                                * (value / axis.maximum).clamp(0.0, 1.0))
+                            .round() as i32;
+                        Some(((x, y), sample.at, value))
+                    })
+                    .collect();
+                for (index, point) in points.iter().enumerate() {
+                    let Some((point, at, value)) = *point else {
                         continue;
                     };
-                    let Some(r) = sample.rates else {
-                        previous = None;
-                        continue;
-                    };
-                    let values = if bytes {
-                        [r.upload, r.download]
-                    } else {
-                        [r.requests, r.errors]
-                    };
-                    let x = plot.left + ((plot.right - plot.left) as f64 * fraction).round() as i32;
-                    let y = plot.bottom
-                        - ((plot.bottom - plot.top) as f64
-                            * (values[series] / maximum).clamp(0.0, 1.0))
-                        .round() as i32;
-                    if let Some((point, at)) = previous
-                        && sample.at.checked_sub(at).is_some_and(|gap| gap <= MAX_GAP)
-                    {
-                        self.series_line(point, (x, y), color[series], series == 1);
+                    let previous = index
+                        .checked_sub(1)
+                        .and_then(|i| points[i])
+                        .filter(|p| at.checked_sub(p.1).is_some_and(|gap| gap <= MAX_GAP));
+                    let next = points
+                        .get(index + 1)
+                        .copied()
+                        .flatten()
+                        .filter(|p| p.1.checked_sub(at).is_some_and(|gap| gap <= MAX_GAP));
+                    if let Some((previous, _, _)) = previous {
+                        self.series_line(previous, point, color, series == 1);
                     }
-                    self.dot(x, y, color[series], series == 1);
-                    previous = Some(((x, y), sample.at));
+                    // Preserve all real line segments; mark only endpoints and turns,
+                    // rather than turning a 120-point idle baseline into a dotted rail.
+                    if (self.kind == Resolved::Contrast && series == 1)
+                        || needs_marker(previous.map(|p| p.2), value, next.map(|p| p.2))
+                    {
+                        self.dot(point.0, point.1, color, series == 1);
+                    }
                 }
             }
             if let Some(reason) = current.and_then(|s| s.unknown)
@@ -827,6 +914,56 @@ mod painting {
                 // Keep historical valid segments visible, but do not imply that
                 // they extend to an unknown current interval.
                 self.text(reason.text(), status, self.palette.text, false, 0);
+            }
+        }
+    }
+
+    struct Frame {
+        dc: HDC,
+        bitmap: HBITMAP,
+        previous: HGDIOBJ,
+    }
+    impl Frame {
+        unsafe fn new(target: HDC, width: i32, height: i32) -> Option<Self> {
+            // SAFETY: Private GDI objects; a bitmap is always deselected before
+            // deletion. Bound transient storage to 16M pixels (normally 64 MiB).
+            unsafe {
+                if width <= 0
+                    || height <= 0
+                    || u64::from(width as u32) * u64::from(height as u32) > 16_777_216
+                {
+                    return None;
+                }
+                let dc = CreateCompatibleDC(target);
+                if dc.is_null() {
+                    return None;
+                }
+                let bitmap = CreateCompatibleBitmap(target, width, height);
+                if bitmap.is_null() {
+                    DeleteDC(dc);
+                    return None;
+                }
+                let previous = SelectObject(dc, bitmap);
+                if previous.is_null() || previous as isize == -1 {
+                    DeleteObject(bitmap);
+                    DeleteDC(dc);
+                    return None;
+                }
+                Some(Self {
+                    dc,
+                    bitmap,
+                    previous,
+                })
+            }
+        }
+    }
+    impl Drop for Frame {
+        fn drop(&mut self) {
+            // SAFETY: Only this frame owns the DC/bitmap and previous selection.
+            unsafe {
+                SelectObject(self.dc, self.previous);
+                DeleteObject(self.bitmap);
+                DeleteDC(self.dc);
             }
         }
     }
@@ -857,13 +994,65 @@ mod painting {
         {
             return;
         }
-        // SAFETY: Caller supplies the live paint DC. SaveDC is guarded before
-        // mutation; clip, fonts, stock pen/brush selections/colors, background
-        // and text modes are restored on every exit. No GDI object is allocated.
+        let Some(width) = item.rcItem.right.checked_sub(item.rcItem.left) else {
+            return;
+        };
+        let Some(height) = item.rcItem.bottom.checked_sub(item.rcItem.top) else {
+            return;
+        };
+        // SAFETY: A complete private frame is copied once into the borrowed DC,
+        // respecting its existing clip/origins. Allocation failure falls back to
+        // the same readable drawing path, never a blank or simulated frame.
+        unsafe {
+            if let Some(frame) = Frame::new(item.hDC, width, height) {
+                let buffered = DRAWITEMSTRUCT {
+                    hDC: frame.dc,
+                    rcItem: RECT {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    },
+                    ..*item
+                };
+                if paint(
+                    &buffered, dpi, font, heading, palette, kind, snapshot, timeline,
+                ) && BitBlt(
+                    item.hDC,
+                    item.rcItem.left,
+                    item.rcItem.top,
+                    width,
+                    height,
+                    frame.dc,
+                    0,
+                    0,
+                    SRCCOPY,
+                ) != 0
+                {
+                    return;
+                }
+            }
+            paint(item, dpi, font, heading, palette, kind, snapshot, timeline);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn paint(
+        item: &DRAWITEMSTRUCT,
+        dpi: u32,
+        font: HFONT,
+        heading: HFONT,
+        palette: Palette,
+        kind: Resolved,
+        snapshot: Option<&crate::app::controller::OverviewSnapshot>,
+        timeline: &Timeline,
+    ) -> bool {
+        // SAFETY: Caller supplies a live DC. SaveDC restores clip, objects and
+        // colors even on early returns; this pass owns no window or app state.
         unsafe {
             let level = SaveDC(item.hDC);
             if level == 0 {
-                return;
+                return false;
             }
             let _saved = SavedDc {
                 dc: item.hDC,
@@ -880,7 +1069,7 @@ mod painting {
             let pen = GetStockObject(DC_PEN);
             let brush = GetStockObject(DC_BRUSH);
             if pen.is_null() || brush.is_null() {
-                return;
+                return false;
             }
             SelectObject(item.hDC, pen);
             SelectObject(item.hDC, brush);
@@ -936,7 +1125,7 @@ mod painting {
                     );
                     top += canvas.px(28);
                 }
-                return;
+                return true;
             }
             canvas.cards(bounds, snapshot.map(|s| &s.metrics));
             let gap = canvas.px(12);
@@ -975,6 +1164,7 @@ mod painting {
                 false,
                 0,
             );
+            true
         }
     }
     #[cfg(test)]
@@ -1012,10 +1202,7 @@ mod painting {
                         assert!(layout.legends[0].bottom < layout.plot.top - px(10));
                         assert!(layout.plot.right > layout.plot.left);
                         assert!(layout.plot.bottom - layout.plot.top >= px(82) - 1);
-                        assert_eq!(
-                            layout.plot.top - panel.top,
-                            px(if status { 88 } else { 68 })
-                        );
+                        assert_eq!(layout.plot.top - panel.top, px(88));
                         if let Some(reason) = layout.status {
                             assert!(reason.top > layout.legends[0].bottom);
                             assert!(reason.bottom <= layout.plot.top - px(10));
@@ -1372,6 +1559,47 @@ mod tests {
             Some(0.5)
         );
     }
+    #[test]
+    fn chart_scale_keeps_compact_units_headroom_and_readable_ticks() {
+        for (bytes, peak, unit, label) in [
+            (true, 0.0, "B/s", "1"),
+            (true, 134_554.0, "KiB/s", "200"),
+            (true, 6.0 * 1024.0 * 1024.0, "MiB/s", "10"),
+            (false, 1.0, "次/s", "2"),
+            (false, 6_200.0, "K次/s", "10"),
+        ] {
+            let scale = RateScale::new(peak, bytes);
+            assert_eq!(scale.unit, unit);
+            assert!(scale.maximum > peak);
+            assert_eq!(scale.label(scale.maximum), label);
+            assert_eq!(scale.label(0.0), "0");
+            for fraction in [0.0, 0.5, 1.0] {
+                assert!(scale.label(scale.maximum * fraction).chars().count() <= 6);
+            }
+        }
+        let scale = RateScale::new(2_000.0, true);
+        assert_eq!(scale.label(1024.0), "1");
+        assert_eq!(scale.label(1024.0 * 1.234), "≈1.23");
+        assert_eq!(scale.label(0.1), "<0.01");
+        for peak in [0.0, 0.5, 99.0, 999.0, 1023.0, 1024.0, u64::MAX as f64] {
+            for bytes in [false, true] {
+                let scale = RateScale::new(peak, bytes);
+                assert!(scale.maximum.is_finite() && scale.maximum > peak);
+            }
+        }
+    }
+
+    #[test]
+    fn chart_markers_keep_endpoints_and_turns_not_every_idle_sample() {
+        assert!(needs_marker(None, 0.0, Some(0.0)));
+        assert!(needs_marker(Some(0.0), 0.0, None));
+        assert!(needs_marker(None, 3.0, None));
+        assert!(!needs_marker(Some(0.0), 0.0, Some(0.0)));
+        assert!(!needs_marker(Some(1.0), 2.0, Some(3.0)));
+        assert!(needs_marker(Some(0.0), 4.0, Some(0.0)));
+        assert!(needs_marker(Some(4.0), 0.0, Some(4.0)));
+    }
+
     #[test]
     fn formatting_distinguishes_unknown_zero_counts_and_byte_units() {
         assert!(Timeline::default().rates_text().contains("未知"));

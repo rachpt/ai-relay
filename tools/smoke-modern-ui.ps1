@@ -95,6 +95,10 @@ public static class ModernNative {
         public int HostClientWidth,Right,ExpectedRight,Margin,ExpectedMargin;
         public string Failure;
     }
+    public sealed class SegmentWidthProof {
+        public int ID,HostClientWidth,Left,ExpectedLeft,Width,ExpectedWidth,Right,ExpectedRight,MaxWidthDIP;
+        public string Failure;
+    }
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr VirtualAllocEx(IntPtr process,IntPtr address,UIntPtr size,uint kind,uint protection);
@@ -236,6 +240,75 @@ public static class ModernNative {
         var regression=PageRightMargin(983,new StatusBarNative.Rect { Left=24,Top=60,Right=976,Bottom=94 },96);
         if(regression.Failure==null || regression.ExpectedRight!=959)
             throw new Exception("976-vs-959 scrollbar-width regression was not detected");
+    }
+    // Only these two settings tracks are capped; PageRightMargin remains strict
+    // for every stretched input/tail, including after native scrollbar show/hide.
+    public static SegmentWidthProof SettingsSegmentWidth(int id,int hostClientWidth,StatusBarNative.Rect fullControl,uint dpi) {
+        if(hostClientWidth<1 || dpi==0) throw new ArgumentException("Invalid host-client width/DPI");
+        int leftDip,maxDip;
+        if(id==2039) { leftDip=24; maxDip=864; }
+        else if(id==2030) { leftDip=180; maxDip=456; }
+        else throw new ArgumentException("Only settings segments 2039/2030 have bounded widths");
+        int left=Scale(leftDip,dpi),margin=Scale(24,dpi);
+        int available=Math.Max(1,Math.Max(1,hostClientWidth-2*margin)-Scale(leftDip-24,dpi));
+        int width=Math.Min(available,Scale(maxDip,dpi));
+        var proof=new SegmentWidthProof { ID=id,HostClientWidth=hostClientWidth,Left=fullControl.Left,ExpectedLeft=left,
+            Width=fullControl.Width,ExpectedWidth=width,Right=fullControl.Right,ExpectedRight=left+width,MaxWidthDIP=maxDip };
+        if(fullControl.Width<=0 || fullControl.Height<=0)
+            proof.Failure="Missing complete settings-segment rectangle";
+        else if(Math.Abs((long)proof.Left-proof.ExpectedLeft)>1 || Math.Abs((long)proof.Width-proof.ExpectedWidth)>1 ||
+            Math.Abs((long)proof.Right-proof.ExpectedRight)>1)
+            proof.Failure="Settings segment must retain its left anchor and exact min(available, DPI cap) width +/-1px: ID="+id+
+                ", left="+proof.Left+", expectedLeft="+proof.ExpectedLeft+", width="+proof.Width+", expectedWidth="+proof.ExpectedWidth+
+                ", right="+proof.Right+", expectedRight="+proof.ExpectedRight+", hostClientWidth="+hostClientWidth;
+        return proof;
+    }
+    static void ValidateSettingsSegmentWidths() {
+        foreach(uint dpi in new uint[]{96,120,144,192}) {
+            foreach(int id in new int[]{2039,2030}) {
+                int left=Scale(id==2039?24:180,dpi),cap=Scale(id==2039?864:456,dpi),margin=Scale(24,dpi);
+                foreach(int width in new int[]{624,659,660,661,744,911,912,913,983,1000,1488,744}) {
+                    foreach(int scrollbar in new int[]{0,17}) {
+                        int hostWidth=Scale(width,dpi)-Scale(scrollbar,dpi);
+                        var full=new StatusBarNative.Rect { Left=left,Top=-Scale(60,dpi),
+                            Right=Math.Min(hostWidth-margin,left+cap),Bottom=Scale(80,dpi) };
+                        var valid=SettingsSegmentWidth(id,hostWidth,full,dpi);
+                        if(valid.Failure!=null || valid.ExpectedRight!=full.Right)
+                            throw new Exception("Exact anchored settings segment width rejected");
+                        foreach(int pixel in new int[]{-1,0,1}) {
+                            var rounded=full; rounded.Right+=pixel;
+                            if(SettingsSegmentWidth(id,hostWidth,rounded,dpi).Failure!=null)
+                                throw new Exception("Settings segment +/-1px tolerance rejected");
+                        }
+                        foreach(int drift in new int[]{-Scale(17,dpi),-2,2,Scale(17,dpi)}) {
+                            var stale=full; stale.Right+=drift;
+                            if(SettingsSegmentWidth(id,hostWidth,stale,dpi).Failure==null)
+                                throw new Exception("Stale/overwide/underwide settings segment was accepted");
+                            var shifted=full; shifted.Left+=drift; shifted.Right+=drift;
+                            if(SettingsSegmentWidth(id,hostWidth,shifted,dpi).Failure==null)
+                                throw new Exception("Centered/shifted settings segment was accepted");
+                        }
+                        // Native scrollbar transitions can cross the cap threshold.
+                        foreach(int delta in new int[]{-Scale(17,dpi),Scale(17,dpi)}) {
+                            var stale=full; stale.Right=Math.Min(hostWidth+delta-margin,left+cap);
+                            if(Math.Abs((long)stale.Right-full.Right)>1 && SettingsSegmentWidth(id,hostWidth,stale,dpi).Failure==null)
+                                throw new Exception("Previous-client settings segment width was accepted");
+                        }
+                        var uncapped=full; uncapped.Right=hostWidth-margin;
+                        if(uncapped.Right-full.Right>1 && SettingsSegmentWidth(id,hostWidth,uncapped,dpi).Failure==null)
+                            throw new Exception("Uncapped settings segment was accepted");
+                    }
+                }
+            }
+        }
+        var category=SettingsSegmentWidth(2039,983,new StatusBarNative.Rect { Left=24,Top=60,Right=888,Bottom=94 },96);
+        var theme=SettingsSegmentWidth(2030,983,new StatusBarNative.Rect { Left=180,Top=118,Right=636,Bottom=150 },96);
+        if(category.Failure!=null || category.ExpectedWidth!=864 || theme.Failure!=null || theme.ExpectedWidth!=456)
+            throw new Exception("864/456-DIP settings cap regression");
+        bool rejected=false;
+        try { SettingsSegmentWidth(2010,983,new StatusBarNative.Rect(),96); }
+        catch(ArgumentException) { rejected=true; }
+        if(!rejected) throw new Exception("Ordinary settings input acquired a segment-width exemption");
     }
     // Pure geometry: fullTail is the complete HWND rectangle in main-client
     // coordinates, NEVER an intersection with the viewport. Tall editors may
@@ -397,6 +470,7 @@ public static class ModernNative {
     public static string Validate() {
         ValidatePageTails();
         ValidatePageRightMargins();
+        ValidateSettingsSegmentWidths();
         if(Marshal.SizeOf(typeof(ScrollInfo))!=28) throw new Exception("Unexpected x64 SCROLLINFO layout");
         var scroll=new ScrollInfo { Min=0,Max=715,Page=400 };
         if(scroll.Limit!=316) throw new Exception("Inclusive scroll range self-check failed");
@@ -419,7 +493,7 @@ public static class ModernNative {
             var sparse=InspectContrast(bitmap,arrow,3,3.0,2); var dense=InspectContrast(bitmap,arrow,3,3.0,1);
             if(sparse.InkSamples!=0 || dense.InkSamples<2 || dense.Contrast<3.0) throw new Exception("One-pixel chevron aliasing/dense contrast self-check failed");
         }
-        return "SCROLLINFO, full-tail 16-DIP padding/terminal-only checks, content-sized settings/phantom extents, actual-host-client 24-DIP right margins (+/-1px, scrollbar show/hide and 976-vs-959 regressions), 96/120/144/192-DPI geometry, clip/document bounds, narrow metadata contract, padded arrow geometry and dense one-pixel chevron contrast";
+        return "SCROLLINFO, full-tail 16-DIP padding/terminal-only checks, content-sized settings/phantom extents, actual-host-client 24-DIP right margins (+/-1px, scrollbar show/hide and 976-vs-959 regressions), exact anchored 864/456-DIP settings segment widths (narrow/threshold/wide, stale client/cap/anchor rejection), 96/120/144/192-DPI geometry, clip/document bounds, narrow metadata contract, padded arrow geometry and dense one-pixel chevron contrast";
     }
     public static StatusBarNative.Rect TabItem(IntPtr pinned,uint pid,IntPtr tab,int index) {
         StatusBarNative.CheckProcess(pinned,pid); ProxyUiSmoke.CheckOwner(tab,pid);
@@ -898,19 +972,36 @@ function Assert-PageLayout([string]$Label,[ValidateSet('any','top','bottom')][st
         default { throw "$Label unknown active page $active" }
     }
     $tails=@($rects | Where-Object { $_.ID -in $tailIds })
-    $rightMarginIds=if ($active -eq 3) { @(2039) } else { @($tailIds) }
+    $rightMarginIds=if ($active -eq 3) { @(2010) } else { @($tailIds) }
     $wideControls=@($rects | Where-Object { $_.ID -in $rightMarginIds })
+    if ($active -eq 3) {
+        # Settings lays out this uncapped input even in other categories. Keep
+        # actual-client scrollbar-width coverage when both tracks reach their caps.
+        $wideControls=@([pscustomobject]@{ ID=2010; Handle=(Control 2010) })
+    }
     $rightMargins=[Collections.Generic.List[object]]::new()
     if ($wideControls.Count -ne 1) {
-        $uiFailures.Add("$Label expected exactly one visible stretched control/category for right-margin IDs $($rightMarginIds -join ','); found $($wideControls.Count)")
+        $uiFailures.Add("$Label expected exactly one stretched input/tail for right-margin IDs $($rightMarginIds -join ','); found $($wideControls.Count)")
     }
     foreach ($wide in $wideControls) {
         # Independent of vertical position: assert at TOP/BOTTOM/cache even if
-        # the category or a tall result is vertically clipped. Never crop right.
+        # an input or a tall result is vertically clipped. Never crop right.
         $full=[StatusBarNative]::InParent($wide.Handle,$hostWindow,[uint32]$ownedPid)
         $margin=[ModernNative]::PageRightMargin($hostClient.Width,$full,$dpi)
         $rightMargins.Add([pscustomobject]@{ ID=$wide.ID; FullHostClientRect=$full; Proof=$margin })
         if ($null -ne $margin.Failure) { $uiFailures.Add("$Label stretched control ID=$($wide.ID): $($margin.Failure)") }
+    }
+    $segmentWidths=[Collections.Generic.List[object]]::new()
+    if ($active -eq 3) {
+        $segmentIds=if ((Message 2039 0x147) -eq 5) { @(2039,2030) } else { @(2039) }
+        foreach ($id in $segmentIds) {
+            $segments=@($rects | Where-Object { $_.ID -eq $id })
+            if ($segments.Count -ne 1) { $uiFailures.Add("$Label expected one visible settings segment ID=$id; found $($segments.Count)"); continue }
+            $full=[StatusBarNative]::InParent($segments[0].Handle,$hostWindow,[uint32]$ownedPid)
+            $width=[ModernNative]::SettingsSegmentWidth($id,$hostClient.Width,$full,$dpi)
+            $segmentWidths.Add([pscustomobject]@{ ID=$id; FullHostClientRect=$full; Proof=$width })
+            if ($null -ne $width.Failure) { $uiFailures.Add("$Label settings segment ID=${id}: $($width.Failure)") }
+        }
     }
     $tailProof=$null; $tailFull=$null
     if ($tails.Count -ne 1) {
@@ -930,7 +1021,7 @@ function Assert-PageLayout([string]$Label,[ValidateSet('any','top','bottom')][st
         $tailProof=[ModernNative]::PageTail([int]$active,$client.Height,$clip,$footerRect,$scroll,$tailFull,[int]$lastVisibleBottom,$dpi)
         if ($null -ne $tailProof.Failure) { $uiFailures.Add("$Label tail ID=$($tail.ID): $($tailProof.Failure)") }
     }
-    Record "$Label viewport/document geometry (native closed combo bounds; complete tail; actual-client right margin)" @{ Page=$active; Endpoint=$Endpoint; DPI=$dpi; Host="$hostRect"; HostClient="$hostClient"; Clip="$clip"; Footer="$footerRect"; Scroll=$scroll; DocumentBottom=$documentBottom; TailIDs=@($tailIds); FullTail=$tailFull; TailProof=$tailProof; RightMarginIDs=@($rightMarginIds); RightMargins=$rightMargins.ToArray(); Children=$rects.ToArray() }
+    Record "$Label viewport/document geometry (native closed combo bounds; complete tail; actual-client right margin; capped settings segments)" @{ Page=$active; Endpoint=$Endpoint; DPI=$dpi; Host="$hostRect"; HostClient="$hostClient"; Clip="$clip"; Footer="$footerRect"; Scroll=$scroll; DocumentBottom=$documentBottom; TailIDs=@($tailIds); FullTail=$tailFull; TailProof=$tailProof; RightMarginIDs=@($rightMarginIds); RightMargins=$rightMargins.ToArray(); SegmentWidths=$segmentWidths.ToArray(); Children=$rects.ToArray() }
     for ($i=$startFailures;$i -lt $uiFailures.Count;$i++) { Write-Warning $uiFailures[$i] }
 }
 function Assert-HistoryLayout([string]$Label) { Assert-PageLayout $Label }

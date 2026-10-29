@@ -447,20 +447,50 @@ fn native_settings_scroll_extent_tracks_category_instead_of_an_empty_page() {
     native.state.show_page(3);
     let draft = native.control(2040);
     settings::set_text(draft, "[\"127.0.0.1\"]");
+    let assert_widths = |native: &NativeState, category: usize, dpi: u32| {
+        let mut host = RECT::default();
+        // SAFETY: Measure the actual host client after native scrollbar visibility settles.
+        assert_ne!(
+            unsafe { GetClientRect(native.state.viewport.handle, &mut host) },
+            0
+        );
+        let right = host.right - scale(24, dpi);
+        for (id, left, cap) in [(2039, 24, 864), (2030, 180, 456)] {
+            if id == 2030 && category != 5 {
+                continue;
+            }
+            let rect = native.rect(native.control(id));
+            assert_eq!(rect.left, scale(left, dpi));
+            assert_eq!(
+                rect.right,
+                right.min(scale(left, dpi) + scale(cap, dpi)),
+                "category {category}, segment {id} has a stale or uncapped width"
+            );
+        }
+        // This input is laid out for every category, even while hidden. Its
+        // uncapped width still catches both scrollbar show/hide regressions.
+        let input = native.rect(native.control(2010));
+        assert_eq!(input.left, scale(180, dpi));
+        assert_eq!(
+            input.right, right,
+            "category {category} input used the previous scrollbar width"
+        );
+    };
     for dpi in [96, 144, 192] {
-        for height in [560, 680, 820, 1000] {
-            resize_client(&mut native, 1000, height, dpi);
+        for (width, height) in [
+            (1000, 560),
+            (800, 560),
+            (1000, 680),
+            (800, 680),
+            (1000, 820),
+            (800, 820),
+            (1000, 1000),
+            (800, 1000),
+        ] {
+            resize_client(&mut native, width, height, dpi);
             for category in [2, 0, 4, 1, 5, 3] {
                 native.command(2039, Some(category));
-                // SAFETY: Actual host width after native scrollbar visibility
-                // changes; the stretched category navigation must use this width.
-                let mut host = RECT::default();
-                unsafe { GetClientRect(native.state.viewport.handle, &mut host) };
-                assert_eq!(
-                    native.rect(native.control(2039)).right,
-                    host.right - scale(24, dpi),
-                    "category {category} was laid out using the previous scrollbar width"
-                );
+                assert_widths(&native, category, dpi);
                 let offset = native.scroll(SB_BOTTOM);
                 let last = native.rect(native.control(2001));
                 let footer = native.rect(native.state.status_label);
@@ -481,10 +511,7 @@ fn native_settings_scroll_extent_tracks_category_instead_of_an_empty_page() {
                 native.state.show_page(3);
                 assert_eq!(native.scroll(SB_ENDSCROLL), expected);
                 assert_eq!(native.rect(native.control(2001)).bottom, last.bottom);
-                assert_eq!(
-                    native.rect(native.control(2039)).right,
-                    host.right - scale(24, dpi)
-                );
+                assert_widths(&native, category, dpi);
                 assert_eq!(settings::text(draft), "[\"127.0.0.1\"]");
             }
         }

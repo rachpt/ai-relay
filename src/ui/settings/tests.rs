@@ -1,8 +1,12 @@
 use super::draft::field_value;
 use super::*;
-use crate::config::Config;
+use crate::{config::Config, windows::Font};
 use windows_sys::Win32::{
-    Graphics::Gdi::ClientToScreen,
+    Foundation::SIZE,
+    Graphics::Gdi::{
+        ClientToScreen, CreateCompatibleDC, DeleteDC, GetTextExtentPoint32W, HDC, HFONT,
+        SelectObject,
+    },
     System::LibraryLoader::GetModuleHandleW,
     UI::Controls::{TCM_GETITEMCOUNT, TCM_GETITEMRECT},
 };
@@ -197,13 +201,16 @@ fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
         .0;
     set_text(token, "synthetic-unsaved-client-token");
     select(settings.theme, 2);
+    let saved = settings.config.clone().unwrap();
+    let draft = settings.draft().unwrap();
+    assert_ne!(draft, saved);
     let appearance = theme::Theme::new(ThemeMode::Light).unwrap();
     // SAFETY: All controls/rectangles belong to this test thread; no State or modal calls.
     unsafe {
         for dpi in [96, 144, 192] {
             choices::apply(settings.category, appearance.kind, appearance.palette, dpi);
             choices::apply(settings.theme, appearance.kind, appearance.palette, dpi);
-            for content_width in [696, 952] {
+            for content_width in [696, 952, 1440, 696] {
                 for category in 0..6 {
                     select(settings.category, category);
                     settings.show_page(3);
@@ -218,7 +225,7 @@ fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
                     assert_eq!(category_rect.top - origin.y, scale(60, dpi));
                     assert_eq!(
                         category_rect.right - category_rect.left,
-                        scale(content_width, dpi)
+                        scale(content_width.min(864), dpi)
                     );
                     assert_eq!(category_rect.bottom - category_rect.top, scale(34, dpi));
                     let controls: Vec<_> = settings
@@ -253,6 +260,8 @@ fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
                     assert_eq!(text(settings.url), "https://draft.invalid/v1");
                     assert_eq!(text(token), "synthetic-unsaved-client-token");
                     assert_eq!(selected(settings.theme), 2);
+                    assert_eq!(settings.draft().unwrap(), draft);
+                    assert_eq!(settings.config.as_ref(), Some(&saved));
                 }
             }
         }
@@ -266,6 +275,117 @@ fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
         settings.show_page(3);
         assert!(visible(settings.category));
         assert_eq!(selected(settings.category), 5);
+    }
+}
+
+fn assert_native_choice_labels_fit(control: HWND, count: usize, dpi: u32) {
+    struct MeasureDc(HDC);
+    impl Drop for MeasureDc {
+        fn drop(&mut self) {
+            // SAFETY: This private DC is released before the test-owned font, even on panic.
+            unsafe { DeleteDC(self.0) };
+        }
+    }
+    // SAFETY: The test owns this live Tab and its font; buffers match the native
+    // messages' contracts. The private DC borrows the font only until cleanup.
+    unsafe {
+        let mut bounds = RECT::default();
+        assert_ne!(GetClientRect(control, &mut bounds), 0);
+        assert_eq!(
+            SendMessageW(control, TCM_GETITEMCOUNT, 0, 0),
+            count as isize
+        );
+        let font = SendMessageW(control, WM_GETFONT, 0, 0) as HFONT;
+        assert!(!font.is_null());
+        let dc = MeasureDc(CreateCompatibleDC(null_mut()));
+        assert!(!dc.0.is_null());
+        let previous = SelectObject(dc.0, font);
+        let mut previous_right = 0;
+        let mut row_top = None;
+        for index in 0..count {
+            let mut item = RECT::default();
+            assert_ne!(
+                SendMessageW(
+                    control,
+                    TCM_GETITEMRECT,
+                    index,
+                    (&mut item as *mut RECT) as LPARAM
+                ),
+                0
+            );
+            assert!(item.left >= previous_right && item.right > item.left);
+            assert!(item.right <= bounds.right);
+            assert!(item.top >= 0 && item.bottom <= bounds.bottom);
+            assert_eq!(*row_top.get_or_insert(item.top), item.top);
+            previous_right = item.right;
+            let length = SendMessageW(control, CB_GETLBTEXTLEN, index, 0);
+            assert!((1..=32).contains(&length));
+            let mut label = vec![0u16; length as usize + 1];
+            assert_eq!(
+                SendMessageW(control, CB_GETLBTEXT, index, label.as_mut_ptr() as LPARAM),
+                length
+            );
+            let mut extent = SIZE::default();
+            assert_ne!(
+                GetTextExtentPoint32W(dc.0, label.as_ptr(), length as i32, &mut extent),
+                0
+            );
+            // Conservative budget for Choices' track, surface and label insets.
+            assert!(
+                extent.cx <= item.right - item.left - scale(8, dpi),
+                "DPI {dpi}, item {index}: label exceeds the segmented text width"
+            );
+            assert!(extent.cy <= item.bottom - item.top - scale(4, dpi));
+        }
+        SelectObject(dc.0, previous);
+    }
+}
+
+#[test]
+fn native_segmented_choices_cap_widths_and_fit_dpi_fonts() {
+    // Fonts outlive the native controls that borrow them, including on assertion failure.
+    let fonts = [96, 120, 144, 192].map(|dpi| (dpi, Font::new(dpi).unwrap()));
+    let mut native = NativeSettings::new();
+    let settings = &mut native.settings;
+    select(settings.category, 5);
+    settings.show_page(3);
+    let appearance = theme::Theme::new(ThemeMode::Light).unwrap();
+    // SAFETY: Hidden, test-owned controls; all layout/font queries stay on this thread.
+    unsafe {
+        for (dpi, font) in &fonts {
+            let dpi = *dpi;
+            settings.set_font(font.0);
+            for control in [settings.category, settings.theme] {
+                choices::apply(control, appearance.kind, appearance.palette, dpi);
+            }
+            // Sub-minimum form widths exercise the theme's shrink path in isolation;
+            // the full form's supported narrow width is covered by the category test.
+            for content_width in [576, 611, 612, 613, 863, 864, 865, 1440, 576] {
+                settings.layout(dpi, scale(content_width, dpi), scale(820, dpi));
+                let mut origin = windows_sys::Win32::Foundation::POINT::default();
+                assert_ne!(ClientToScreen(native.parent, &mut origin), 0);
+                let form = native_rect(settings.url);
+                assert_eq!(form.left - origin.x, scale(180, dpi));
+                assert_eq!(form.right - origin.x, scale(24 + content_width, dpi));
+                for (control, x, y, cap, height, count) in [
+                    (settings.category, 24, 60, 864, 34, 6),
+                    (settings.theme, 180, 118, 456, 32, 3),
+                ] {
+                    let rect = native_rect(control);
+                    assert!(visible(control));
+                    assert_eq!(rect.left - origin.x, scale(x, dpi));
+                    assert_eq!(rect.top - origin.y, scale(y, dpi));
+                    assert_eq!(
+                        rect.right - rect.left,
+                        (scale(content_width, dpi) - scale(x - 24, dpi))
+                            .max(1)
+                            .min(scale(cap, dpi))
+                    );
+                    assert_eq!(rect.bottom - rect.top, scale(height, dpi));
+                    assert_native_choice_labels_fit(control, count, dpi);
+                }
+            }
+        }
     }
 }
 

@@ -40,6 +40,8 @@
 
 - [0019：明暗视觉层级与原生导航展示隔离](0019-fluent-presentation-tokens.md)
 
+- [0020：概览有界整帧呈现与月历宿主边沿](0020-bounded-dashboard-popup-chrome.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

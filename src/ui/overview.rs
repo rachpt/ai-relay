@@ -31,6 +31,8 @@ pub(super) struct Overview {
     directory: HWND,
     snapshot: Option<OverviewSnapshot>,
     rendered: String,
+    header: String,
+    description: String,
     dirty: bool,
 }
 impl Overview {
@@ -83,6 +85,9 @@ impl Overview {
                 );
                 if target.is_null() {
                     return Err(last_error("创建概览控件"));
+                }
+                if id == overview_dashboard::CONTROL_ID {
+                    overview_dashboard::attach(*target)?;
                 }
             }
         }
@@ -164,8 +169,16 @@ impl Overview {
         }
         // Precise dashboard values/rates must not depend on the legacy summary's
         // rounded byte display or whole-second uptime deduplication.
-        settings::set_text(self.summary, &format_header(snapshot));
-        settings::set_text(self.dashboard, &self.timeline.description());
+        let header = format_header(snapshot);
+        if header != self.header {
+            settings::set_text(self.summary, &header);
+            self.header = header;
+        }
+        let description = self.timeline.description();
+        if description != self.description {
+            settings::set_text(self.dashboard, &description);
+            self.description = description;
+        }
         // SAFETY: Queue drawing only while this page is visible; no I/O or
         // controller lock is acquired by the subsequent paint callback.
         unsafe {

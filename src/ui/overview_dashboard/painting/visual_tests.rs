@@ -297,6 +297,185 @@ fn cards_and_system_color_patterns_paint_without_color_only_distinctions() {
 }
 
 #[test]
+fn short_constant_contrast_series_retains_visible_square_samples() {
+    let target = Target::new();
+    let font = Font::new(96).unwrap();
+    let heading = Font::heading(96).unwrap();
+    let p = palette(Resolved::Contrast);
+    let mut timeline = Timeline::default();
+    for second in 0..=120 {
+        timeline.record(&ProxyMetricsSnapshot {
+            uptime: Duration::from_secs(second),
+            total_requests: second * 5,
+            errors: second * 3,
+            ..Default::default()
+        });
+    }
+    // SAFETY: Only a private memory bitmap is painted. At this width each
+    // one-second segment is four pixels; eight-way native dashes may degenerate.
+    unsafe {
+        let level = SaveDC(target.dc);
+        let _saved = SavedDc {
+            dc: target.dc,
+            level,
+        };
+        SelectObject(target.dc, GetStockObject(DC_PEN));
+        SelectObject(target.dc, GetStockObject(DC_BRUSH));
+        SetBkMode(target.dc, TRANSPARENT as i32);
+        let canvas = Canvas {
+            dc: target.dc,
+            font: font.0,
+            heading: heading.0,
+            dpi: 96,
+            palette: p,
+            kind: Resolved::Contrast,
+            colors: PaintColors::new(p, Resolved::Contrast),
+        };
+        let panel = RECT {
+            left: 0,
+            top: 0,
+            right: 560,
+            bottom: 300,
+        };
+        let layout = ChartLayout::new(panel, 96, [50; 2], 112, false);
+        assert_eq!(layout.plot.right - layout.plot.left, 480);
+        canvas.chart(panel, &timeline, false, true);
+        let x = layout.plot.left + 240;
+        let axis = RateScale::new(5.0, false);
+        let y = layout.plot.bottom
+            - ((layout.plot.bottom - layout.plot.top) as f64 * 3.0 / axis.maximum).round() as i32;
+        assert_eq!(GetPixel(target.dc, x - 2, y), p.text);
+        assert_eq!(GetPixel(target.dc, x, y), p.surface);
+    }
+}
+
+unsafe fn pixels(target: &Target) -> Vec<u32> {
+    // SAFETY: Temporarily deselect the test-owned bitmap for GetDIBits, then
+    // restore it. The writable buffer exactly matches the requested 32-bit DIB.
+    unsafe {
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = 1600;
+        info.bmiHeader.biHeight = -900;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        let mut pixels = vec![0_u32; 1600 * 900];
+        SelectObject(target.dc, target.previous);
+        let rows = GetDIBits(
+            target.dc,
+            target.bitmap,
+            0,
+            900,
+            pixels.as_mut_ptr().cast(),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        SelectObject(target.dc, target.bitmap);
+        assert_eq!(rows, 900);
+        for pixel in &mut pixels {
+            *pixel &= 0x00ff_ffff;
+        }
+        pixels
+    }
+}
+
+#[test]
+fn buffered_frame_matches_direct_pixels_with_offsets_clipping_and_bounded_allocation() {
+    let buffered = Target::new();
+    let direct = Target::new();
+    let mut timeline = Timeline::default();
+    timeline.record(&ProxyMetricsSnapshot::default());
+    let snapshot = OverviewSnapshot {
+        metrics: ProxyMetricsSnapshot {
+            uptime: Duration::from_secs(1),
+            total_requests: 12,
+            errors: 3,
+            upload_body_bytes: 134_554,
+            download_body_bytes: 6 * 1024 * 1024,
+            ..Default::default()
+        },
+        running: true,
+        listen: None,
+        upstream: None,
+    };
+    timeline.record(&snapshot.metrics);
+    // SAFETY: Isolated memory DCs, stock objects, and borrowed test fonts. No
+    // window/desktop access; pixel equality includes outside-clip sentinels.
+    unsafe {
+        let count = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+        assert!(Frame::new(buffered.dc, 0, 1).is_none());
+        assert!(Frame::new(buffered.dc, 1, -1).is_none());
+        assert!(Frame::new(buffered.dc, i32::MAX, i32::MAX).is_none());
+        assert_eq!(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS), count);
+        for dpi in [96, 192] {
+            let font = Font::new(dpi).unwrap();
+            let heading = Font::heading(dpi).unwrap();
+            for kind in [Resolved::Light, Resolved::Dark, Resolved::Contrast] {
+                for target in [&buffered, &direct] {
+                    SelectClipRgn(target.dc, std::ptr::null_mut());
+                    SetWindowOrgEx(target.dc, 0, 0, std::ptr::null_mut());
+                    SetViewportOrgEx(target.dc, 0, 0, std::ptr::null_mut());
+                    SetDCBrushColor(target.dc, 0xdc00dc);
+                    FillRect(
+                        target.dc,
+                        &RECT {
+                            left: 0,
+                            top: 0,
+                            right: 1600,
+                            bottom: 900,
+                        },
+                        GetStockObject(DC_BRUSH),
+                    );
+                    SetWindowOrgEx(target.dc, 2, 3, std::ptr::null_mut());
+                    SetViewportOrgEx(target.dc, 5, 7, std::ptr::null_mut());
+                    IntersectClipRect(target.dc, 17, 19, 1300, 680);
+                }
+                let item = DRAWITEMSTRUCT {
+                    hDC: buffered.dc,
+                    rcItem: RECT {
+                        left: 11,
+                        top: 13,
+                        right: 11 + scale(MIN_WIDTH_DIP, dpi),
+                        bottom: 13 + scale(MIN_HEIGHT_DIP, dpi),
+                    },
+                    ..Default::default()
+                };
+                draw(
+                    &item,
+                    dpi,
+                    font.0,
+                    heading.0,
+                    palette(kind),
+                    kind,
+                    Some(&snapshot),
+                    &timeline,
+                );
+                assert!(paint(
+                    &DRAWITEMSTRUCT {
+                        hDC: direct.dc,
+                        ..item
+                    },
+                    dpi,
+                    font.0,
+                    heading.0,
+                    palette(kind),
+                    kind,
+                    Some(&snapshot),
+                    &timeline
+                ));
+                GdiFlush();
+                assert_eq!(
+                    pixels(&buffered),
+                    pixels(&direct),
+                    "buffered offset/clip mismatch {kind:?} dpi={dpi}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn full_dashboard_and_tiny_fallback_restore_dc_and_gdi_resources() {
     let target = Target::new();
     let metrics = ProxyMetricsSnapshot {

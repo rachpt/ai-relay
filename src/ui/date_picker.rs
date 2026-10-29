@@ -6,7 +6,8 @@
 //!
 //! Dark presentation tints the themed picker and uses native classic calendar
 //! colors, including direct navigation animation paths. Native font/minimum and
-//! popup-host sizing preserve the full grid/footer; light/contrast restore themes.
+//! popup-host sizing preserve the full grid/footer. Local popup chrome adapts
+//! only native outer borders/gutters; navigation and styles remain untouched.
 #![cfg(windows)]
 
 use super::theme::{Palette, Resolved};
@@ -19,6 +20,7 @@ use windows_sys::Win32::{
     UI::{Controls::*, WindowsAndMessaging::*},
 };
 
+mod popup;
 mod tint;
 
 const PROPERTY: &[u16] = &[
@@ -317,6 +319,10 @@ unsafe fn popup_colors(hwnd: HWND) {
     // SAFETY: caller supplies this live owner-thread picker. Scalars and borrowed
     // native font handles only; the control owns its ephemeral month calendar.
     unsafe {
+        let owner = GetPropW(hwnd, PROPERTY.as_ptr()) as *const Settings;
+        if owner.is_null() {
+            return;
+        }
         let value = appearance(hwnd);
         let dark = value.filter(|value| value.kind == Resolved::Dark && !high_contrast());
 
@@ -327,6 +333,18 @@ unsafe fn popup_colors(hwnd: HWND) {
             // than tinting only WM_PAINT/PRINT and leaving its final frame white.
             if let Some(value) = value {
                 tint::apply(calendar, Resolved::Light, value.palette);
+            }
+            if dark.is_none()
+                && let Some(value) = value
+            {
+                // Remove only local border presentation before restoring the
+                // native light/contrast theme. No control styles were changed.
+                popup::apply(calendar, Resolved::Light, value.palette);
+                if GetPropW(hwnd, PROPERTY.as_ptr()) as *const Settings != owner
+                    || SendMessageW(hwnd, DTM_GETMONTHCAL, 0, 0) as HWND != calendar
+                {
+                    return;
+                }
             }
             let empty = [0u16];
             let theme = if dark.is_some() {
@@ -412,6 +430,14 @@ unsafe fn popup_colors(hwnd: HWND) {
                 );
                 fit_popup_host(calendar);
             }
+            if let Some(value) = dark {
+                popup::apply(calendar, value.kind, value.palette);
+                if GetPropW(hwnd, PROPERTY.as_ptr()) as *const Settings != owner
+                    || SendMessageW(hwnd, DTM_GETMONTHCAL, 0, 0) as HWND != calendar
+                {
+                    return;
+                }
+            }
             RedrawWindow(
                 calendar,
                 null(),
@@ -428,19 +454,9 @@ unsafe fn fit_popup_host(calendar: HWND) {
     // Resizing just the child leaves its last columns/footer clipped by the
     // smaller themed host after switching the calendar renderer or DPI font.
     unsafe {
-        if GetWindowLongPtrW(calendar, GWL_STYLE) as u32 & WS_CHILD == 0 {
+        let Some(host) = popup::native_host(calendar) else {
             return;
-        }
-        let host = GetParent(calendar);
-        let mut class = [0u16; 32];
-        let count = GetClassNameW(host, class.as_mut_ptr(), class.len() as i32);
-        if count <= 0
-            || !String::from_utf16_lossy(&class[..count as usize]).eq_ignore_ascii_case("DropDown")
-            || GetWindowThreadProcessId(host, std::ptr::null_mut()) != GetCurrentThreadId()
-            || GetWindowLongPtrW(host, GWL_STYLE) as u32 & WS_POPUP == 0
-        {
-            return;
-        }
+        };
         let mut child = RECT::default();
         let mut outer = RECT::default();
         let mut client = RECT::default();
