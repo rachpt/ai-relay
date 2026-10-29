@@ -69,6 +69,40 @@ fn status_kind(text: &str) -> StatusKind {
     }
 }
 
+#[derive(Clone, Copy)]
+struct StatusColors {
+    icon: u32,
+    badge: u32,
+    text: u32,
+    detail: u32,
+}
+
+fn colors(status: StatusKind, kind: theme::Resolved, palette: theme::Palette) -> StatusColors {
+    if kind == theme::Resolved::Contrast {
+        return StatusColors {
+            icon: palette.text,
+            badge: palette.background,
+            text: palette.text,
+            detail: palette.text,
+        };
+    }
+    let icon = match (status, kind) {
+        (StatusKind::Error, theme::Resolved::Light) => 0x001c2bc4,
+        (StatusKind::Error, _) => 0x00a499ff,
+        (StatusKind::Busy, theme::Resolved::Light) => 0x0000528a,
+        (StatusKind::Busy, _) => 0x0000e1fc,
+        (StatusKind::Running, theme::Resolved::Light) => 0x000f6b0f,
+        (StatusKind::Running, _) => 0x005fcb6c,
+        (StatusKind::Stopped, _) => palette.disabled,
+    };
+    StatusColors {
+        icon,
+        badge: theme::blend(palette.background, icon, 8),
+        text: palette.text,
+        detail: palette.disabled,
+    }
+}
+
 fn bounds(width: i32, height: i32, dpi: u32) -> RECT {
     RECT {
         left: 0,
@@ -325,7 +359,6 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
         }
         let dpi = (*state).dpi;
         let palette = (*state).theme.palette;
-        let contrast = (*state).theme.kind == theme::Resolved::Contrast;
         let background = palette.background;
         let mut rect = RECT::default();
         GetClientRect(hwnd, &mut rect);
@@ -344,31 +377,18 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
         SetBkMode(dc, TRANSPARENT as i32);
         let text = settings::text(hwnd);
         let (status, message) = lines(&text);
-        let padding = scale(12, dpi);
+        let padding = scale(24, dpi);
         let icon_size = scale(16, dpi);
         let icon_top = rect.top + ((rect.bottom - rect.top - icon_size) / 2).max(0);
-        // COLORREF is BGR; text shades also remain legible on each theme's surface.
-        let ink = if contrast {
-            palette.text
-        } else {
-            match (status_kind(status), (*state).theme.kind) {
-                (StatusKind::Error, theme::Resolved::Light) => 0x001823b4,
-                (StatusKind::Error, _) => 0x00959bff,
-                (StatusKind::Busy, theme::Resolved::Light) => 0x0000588a,
-                (StatusKind::Busy, _) => 0x0078d0ff,
-                (StatusKind::Running, theme::Resolved::Light) => 0x003c7316,
-                (StatusKind::Running, _) => 0x009bd672,
-                (StatusKind::Stopped, _) => palette.disabled,
-            }
-        };
+        let colors = colors(status_kind(status), (*state).theme.kind, palette);
         status_icon(
             dc,
             padding,
             icon_top,
             icon_size,
             status_kind(status),
-            ink,
-            background,
+            colors.icon,
+            colors.badge,
         );
         let text_left = padding + icon_size + scale(8, dpi);
         let text_right = (rect.right - padding).max(text_left);
@@ -402,7 +422,7 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
             top: rect.top,
             bottom: rect.bottom,
         };
-        SetTextColor(dc, ink);
+        SetTextColor(dc, colors.text);
         DrawTextW(dc, wide(status).as_ptr(), -1, &mut top, flags);
         if !message.is_empty() {
             let separator = text_left + status_width + scale(8, dpi);
@@ -412,8 +432,8 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
                     let line = RECT {
                         left: separator,
                         right: separator + scale(1, dpi),
-                        top: rect.top + scale(10, dpi),
-                        bottom: rect.bottom - scale(10, dpi),
+                        top: rect.top + scale(12, dpi),
+                        bottom: rect.bottom - scale(12, dpi),
                     };
                     SetDCBrushColor(dc, palette.border);
                     FillRect(dc, &line, brush);
@@ -424,14 +444,7 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
                     top: rect.top,
                     bottom: rect.bottom,
                 };
-                SetTextColor(
-                    dc,
-                    if contrast {
-                        palette.text
-                    } else {
-                        palette.disabled
-                    },
-                );
+                SetTextColor(dc, colors.detail);
                 DrawTextW(dc, wide(&message).as_ptr(), -1, &mut detail, flags);
             }
         }
@@ -503,6 +516,56 @@ mod tests {
         assert_eq!(status_kind("代理启动中\r\n失败"), StatusKind::Busy);
     }
 
+    fn contrast(a: u32, b: u32) -> f64 {
+        let luminance = |color: u32| {
+            [0.2126, 0.7152, 0.0722]
+                .into_iter()
+                .enumerate()
+                .map(|(index, weight)| {
+                    let channel = f64::from((color >> (index * 8)) & 255) / 255.0;
+                    weight
+                        * if channel <= 0.04045 {
+                            channel / 12.92
+                        } else {
+                            ((channel + 0.055) / 1.055).powf(2.4)
+                        }
+                })
+                .sum::<f64>()
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn status_colors_keep_semantics_in_icons_without_tinting_status_text() {
+        for mode in [
+            crate::config::ThemeMode::Light,
+            crate::config::ThemeMode::Dark,
+        ] {
+            let theme = theme::Theme::new(mode).unwrap();
+            for status in [
+                StatusKind::Error,
+                StatusKind::Busy,
+                StatusKind::Running,
+                StatusKind::Stopped,
+            ] {
+                let colors = colors(status, theme.kind, theme.palette);
+                assert_eq!(colors.text, theme.palette.text);
+                assert!(contrast(colors.text, theme.palette.background) >= 4.5);
+                assert!(contrast(colors.detail, theme.palette.background) >= 4.5);
+                assert!(contrast(colors.icon, colors.badge) >= 3.0);
+                if theme.kind != theme::Resolved::Contrast {
+                    assert_ne!(colors.icon, colors.text);
+                    assert_ne!(colors.badge, theme.palette.background);
+                }
+            }
+            let colors = colors(StatusKind::Error, theme::Resolved::Contrast, theme.palette);
+            assert_eq!(colors.icon, theme.palette.text);
+            assert_eq!(colors.badge, theme.palette.background);
+            assert_eq!(colors.detail, theme.palette.text);
+        }
+    }
+
     #[test]
     fn docked_bounds_fit_client_at_common_dpi() {
         for dpi in [96, 144, 192] {
@@ -519,3 +582,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod paint_tests;

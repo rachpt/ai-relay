@@ -53,6 +53,8 @@ struct Appearance {
     palette: Palette,
     dpi: u32,
     hover: bool,
+    pointer: Option<(i32, i32)>,
+    press_origin: Option<(i32, i32)>,
 }
 
 fn px(value: i32, dpi: u32) -> i32 {
@@ -115,7 +117,10 @@ unsafe fn attach(hwnd: HWND, mut value: Appearance) {
         let mut data = 0;
         if GetWindowSubclass(hwnd, Some(procedure), SUBCLASS_ID, &mut data) != 0 {
             if data != 0 {
-                value.hover = (*(data as *const Appearance)).hover;
+                let previous = *(data as *const Appearance);
+                value.hover = previous.hover;
+                value.pointer = previous.pointer;
+                value.press_origin = previous.press_origin;
                 *(data as *mut Appearance) = value;
             }
             return;
@@ -168,6 +173,8 @@ pub(super) unsafe fn apply(hwnd: HWND, kind: Resolved, palette: Palette, dpi: u3
                     palette,
                     dpi,
                     hover: false,
+                    pointer: None,
+                    press_origin: None,
                 },
             );
         } else {
@@ -285,7 +292,7 @@ fn row_background(p: Palette, row: usize, selected: bool, hot: bool, enabled: bo
     } else if hot && enabled {
         p.hover()
     } else if row & 1 != 0 {
-        blend(p.surface, p.subtle(), 50)
+        blend(p.surface, p.background, 40)
     } else {
         p.surface
     }
@@ -325,10 +332,40 @@ unsafe fn fill(dc: HDC, rect: &RECT, color: u32) {
     }
 }
 
+fn chevron_points(rect: RECT, dpi: u32, up: bool) -> Option<[POINT; 3]> {
+    let width = (rect.right - rect.left).max(0);
+    let height = (rect.bottom - rect.top).max(0);
+    if width < 3 || height < 3 {
+        return None;
+    }
+    let x = rect.left + width / 2;
+    let y = rect.top + height / 2;
+    let radius = px(4, dpi).min((width - 1) / 2).min(height - 1);
+    let rise = (radius / 2).max(1).min((height - 1) / 2);
+    let direction = if up { -1 } else { 1 };
+    Some([
+        POINT {
+            x: x - radius,
+            y: y - direction * rise,
+        },
+        POINT {
+            x,
+            y: y + direction * rise,
+        },
+        POINT {
+            x: x + radius,
+            y: y - direction * rise,
+        },
+    ])
+}
+
 unsafe fn chevron(dc: HDC, rect: &RECT, color: u32, dpi: u32, up: bool) {
     // SAFETY: all coordinates are scalar. The nested DC guard deselects the pen
     // before Pen::drop, including early returns, without deleting stock objects.
     unsafe {
+        let Some(points) = chevron_points(*rect, dpi, up) else {
+            return;
+        };
         let raw = CreatePen(PS_SOLID, px(1, dpi), color);
         if raw.is_null() {
             return;
@@ -338,24 +375,7 @@ unsafe fn chevron(dc: HDC, rect: &RECT, color: u32, dpi: u32, up: bool) {
             return;
         };
         SelectObject(dc, pen.0 as HGDIOBJ);
-        let x = (rect.left + rect.right) / 2;
-        let y = (rect.top + rect.bottom) / 2;
-        let radius = px(4, dpi).min((rect.right - rect.left).max(0) / 3);
-        let offset = if up { -1 } else { 1 };
-        let points = [
-            POINT {
-                x: x - radius,
-                y: y - offset * radius / 2,
-            },
-            POINT {
-                x,
-                y: y + offset * radius / 2,
-            },
-            POINT {
-                x: x + radius,
-                y: y - offset * radius / 2,
-            },
-        ];
+        IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
         Polyline(dc, points.as_ptr(), points.len() as i32);
     }
 }
@@ -404,9 +424,21 @@ fn combo_rects(client: RECT, dpi: u32) -> (RECT, RECT) {
     (text, arrow)
 }
 
+fn indicator_ink(p: Palette, enabled: bool) -> u32 {
+    if enabled {
+        blend(p.text, p.disabled, 35)
+    } else {
+        blend(p.subtle(), p.disabled, 65)
+    }
+}
+
 fn combo_colors(p: Palette, enabled: bool, hover: bool, active: bool) -> (u32, u32, u32) {
     if !enabled {
-        return (p.subtle(), blend(p.subtle(), p.border, 60), p.disabled);
+        return (
+            p.subtle(),
+            blend(p.subtle(), p.border, 60),
+            indicator_ink(p, false),
+        );
     }
     let surface = if hover || active {
         blend(p.surface, p.hover(), 60)
@@ -414,18 +446,13 @@ fn combo_colors(p: Palette, enabled: bool, hover: bool, active: bool) -> (u32, u
         p.surface
     };
     let border = if active {
-        blend(p.border, p.accent, 80)
+        p.accent
     } else if hover {
-        blend(p.border, p.accent, 35)
+        blend(p.border, p.disabled, 20)
     } else {
         blend(p.surface, p.border, 85)
     };
-    let arrow = if active || hover {
-        blend(p.disabled, p.accent, 65)
-    } else {
-        p.disabled
-    };
-    (surface, border, arrow)
+    (surface, border, indicator_ink(p, true))
 }
 
 unsafe fn draw_combo(hwnd: HWND, dc: HDC, value: Appearance) {
@@ -446,7 +473,7 @@ unsafe fn draw_combo(hwnd: HWND, dc: HDC, value: Appearance) {
         let enabled = IsWindowEnabled(hwnd) != 0;
         let ink = if enabled { p.text } else { p.disabled };
         let focused = enabled && GetFocus() == hwnd;
-        let opened = SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0;
+        let opened = enabled && SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0;
         let (surface, border, arrow_ink) = combo_colors(p, enabled, value.hover, focused || opened);
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         // Owner-drawn combos may display icons/arbitrary application content.
@@ -472,6 +499,7 @@ unsafe fn draw_combo(hwnd: HWND, dc: HDC, value: Appearance) {
                 let inset = px(3, value.dpi);
                 InflateRect(&mut focus, -inset, -inset);
                 if focus.right > focus.left && focus.bottom > focus.top {
+                    SetBkColor(dc, surface);
                     DrawFocusRect(dc, &focus);
                 }
             }
@@ -500,8 +528,9 @@ fn switch_rects(client: RECT, dpi: u32, checked: bool, right: bool) -> (RECT, RE
         right: left + width,
         bottom: top + height,
     };
-    let inset = px(3, dpi).min(height / 3);
-    let diameter = (height - 2 * inset).max(0);
+    let inset = px(3, dpi).min(height / 3).min(width / 3);
+    let diameter = (height - 2 * inset).min(width - 2 * inset).max(0);
+    let knob_top = top + (height - diameter) / 2;
     let knob_left = if checked {
         track.right - inset - diameter
     } else {
@@ -509,9 +538,9 @@ fn switch_rects(client: RECT, dpi: u32, checked: bool, right: bool) -> (RECT, RE
     };
     let knob = RECT {
         left: knob_left,
-        top: top + inset,
+        top: knob_top,
         right: knob_left + diameter,
-        bottom: top + inset + diameter,
+        bottom: knob_top + diameter,
     };
     let mut label = client;
     if right {
@@ -529,29 +558,46 @@ fn switch_colors(
     hover: bool,
     pressed: bool,
 ) -> (u32, u32, u32) {
-    let (mut track, mut border, mut knob) = if checked {
-        (p.accent, p.accent, p.on_accent())
-    } else {
-        (
-            blend(p.subtle(), p.border, 30),
-            blend(p.subtle(), p.border, 65),
-            p.disabled,
-        )
-    };
     if !enabled {
-        track = blend(p.subtle(), track, 40);
-        border = blend(track, p.border, 40);
-        knob = blend(track, knob, 65);
-    } else if hover || pressed {
-        if checked {
-            track = blend(track, p.on_accent(), if pressed { 15 } else { 8 });
-            border = track;
-        } else {
-            track = blend(track, p.disabled, if pressed { 20 } else { 10 });
-            border = blend(border, p.disabled, 35);
-        }
+        // Keep the stored check direction, but do not suggest an enabled accent action.
+        let track = blend(
+            blend(p.subtle(), p.background, 40),
+            p.disabled,
+            if checked { 12 } else { 0 },
+        );
+        return (
+            track,
+            blend(track, p.border, 60),
+            blend(track, p.disabled, 65),
+        );
     }
-    (track, border, knob)
+    if checked {
+        let track = blend(
+            p.accent,
+            p.text,
+            if pressed {
+                12
+            } else if hover {
+                6
+            } else {
+                0
+            },
+        );
+        (track, track, p.on_accent())
+    } else {
+        let track = blend(
+            p.subtle(),
+            p.disabled,
+            if pressed {
+                10
+            } else if hover {
+                5
+            } else {
+                0
+            },
+        );
+        (track, blend(p.border, p.disabled, 70), p.disabled)
+    }
 }
 
 unsafe fn draw_switch(hwnd: HWND, dc: HDC, value: Appearance) {
@@ -616,7 +662,141 @@ unsafe fn draw_switch(hwnd: HWND, dc: HDC, value: Appearance) {
         if enabled && GetFocus() == hwnd && ui & UISF_HIDEFOCUS == 0 {
             let mut focus = client;
             InflateRect(&mut focus, -1, -1);
-            DrawFocusRect(dc, &focus);
+            if focus.right > focus.left && focus.bottom > focus.top {
+                SetBkColor(dc, p.background);
+                DrawFocusRect(dc, &focus);
+            }
+        }
+    }
+}
+
+unsafe fn header_enabled(hwnd: HWND) -> bool {
+    // SAFETY: Owner-thread native Header. These queries inspect opaque live HWNDs
+    // without callbacks. A disabled ListView does not set WS_DISABLED on its Header.
+    unsafe {
+        let parent = GetParent(hwnd);
+        IsWindowEnabled(hwnd) != 0 && (parent.is_null() || IsWindowEnabled(parent) != 0)
+    }
+}
+
+fn header_colors(p: Palette, enabled: bool, hot: bool, pressed: bool) -> (u32, u32) {
+    let surface = if enabled && pressed {
+        blend(p.subtle(), p.text, 8)
+    } else if enabled && hot {
+        blend(p.subtle(), p.text, 4)
+    } else {
+        p.subtle()
+    };
+    (
+        surface,
+        if enabled {
+            blend(p.text, p.disabled, 35)
+        } else {
+            p.disabled
+        },
+    )
+}
+
+fn header_states(
+    rect: RECT,
+    dpi: u32,
+    enabled: bool,
+    pointer: Option<(i32, i32)>,
+    press_origin: Option<(i32, i32)>,
+) -> (bool, bool) {
+    // Do not present a column-resize divider as a pressed sort button. This
+    // affects artwork only; native Header hit testing still owns every action.
+    let margin = px(3, dpi);
+    let contains = |(x, y)| {
+        x >= rect.left + margin && x < rect.right - margin && y >= rect.top && y < rect.bottom
+    };
+    let hot = enabled && pointer.is_some_and(contains);
+    (hot, hot && press_origin.is_some_and(contains))
+}
+
+fn header_divider(rect: RECT, client: RECT, dpi: u32) -> Option<RECT> {
+    let inset = px(8, dpi).min((rect.bottom - rect.top).max(0) / 3);
+    (rect.right > client.left
+        && rect.right < client.right
+        && rect.bottom - inset > rect.top + inset)
+        .then_some(RECT {
+            left: rect.right - 1,
+            right: rect.right,
+            top: rect.top + inset,
+            bottom: rect.bottom - inset,
+        })
+}
+
+unsafe fn header_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) {
+    // SAFETY: Owner-thread Header. TrackMouseEvent runs before the fresh subclass
+    // lookup; no pointer into its Box crosses tracking, invalidation or forwarding.
+    unsafe {
+        if !matches!(
+            message,
+            WM_MOUSEMOVE
+                | WM_MOUSELEAVE
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONDBLCLK
+                | WM_LBUTTONUP
+                | WM_CAPTURECHANGED
+                | WM_CANCELMODE
+                | WM_ENABLE
+                | WM_SHOWWINDOW
+        ) {
+            return;
+        }
+        let enabled = header_enabled(hwnd);
+        if message == WM_MOUSEMOVE && enabled && appearance(hwnd).is_some_and(|v| !v.hover) {
+            let mut event = MouseTracking {
+                size: size_of::<MouseTracking>() as u32,
+                flags: TRACK_MOUSE_LEAVE,
+                hwnd,
+                hover_time: 0,
+            };
+            if TrackMouseEvent(&mut event) == 0 {
+                return;
+            }
+        }
+        let mut data = 0;
+        if GetWindowSubclass(hwnd, Some(procedure), SUBCLASS_ID, &mut data) == 0 || data == 0 {
+            return;
+        }
+        let before = *(data as *const Appearance);
+        if before.control != Control::Header || before.kind == Resolved::Contrast {
+            return;
+        }
+        let mut value = before;
+        let point = (
+            l as u16 as i16 as i32,
+            (l as u32 >> 16) as u16 as i16 as i32,
+        );
+        match message {
+            WM_MOUSEMOVE if enabled => {
+                value.pointer = Some(point);
+                value.hover = true;
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if enabled => {
+                value.pointer = Some(point);
+                value.press_origin = Some(point);
+            }
+            WM_LBUTTONUP => value.press_origin = None,
+            WM_MOUSELEAVE => {
+                value.pointer = None;
+                value.hover = false;
+            }
+            WM_CANCELMODE | WM_CAPTURECHANGED => value.press_origin = None,
+            WM_ENABLE | WM_SHOWWINDOW if w == 0 => {
+                value.pointer = None;
+                value.press_origin = None;
+                value.hover = false;
+            }
+            _ => {}
+        }
+        if (value.hover, value.pointer, value.press_origin)
+            != (before.hover, before.pointer, before.press_origin)
+        {
+            *(data as *mut Appearance) = value;
+            InvalidateRect(hwnd, null(), 0);
         }
     }
 }
@@ -633,14 +813,16 @@ unsafe fn draw_header(hwnd: HWND, dc: HDC, value: Appearance) {
         GetClientRect(hwnd, &mut client);
         fill(dc, &client, p.subtle());
         font(hwnd, dc);
-        SetTextColor(
-            dc,
-            if IsWindowEnabled(hwnd) != 0 {
-                p.text
-            } else {
-                p.disabled
-            },
-        );
+        let enabled = header_enabled(hwnd);
+        let buttons = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & HDS_BUTTONS != 0;
+        let show_focus = enabled
+            && GetFocus() == hwnd
+            && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) as u32 & UISF_HIDEFOCUS == 0;
+        let focused = if show_focus {
+            SendMessageW(hwnd, HDM_GETFOCUSEDITEM, 0, 0)
+        } else {
+            -1
+        };
         let count = SendMessageW(hwnd, HDM_GETITEMCOUNT, 0, 0).clamp(0, 4096);
         for index in 0..count {
             let mut rect = RECT::default();
@@ -675,6 +857,18 @@ unsafe fn draw_header(hwnd: HWND, dc: HDC, value: Appearance) {
                 continue;
             };
             IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
+            let (hot, pressed) = header_states(
+                rect,
+                value.dpi,
+                enabled && buttons,
+                value.pointer,
+                value.press_origin,
+            );
+            let (surface, ink) = header_colors(p, enabled, hot, pressed);
+            if hot || pressed {
+                fill(dc, &rect, surface);
+            }
+            SetTextColor(dc, ink);
             let mut text = rect;
             text.left += px(10, value.dpi);
             text.right = (text.right - px(10, value.dpi)).max(text.left);
@@ -683,12 +877,13 @@ unsafe fn draw_header(hwnd: HWND, dc: HDC, value: Appearance) {
                     left: (text.right - px(16, value.dpi)).max(text.left),
                     ..text
                 };
-                let ink = if IsWindowEnabled(hwnd) != 0 {
-                    blend(p.disabled, p.accent, 60)
-                } else {
-                    p.disabled
-                };
-                chevron(dc, &arrow, ink, value.dpi, item.fmt & HDF_SORTUP != 0);
+                chevron(
+                    dc,
+                    &arrow,
+                    indicator_ink(p, enabled),
+                    value.dpi,
+                    item.fmt & HDF_SORTUP != 0,
+                );
                 text.right = arrow.left;
             }
             let length = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
@@ -704,6 +899,18 @@ unsafe fn draw_header(hwnd: HWND, dc: HDC, value: Appearance) {
                 &mut text,
                 align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
+            if let Some(divider) = header_divider(rect, client, value.dpi) {
+                fill(dc, &divider, blend(p.subtle(), p.border, 65));
+            }
+            if focused == index {
+                let mut focus = rect;
+                let inset = px(3, value.dpi);
+                InflateRect(&mut focus, -inset, -inset);
+                if focus.right > focus.left && focus.bottom > focus.top {
+                    SetBkColor(dc, surface);
+                    DrawFocusRect(dc, &focus);
+                }
+            }
         }
         let line = RECT {
             top: (client.bottom - 1).max(client.top),
@@ -735,6 +942,18 @@ unsafe extern "system" fn procedure(
         if value.kind == Resolved::Contrast {
             return DefSubclassProc(hwnd, message, w, l);
         }
+        if message == WM_PRINT {
+            // WM_PRINT's caller lends a live DC until dispatch returns. Preserve
+            // the whole native pass, including synchronous child prints; the
+            // guard retains no subclass pointer across detach or destruction.
+            let Some(_saved) = SavedDc::new(w as HDC) else {
+                return 0;
+            };
+            return DefSubclassProc(hwnd, message, w, l);
+        }
+        if value.control == Control::Header {
+            header_input(hwnd, message, w, l);
+        }
         if matches!(value.control, Control::Combo | Control::Switch) {
             if message == WM_MOUSEMOVE && !value.hover && IsWindowEnabled(hwnd) != 0 {
                 let mut tracking = MouseTracking {
@@ -759,8 +978,11 @@ unsafe extern "system" fn procedure(
                 // region. BeginPaint before it would suppress its native painting.
                 // Native PRINTCLIENT can also change the caller's DC; include
                 // it inside the guard rather than saving only our overlay.
-                let _print_dc = if message == WM_PRINTCLIENT && w != 0 {
-                    SavedDc::new(w as HDC)
+                let _print_dc = if message == WM_PRINTCLIENT {
+                    let Some(saved) = SavedDc::new(w as HDC) else {
+                        return 0;
+                    };
+                    Some(saved)
                 } else {
                     None
                 };
@@ -810,6 +1032,13 @@ unsafe extern "system" fn procedure(
         let Some(value) = appearance(hwnd) else {
             return result;
         };
+        if value.control == Control::List && message == WM_ENABLE {
+            let header = SendMessageW(hwnd, LVM_GETHEADER, 0, 0) as HWND;
+            if !header.is_null() {
+                header_input(header, WM_ENABLE, w, l);
+                InvalidateRect(header, null(), 0);
+            }
+        }
         if value.control == Control::List && message == LVM_INSERTCOLUMNW {
             // Some Common Controls versions create their header only on the
             // first column. Apply colors at that point, not just at theme refresh.
@@ -851,25 +1080,25 @@ mod tests {
 
     fn palette() -> Palette {
         Palette {
-            background: 0x24201e,
-            surface: 0x322c29,
-            text: 0xf5f2ee,
-            disabled: 0xb2aaa2,
-            accent: 0xffc078,
-            border: 0x574e47,
-            accent_surface: 0x543e29,
+            background: 0x202020,
+            surface: 0x2b2b2b,
+            text: 0xf5f5f5,
+            disabled: 0xc5c5c5,
+            accent: 0xffcd60,
+            border: 0x454545,
+            accent_surface: 0x473d2d,
         }
     }
 
     fn light_palette() -> Palette {
         Palette {
-            background: 0xffffff,
+            background: 0xf3f3f3,
             surface: 0xffffff,
-            text: 0x262220,
-            disabled: 0x756d66,
-            accent: 0xd77800,
-            border: 0xe3ded9,
-            accent_surface: 0xfcf0e5,
+            text: 0x1a1a1a,
+            disabled: 0x616161,
+            accent: 0xb85f00,
+            border: 0xe0e0e0,
+            accent_surface: 0xf9f2ea,
         }
     }
 
@@ -934,7 +1163,11 @@ mod tests {
             assert_ne!(normal.0, hover.0);
             assert_ne!(normal.1, hover.1);
             assert_ne!(hover.1, focus.1);
-            assert_eq!(combo_colors(p, false, false, false).2, p.disabled);
+            assert_eq!(
+                combo_colors(p, false, false, false).2,
+                indicator_ink(p, false)
+            );
+            assert_ne!(normal.2, combo_colors(p, false, false, false).2);
             assert_eq!(
                 combo_colors(p, false, false, false),
                 combo_colors(p, false, true, true)
@@ -946,9 +1179,12 @@ mod tests {
     fn table_colors_keep_selection_above_hover_and_subtle_stripes() {
         for p in [light_palette(), palette()] {
             assert_eq!(row_background(p, 0, false, false, true), p.surface);
-            let stripe = blend(p.surface, p.subtle(), 50);
+            let stripe = blend(p.surface, p.background, 40);
             assert_eq!(row_background(p, 1, false, false, true), stripe);
             assert_eq!(row_background(p, 3, false, false, true), stripe);
+            assert_ne!(stripe, p.surface);
+            // Stripes recede into the page instead of looking like hovered rows.
+            assert!(luminance(stripe) < luminance(p.surface));
             assert_eq!(row_background(p, 1, false, true, true), p.hover());
             for row in [0, 1] {
                 assert_eq!(row_background(p, row, true, false, true), p.accent_surface);
@@ -961,6 +1197,210 @@ mod tests {
                     row_background(p, row, false, true, false),
                     row_background(p, row, false, false, false)
                 );
+            }
+        }
+    }
+
+    fn luminance(color: u32) -> f64 {
+        [0.2126, 0.7152, 0.0722]
+            .into_iter()
+            .enumerate()
+            .map(|(index, weight)| {
+                let channel = f64::from(color >> (index * 8) & 255) / 255.0;
+                weight
+                    * if channel <= 0.04045 {
+                        channel / 12.92
+                    } else {
+                        ((channel + 0.055) / 1.055).powf(2.4)
+                    }
+            })
+            .sum()
+    }
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let a = luminance(a);
+        let b = luminance(b);
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    fn assert_control_contrast(p: Palette) {
+        for enabled in [false, true] {
+            let text = if enabled { p.text } else { p.disabled };
+            for hot in [false, true] {
+                for active in [false, true] {
+                    let combo = combo_colors(p, enabled, hot, active);
+                    assert!(
+                        contrast(text, combo.0) >= 4.5,
+                        "combo label enabled={enabled}, hot={hot}, active={active}"
+                    );
+                    if enabled {
+                        assert!(contrast(combo.2, combo.0) >= 4.5, "enabled combo arrow");
+                    }
+                    let (surface, ink) = header_colors(p, enabled, hot, active);
+                    assert!(
+                        contrast(ink, surface) >= 4.5,
+                        "header label enabled={enabled}, hot={hot}, pressed={active}"
+                    );
+                    if enabled {
+                        assert!(
+                            contrast(indicator_ink(p, true), surface) >= 4.5,
+                            "enabled header sort arrow"
+                        );
+                    }
+                    for row in [0, 1] {
+                        assert!(
+                            contrast(text, row_background(p, row, active, hot, enabled)) >= 4.5,
+                            "list row {row}, enabled={enabled}, selected={active}, hot={hot}"
+                        );
+                    }
+                }
+            }
+            assert!(
+                contrast(text, p.background) >= 4.5,
+                "switch label enabled={enabled}"
+            );
+        }
+        for checked in [false, true] {
+            for hot in [false, true] {
+                for pressed in [false, true] {
+                    let (track, border, knob) = switch_colors(p, checked, true, hot, pressed);
+                    assert!(
+                        contrast(knob, track) >= 3.0,
+                        "switch knob checked={checked}, hot={hot}, pressed={pressed}"
+                    );
+                    assert!(
+                        contrast(border, p.background) >= 3.0,
+                        "switch boundary checked={checked}, hot={hot}, pressed={pressed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_and_enabled_indicators_remain_readable_in_fixtures_and_real_palette() {
+        for p in [light_palette(), palette()] {
+            assert_control_contrast(p);
+        }
+        for mode in [
+            crate::config::ThemeMode::Light,
+            crate::config::ThemeMode::Dark,
+        ] {
+            let theme = crate::ui::theme::Theme::new(mode).unwrap();
+            if theme.kind != Resolved::Contrast {
+                assert_control_contrast(theme.palette);
+            }
+        }
+    }
+
+    #[test]
+    fn combo_header_interactions_are_neutral_and_disabled_cannot_look_hot() {
+        for p in [light_palette(), palette()] {
+            for hot in [false, true] {
+                let combo = combo_colors(p, true, hot, false);
+                for color in [combo.0, combo.1, combo.2] {
+                    assert_eq!(color & 255, color >> 8 & 255);
+                    assert_eq!(color & 255, color >> 16 & 255);
+                }
+            }
+            assert_ne!(indicator_ink(p, false), indicator_ink(p, true));
+            for hot in [false, true] {
+                for pressed in [false, true] {
+                    assert_eq!(
+                        header_colors(p, false, hot, pressed),
+                        header_colors(p, false, false, false)
+                    );
+                    let (surface, ink) = header_colors(p, true, hot, pressed);
+                    for color in [surface, ink] {
+                        assert_eq!(color & 255, color >> 8 & 255);
+                        assert_eq!(color & 255, color >> 16 & 255);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chevrons_and_header_dividers_fit_fixed_control_geometry() {
+        for dpi in [96, 144, 192] {
+            for height in [28, 30, 36] {
+                let client = RECT {
+                    left: 5,
+                    top: 3,
+                    right: 5 + px(240, dpi),
+                    bottom: 3 + px(height, dpi),
+                };
+                let (_, arrow) = combo_rects(client, dpi);
+                for up in [false, true] {
+                    let points = chevron_points(arrow, dpi, up).unwrap();
+                    assert!(points.iter().all(|p| p.x >= arrow.left
+                        && p.x < arrow.right
+                        && p.y >= arrow.top
+                        && p.y < arrow.bottom));
+                    assert_eq!(points[0].y, points[2].y);
+                    assert_eq!(points[0].x + points[2].x, 2 * points[1].x);
+                    assert_eq!(points[1].y < points[0].y, up);
+                }
+                let column = RECT {
+                    right: client.left + px(100, dpi),
+                    ..client
+                };
+                let divider = header_divider(column, client, dpi).unwrap();
+                assert_eq!(divider.right - divider.left, 1);
+                assert!(divider.top > column.top && divider.bottom < column.bottom);
+                assert!(header_divider(client, client, dpi).is_none());
+                let center = (
+                    (column.left + column.right) / 2,
+                    (column.top + column.bottom) / 2,
+                );
+                assert_eq!(
+                    header_states(column, dpi, true, Some(center), None),
+                    (true, false)
+                );
+                assert_eq!(
+                    header_states(column, dpi, true, Some(center), Some(center)),
+                    (true, true)
+                );
+                assert_eq!(
+                    header_states(column, dpi, false, Some(center), Some(center)),
+                    (false, false)
+                );
+                assert_eq!(
+                    header_states(
+                        column,
+                        dpi,
+                        true,
+                        Some((column.right - 1, center.1)),
+                        Some(center)
+                    ),
+                    (false, false)
+                );
+                assert_eq!(
+                    header_states(
+                        column,
+                        dpi,
+                        true,
+                        Some(center),
+                        Some((column.right - 1, center.1))
+                    ),
+                    (true, false)
+                );
+            }
+        }
+        for width in 0..12 {
+            for height in 0..8 {
+                let rect = RECT {
+                    right: width,
+                    bottom: height,
+                    ..RECT::default()
+                };
+                if let Some(points) = chevron_points(rect, 192, false) {
+                    assert!(
+                        points
+                            .iter()
+                            .all(|p| p.x >= 0 && p.x < width && p.y >= 0 && p.y < height)
+                    );
+                }
             }
         }
     }
@@ -1008,6 +1448,81 @@ mod tests {
         let (track, knob, _) = switch_rects(tiny, 192, true, false);
         assert!(track.right <= tiny.right && track.bottom <= tiny.bottom);
         assert!(knob.left >= track.left && knob.right <= track.right);
+        for dpi in [96, 144, 192] {
+            for width in [0, 1, 8, 34, 240] {
+                for height in [0, 1, 5, 28, 30, 36] {
+                    let client = RECT {
+                        left: 5,
+                        top: 7,
+                        right: 5 + px(width, dpi),
+                        bottom: 7 + px(height, dpi),
+                    };
+                    for checked in [false, true] {
+                        for right in [false, true] {
+                            let (track, knob, label) = switch_rects(client, dpi, checked, right);
+                            assert!(track.left >= client.left && track.right <= client.right);
+                            assert!(track.top >= client.top && track.bottom <= client.bottom);
+                            assert!(
+                                knob.left >= track.left
+                                    && knob.right <= track.right
+                                    && knob.left <= knob.right
+                            );
+                            assert!(
+                                knob.top >= track.top
+                                    && knob.bottom <= track.bottom
+                                    && knob.top <= knob.bottom
+                            );
+                            assert_eq!(knob.right - knob.left, knob.bottom - knob.top);
+                            assert!(
+                                label.left >= client.left
+                                    && label.right <= client.right
+                                    && label.left <= label.right
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DcState {
+        colors: [u32; 4],
+        objects: [HGDIOBJ; 3],
+        modes: [i32; 2],
+        viewport: (i32, i32),
+        window: (i32, i32),
+        clip: (i32, i32, i32, i32, i32),
+    }
+    impl DcState {
+        unsafe fn capture(dc: HDC) -> Self {
+            // SAFETY: Borrowed test-owned memory DC; GDI writes only to locals.
+            unsafe {
+                let mut viewport = POINT::default();
+                let mut window = POINT::default();
+                let mut clip = RECT::default();
+                GetViewportOrgEx(dc, &mut viewport);
+                GetWindowOrgEx(dc, &mut window);
+                let clip_kind = GetClipBox(dc, &mut clip);
+                Self {
+                    colors: [
+                        GetTextColor(dc),
+                        GetBkColor(dc),
+                        GetDCBrushColor(dc),
+                        GetDCPenColor(dc),
+                    ],
+                    objects: [
+                        GetCurrentObject(dc, OBJ_FONT as u32),
+                        GetCurrentObject(dc, OBJ_PEN as u32),
+                        GetCurrentObject(dc, OBJ_BRUSH as u32),
+                    ],
+                    modes: [GetBkMode(dc), GetMapMode(dc)],
+                    viewport: (viewport.x, viewport.y),
+                    window: (window.x, window.y),
+                    clip: (clip_kind, clip.left, clip.top, clip.right, clip.bottom),
+                }
+            }
+        }
     }
 
     unsafe fn window(class: &str, style: u32, parent: HWND) -> HWND {
@@ -1031,6 +1546,229 @@ mod tests {
             );
             assert!(!hwnd.is_null());
             hwnd
+        }
+    }
+
+    #[test]
+    fn native_header_feedback_keeps_sort_width_order_hit_testing_and_dc() {
+        // SAFETY: Private never-shown native Header/parent and an owned bitmap;
+        // all messages and presentation updates stay on their creating thread.
+        unsafe {
+            let init = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&init), 0);
+            let parent = window("STATIC", WS_POPUP, std::ptr::null_mut());
+            let header = window("SysHeader32", WS_CHILD | HDS_BUTTONS | HDS_HOTTRACK, parent);
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            assert!(!dc.is_null());
+            let bitmap = CreateBitmap(800, 120, 1, 32, null());
+            assert!(!bitmap.is_null());
+            let old = SelectObject(dc, bitmap);
+            SelectObject(dc, GetStockObject(SYSTEM_FIXED_FONT));
+            SelectObject(dc, GetStockObject(GRAY_BRUSH));
+            SelectObject(dc, GetStockObject(BLACK_PEN));
+            SetTextColor(dc, 0x123456);
+            SetBkColor(dc, 0x234567);
+            SetDCBrushColor(dc, 0x345678);
+            SetDCPenColor(dc, 0x456789);
+            SetBkMode(dc, OPAQUE as i32);
+            SetViewportOrgEx(dc, 7, 9, std::ptr::null_mut());
+            IntersectClipRect(dc, 0, 0, 700, 100);
+            let font = GetStockObject(SYSTEM_FIXED_FONT);
+            SendMessageW(header, WM_SETFONT, font as WPARAM, 0);
+            let mut caption = crate::windows::wide("排序列");
+            for index in 0..2 {
+                let mut item = HDITEMW {
+                    mask: HDI_TEXT | HDI_WIDTH | HDI_FORMAT,
+                    cxy: 100,
+                    pszText: caption.as_mut_ptr(),
+                    fmt: HDF_STRING | if index == 0 { HDF_SORTUP } else { 0 },
+                    ..Default::default()
+                };
+                assert_eq!(
+                    SendMessageW(
+                        header,
+                        HDM_INSERTITEMW,
+                        index,
+                        (&mut item as *mut HDITEMW) as LPARAM
+                    ),
+                    index as LRESULT
+                );
+            }
+            let style = GetWindowLongPtrW(header, GWL_STYLE);
+            for dpi in [96, 144, 192] {
+                MoveWindow(header, 0, 0, px(240, dpi), px(30, dpi), 0);
+                for index in 0..2 {
+                    let mut item = HDITEMW {
+                        mask: HDI_WIDTH,
+                        cxy: px(100, dpi),
+                        ..Default::default()
+                    };
+                    assert_ne!(
+                        SendMessageW(
+                            header,
+                            HDM_SETITEMW,
+                            index,
+                            (&mut item as *mut HDITEMW) as LPARAM
+                        ),
+                        0
+                    );
+                }
+                let mut client = RECT::default();
+                GetClientRect(header, &mut client);
+                let mut first = RECT::default();
+                assert_ne!(
+                    SendMessageW(
+                        header,
+                        HDM_GETITEMRECT,
+                        0,
+                        (&mut first as *mut RECT) as LPARAM
+                    ),
+                    0
+                );
+                let center = POINT {
+                    x: (first.left + first.right) / 2,
+                    y: (first.top + first.bottom) / 2,
+                };
+                let point = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as LPARAM;
+                for (kind, p) in [
+                    (Resolved::Light, light_palette()),
+                    (Resolved::Dark, palette()),
+                ] {
+                    apply(header, kind, p, dpi);
+                    let sample_x = first.left + px(12, dpi);
+                    let sample_y = first.top + px(3, dpi);
+                    let before = DcState::capture(dc);
+                    SendMessageW(header, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM);
+                    assert_eq!(
+                        GetPixel(dc, sample_x, sample_y),
+                        header_colors(p, true, false, false).0
+                    );
+                    SendMessageW(header, WM_MOUSEMOVE, 0, point);
+                    assert_eq!(
+                        appearance(header).unwrap().pointer,
+                        Some((center.x, center.y))
+                    );
+                    SendMessageW(header, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM);
+                    assert_eq!(
+                        GetPixel(dc, sample_x, sample_y),
+                        header_colors(p, true, true, false).0
+                    );
+                    // Exercise pressed artwork without native Header's modal drag
+                    // loop or desktop input; actual actions continue to be native.
+                    header_input(header, WM_LBUTTONDOWN, 1, point);
+                    SendMessageW(header, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM);
+                    assert_eq!(
+                        GetPixel(dc, sample_x, sample_y),
+                        header_colors(p, true, true, true).0
+                    );
+                    SendMessageW(header, WM_CANCELMODE, 0, 0);
+                    assert!(appearance(header).unwrap().press_origin.is_none());
+                    header_input(header, WM_LBUTTONDOWN, 1, point);
+                    SendMessageW(header, WM_CAPTURECHANGED, 0, 0);
+                    assert!(appearance(header).unwrap().press_origin.is_none());
+                    SendMessageW(header, WM_MOUSELEAVE, 0, 0);
+                    assert!(appearance(header).unwrap().pointer.is_none());
+                    let text_right = first.right - px(10, dpi);
+                    let arrow = RECT {
+                        left: text_right - px(16, dpi),
+                        right: text_right,
+                        ..first
+                    };
+                    for enabled in [false, true] {
+                        EnableWindow(header, i32::from(enabled));
+                        if !enabled {
+                            SendMessageW(header, WM_MOUSEMOVE, 0, point);
+                            assert!(appearance(header).unwrap().pointer.is_none());
+                        }
+                        SendMessageW(header, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM);
+                        assert_eq!(
+                            GetPixel(dc, sample_x, sample_y),
+                            header_colors(p, enabled, false, false).0
+                        );
+                        let ink = indicator_ink(p, enabled);
+                        let mut pixels = 0;
+                        for y in arrow.top..arrow.bottom {
+                            for x in arrow.left..arrow.right {
+                                pixels += usize::from(GetPixel(dc, x, y) == ink);
+                            }
+                        }
+                        assert!(pixels > 0, "header sort arrow missing, enabled={enabled}");
+                        assert!(
+                            pixels
+                                < ((arrow.right - arrow.left) * (arrow.bottom - arrow.top))
+                                    as usize
+                        );
+                        let divider = header_divider(first, client, dpi).unwrap();
+                        assert_eq!(
+                            GetPixel(dc, divider.left, (divider.top + divider.bottom) / 2),
+                            blend(p.subtle(), p.border, 65)
+                        );
+                        assert_eq!(GetPixel(dc, divider.left, first.top), p.subtle());
+                    }
+                    EnableWindow(parent, 0);
+                    assert!(!header_enabled(header));
+                    SendMessageW(header, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM);
+                    assert_eq!(
+                        GetPixel(dc, sample_x, sample_y),
+                        header_colors(p, false, false, false).0
+                    );
+                    EnableWindow(parent, 1);
+                    assert!(header_enabled(header));
+                    assert_eq!(DcState::capture(dc), before);
+                    let mut item = HDITEMW {
+                        mask: HDI_WIDTH | HDI_FORMAT | HDI_ORDER,
+                        ..Default::default()
+                    };
+                    assert_ne!(
+                        SendMessageW(
+                            header,
+                            HDM_GETITEMW,
+                            0,
+                            (&mut item as *mut HDITEMW) as LPARAM
+                        ),
+                        0
+                    );
+                    assert_eq!(item.cxy, px(100, dpi));
+                    assert_eq!(item.fmt & (HDF_SORTUP | HDF_SORTDOWN), HDF_SORTUP);
+                    assert_eq!(item.iOrder, 0);
+                    assert_eq!(GetWindowLongPtrW(header, GWL_STYLE), style);
+                    assert_eq!(SendMessageW(header, WM_GETFONT, 0, 0), font as LRESULT);
+                    let mut hit = HDHITTESTINFO {
+                        pt: center,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        SendMessageW(
+                            header,
+                            HDM_HITTEST,
+                            0,
+                            (&mut hit as *mut HDHITTESTINFO) as LPARAM
+                        ),
+                        0
+                    );
+                    let mut after = RECT::default();
+                    SendMessageW(
+                        header,
+                        HDM_GETITEMRECT,
+                        0,
+                        (&mut after as *mut RECT) as LPARAM,
+                    );
+                    assert_eq!(
+                        (first.left, first.top, first.right, first.bottom),
+                        (after.left, after.top, after.right, after.bottom)
+                    );
+                    apply(header, Resolved::Contrast, p, dpi);
+                    assert!(appearance(header).is_none());
+                    assert_eq!(SendMessageW(header, HDM_GETITEMCOUNT, 0, 0), 2);
+                }
+            }
+            SelectObject(dc, old);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            DestroyWindow(parent);
         }
     }
 
@@ -1278,12 +2016,14 @@ mod tests {
                 draw.nmcd.dwItemSpec = 1;
                 draw.nmcd.uItemState = 0;
                 custom_draw((&mut draw as *mut NMLVCUSTOMDRAW) as LPARAM);
-                assert_eq!(draw.clrTextBk, blend(colors.surface, colors.subtle(), 50));
+                assert_eq!(draw.clrTextBk, blend(colors.surface, colors.background, 40));
                 draw.nmcd.uItemState = CDIS_HOT;
                 custom_draw((&mut draw as *mut NMLVCUSTOMDRAW) as LPARAM);
                 assert_eq!(draw.clrTextBk, colors.hover());
                 assert_eq!(draw.nmcd.uItemState & CDIS_HOT, 0);
                 EnableWindow(list, 0);
+                assert!(!header_enabled(header));
+                assert!(appearance(header).unwrap().pointer.is_none());
                 draw.nmcd.dwItemSpec = 0;
                 custom_draw((&mut draw as *mut NMLVCUSTOMDRAW) as LPARAM);
                 assert_eq!(draw.clrText, colors.disabled);
@@ -1292,6 +2032,7 @@ mod tests {
                     blend(colors.surface, colors.accent_surface, 50)
                 );
                 EnableWindow(list, 1);
+                assert!(header_enabled(header));
                 assert_eq!(
                     SendMessageW(
                         list,
@@ -1352,7 +2093,14 @@ mod tests {
                     for enabled in [false, true] {
                         EnableWindow(hwnd, i32::from(enabled));
                         let color = SetTextColor(dc, 0x123456);
-                        SendMessageW(hwnd, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM);
+                        SetBkColor(dc, 0x234567);
+                        SetDCBrushColor(dc, 0x345678);
+                        SetDCPenColor(dc, 0x456789);
+                        let before = DcState::capture(dc);
+                        for message in [WM_PRINT, WM_PRINTCLIENT] {
+                            SendMessageW(hwnd, message, dc as WPARAM, PRF_CLIENT as LPARAM);
+                            assert_eq!(DcState::capture(dc), before, "print changed caller DC");
+                        }
                         assert_eq!(GetTextColor(dc), 0x123456);
                         SetTextColor(dc, color);
                         if hwnd == switch {
@@ -1386,12 +2134,34 @@ mod tests {
                                     knob_color
                                 );
                             }
+                        } else if hwnd == combo {
+                            let mut client = RECT::default();
+                            GetClientRect(combo, &mut client);
+                            let (_, arrow) = combo_rects(client, 96);
+                            let arrow_ink = indicator_ink(colors, enabled);
+                            let mut pixels = 0;
+                            for y in arrow.top..arrow.bottom {
+                                for x in arrow.left..arrow.right {
+                                    pixels += usize::from(GetPixel(dc, x, y) == arrow_ink);
+                                }
+                            }
+                            assert!(pixels > 0, "combo arrow missing, enabled={enabled}");
+                            assert!(
+                                pixels
+                                    < ((arrow.right - arrow.left) * (arrow.bottom - arrow.top))
+                                        as usize
+                            );
+                            assert_eq!(SendMessageW(combo, CB_GETCURSEL, 0, 0), 0);
                         } else if hwnd == header {
                             let mut client = RECT::default();
                             GetClientRect(header, &mut client);
-                            // The old right-hand column frame was visible even
-                            // at the top; now only the bottom has a separator.
+                            // Dividers are inset: the top stays clean while the
+                            // resize boundary and shared bottom line remain legible.
                             assert_eq!(GetPixel(dc, column.cx - 1, client.top), colors.subtle());
+                            assert_eq!(
+                                GetPixel(dc, column.cx - 1, (client.top + client.bottom) / 2),
+                                blend(colors.subtle(), colors.border, 65)
+                            );
                             assert_eq!(
                                 GetPixel(dc, column.cx - 1, client.bottom - 1),
                                 blend(colors.subtle(), colors.border, 65)

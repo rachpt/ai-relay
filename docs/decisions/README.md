@@ -38,6 +38,8 @@
 
 - [0018：原生深色月历颜色与翻月呈现](0018-native-dark-calendar-navigation.md)
 
+- [0019：明暗视觉层级与原生导航展示隔离](0019-fluent-presentation-tokens.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

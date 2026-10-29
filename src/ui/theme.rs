@@ -8,21 +8,6 @@ use windows_sys::Win32::{
     UI::Controls::*,
 };
 
-// Public commctrl.h helpers (windows-sys places these behind an unused feature).
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn GetFocus() -> HWND;
-}
-
-type SubclassProc =
-    Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
-#[link(name = "comctl32")]
-unsafe extern "system" {
-    fn SetWindowSubclass(hwnd: HWND, proc: SubclassProc, id: usize, data: usize) -> i32;
-    fn RemoveWindowSubclass(hwnd: HWND, proc: SubclassProc, id: usize) -> i32;
-    fn DefSubclassProc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT;
-}
-
 pub(super) const REFRESH: u32 = WM_APP + 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,22 +58,22 @@ impl Palette {
                     accent_surface: GetSysColor(COLOR_HIGHLIGHT),
                 },
                 Resolved::Light => Self {
-                    background: 0x00fbf7f5,
+                    background: 0x00f3f3f3,
                     surface: 0x00ffffff,
-                    text: 0x003d2b20,
-                    disabled: 0x00806a5a,
-                    accent: 0x00ce5c31,
-                    border: 0x00ebdfd7,
-                    accent_surface: 0x00ffefe8,
+                    text: 0x001a1a1a,
+                    disabled: 0x00616161,
+                    accent: 0x00b85f00,
+                    border: 0x00e0e0e0,
+                    accent_surface: 0x00f9f2ea,
                 },
                 Resolved::Dark => Self {
-                    background: 0x00221915,
-                    surface: 0x0032261f,
-                    text: 0x00f8eee9,
-                    disabled: 0x00c5afa1,
-                    accent: 0x00ffba9b,
-                    border: 0x00544035,
-                    accent_surface: 0x00513929,
+                    background: 0x00202020,
+                    surface: 0x002b2b2b,
+                    text: 0x00f5f5f5,
+                    disabled: 0x00c5c5c5,
+                    accent: 0x00ffcd60,
+                    border: 0x00454545,
+                    accent_surface: 0x00473d2d,
                 },
             }
         }
@@ -99,7 +84,7 @@ impl Palette {
     }
 
     pub fn hover(self) -> u32 {
-        blend(self.surface, self.accent, 10)
+        blend(self.surface, self.text, 8)
     }
 
     pub fn on_accent(self) -> u32 {
@@ -107,7 +92,7 @@ impl Palette {
             + ((self.accent >> 8) & 255) * 587
             + ((self.accent >> 16) & 255) * 114;
         if brightness >= 155_000 {
-            0x00221915
+            0x00202020
         } else {
             0x00ffffff
         }
@@ -219,7 +204,7 @@ pub(super) unsafe fn refresh(hwnd: HWND, state: *mut State) {
         // leaves the prior valid caption icon.
         let _ = (*state).title_menu.refresh(hwnd, dpi, kind, palette);
         let tab = (*state).tabs.handle;
-        SetWindowSubclass(tab, Some(tab_proc), 1, state as usize);
+        tabs::apply(tab, kind, palette, dpi);
         // Native Tab still owns hit testing, selection, keyboard and accessibility.
         let style = GetWindowLongPtrW(tab, GWL_STYLE) as u32;
         SetWindowLongPtrW(tab, GWL_STYLE, (style & !TCS_OWNERDRAWFIXED) as isize);
@@ -472,142 +457,6 @@ pub(super) unsafe fn paint(
     }
 }
 
-// Native Tab handles input, selection and accessibility; only its header is
-// painted here, so no classic page border or raised button edges are exposed.
-unsafe extern "system" fn tab_proc(
-    hwnd: HWND,
-    message: u32,
-    w: WPARAM,
-    l: LPARAM,
-    id: usize,
-    data: usize,
-) -> LRESULT {
-    // SAFETY: Subclass is attached only to our UI-thread Tab; State outlives its children.
-    unsafe {
-        if message == WM_NCDESTROY {
-            RemoveWindowSubclass(hwnd, Some(tab_proc), id);
-        }
-        let state = data as *mut State;
-        if (message == WM_PAINT || message == WM_PRINTCLIENT)
-            && (*state).theme.kind != Resolved::Contrast
-        {
-            let mut paint = PAINTSTRUCT::default();
-            let dc = if message == WM_PAINT {
-                BeginPaint(hwnd, &mut paint)
-            } else {
-                w as HDC
-            };
-            if !dc.is_null() {
-                let saved = SaveDC(dc);
-                let mut bounds = RECT::default();
-                GetClientRect(hwnd, &mut bounds);
-                FillRect(dc, &bounds, (*state).theme.background.0);
-                let palette = (*state).theme.palette;
-                let font = SelectObject(dc, (*state).font.0);
-                SetBkMode(dc, TRANSPARENT as i32);
-                let selected = SendMessageW(hwnd, TCM_GETCURSEL, 0, 0);
-                for (index, title) in tabs::LABELS.iter().enumerate() {
-                    let mut rect = RECT::default();
-                    if SendMessageW(
-                        hwnd,
-                        TCM_GETITEMRECT,
-                        index,
-                        (&mut rect as *mut RECT) as isize,
-                    ) == 0
-                    {
-                        continue;
-                    }
-                    let active = selected == index as isize;
-                    if active {
-                        let mut pill = rect;
-                        InflateRect(&mut pill, -scale(3, (*state).dpi), -scale(3, (*state).dpi));
-                        rounded::surface(
-                            dc,
-                            &pill,
-                            (*state).dpi,
-                            palette.background,
-                            palette.accent_surface,
-                            palette.accent_surface,
-                        );
-                    }
-                    let color = if active {
-                        palette.accent
-                    } else {
-                        palette.disabled
-                    };
-                    SetTextColor(dc, color);
-                    let title = wide(title);
-                    let mut measured = RECT::default();
-                    DrawTextW(
-                        dc,
-                        title.as_ptr(),
-                        -1,
-                        &mut measured,
-                        DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
-                    );
-                    let dpi = (*state).dpi;
-                    let icon_size = tabs::Tabs::icon_size(dpi);
-                    let gap = scale(6, dpi);
-                    let text_width = measured.right - measured.left;
-                    let content_width = icon_size + gap + text_width;
-                    let mut text_rect = rect;
-                    // Keep the native item rectangle for hit testing, underline and focus.
-                    // If resources or width are insufficient, center the full text instead.
-                    if content_width <= rect.right - rect.left - scale(8, dpi)
-                        && icon_size <= rect.bottom - rect.top
-                    {
-                        let left = rect.left + (rect.right - rect.left - content_width) / 2;
-                        let top = rect.top + (rect.bottom - rect.top - icon_size) / 2;
-                        let icon_rect = RECT {
-                            left,
-                            top,
-                            right: left + icon_size,
-                            bottom: top + icon_size,
-                        };
-                        if (*state).tabs.draw_icon(index, dc, &icon_rect, dpi, color) {
-                            text_rect.left = left + icon_size + gap;
-                            text_rect.right = text_rect.left + text_width;
-                        }
-                    }
-                    DrawTextW(
-                        dc,
-                        title.as_ptr(),
-                        -1,
-                        &mut text_rect,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                    );
-
-                    if active
-                        && GetFocus() == hwnd
-                        && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize == 0
-                    {
-                        InflateRect(&mut rect, -scale(4, (*state).dpi), -scale(4, (*state).dpi));
-                        DrawFocusRect(dc, &rect);
-                    }
-                }
-                SelectObject(dc, font);
-                if saved != 0 {
-                    RestoreDC(dc, saved);
-                }
-            }
-            if message == WM_PAINT {
-                EndPaint(hwnd, &paint);
-            }
-            return 0;
-        }
-        if message == WM_ERASEBKGND {
-            let state = data as *mut State;
-            if (*state).theme.kind != Resolved::Contrast {
-                let mut rect = RECT::default();
-                GetClientRect(hwnd, &mut rect);
-                FillRect(w as HDC, &rect, (*state).theme.background.0);
-                return 1;
-            }
-        }
-        DefSubclassProc(hwnd, message, w, l)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +517,72 @@ mod tests {
         assert_eq!(blend(0, 0xffffff, 100), 0xffffff);
         assert_eq!(blend(0, 0xffffff, 150), 0xffffff);
         assert_eq!(blend(0x123456, 0xffffff, 0), 0x123456);
+    }
+
+    #[test]
+    fn fluent_palette_keeps_neutral_layers_and_low_intensity_hover() {
+        for (kind, expected) in [
+            (
+                Resolved::Light,
+                [
+                    0xf3f3f3, 0xffffff, 0x1a1a1a, 0x616161, 0xb85f00, 0xe0e0e0, 0xf9f2ea,
+                ],
+            ),
+            (
+                Resolved::Dark,
+                [
+                    0x202020, 0x2b2b2b, 0xf5f5f5, 0xc5c5c5, 0xffcd60, 0x454545, 0x473d2d,
+                ],
+            ),
+        ] {
+            let p = Palette::new(kind);
+            assert_eq!(
+                [
+                    p.background,
+                    p.surface,
+                    p.text,
+                    p.disabled,
+                    p.accent,
+                    p.border,
+                    p.accent_surface,
+                ],
+                expected
+            );
+            for neutral in [
+                p.background,
+                p.surface,
+                p.text,
+                p.disabled,
+                p.border,
+                p.subtle(),
+                p.hover(),
+            ] {
+                assert_eq!(neutral & 255, (neutral >> 8) & 255);
+                assert_eq!(neutral & 255, (neutral >> 16) & 255);
+            }
+            assert!((p.surface & 255).abs_diff(p.hover() & 255) <= 20);
+            assert_ne!(p.surface, p.hover());
+            for background in [p.background, p.surface, p.hover()] {
+                assert!(contrast(p.accent, background) >= 3.0);
+            }
+        }
+        assert_eq!(Palette::new(Resolved::Light).on_accent(), 0xffffff);
+        assert_eq!(Palette::new(Resolved::Dark).on_accent(), 0x202020);
+    }
+
+    #[test]
+    fn high_contrast_palette_uses_only_system_colors() {
+        let p = Palette::new(Resolved::Contrast);
+        // SAFETY: These predefined system color queries do not mutate OS settings.
+        unsafe {
+            assert_eq!(p.background, GetSysColor(COLOR_WINDOW));
+            assert_eq!(p.surface, GetSysColor(COLOR_WINDOW));
+            assert_eq!(p.text, GetSysColor(COLOR_WINDOWTEXT));
+            assert_eq!(p.disabled, GetSysColor(COLOR_GRAYTEXT));
+            assert_eq!(p.accent, GetSysColor(COLOR_HIGHLIGHT));
+            assert_eq!(p.border, GetSysColor(COLOR_WINDOWTEXT));
+            assert_eq!(p.accent_surface, GetSysColor(COLOR_HIGHLIGHT));
+        }
     }
 
     #[test]

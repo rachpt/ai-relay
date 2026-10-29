@@ -54,7 +54,7 @@ fn px(dip: i32, dpi: u32) -> i32 {
 fn geometry(width: i32, height: i32, dpi: u32) -> (i32, i32, i32) {
     let width = width.max(0);
     let height = height.max(0);
-    (width, height, px(12, dpi).min(width).min(height))
+    (width, height, px(8, dpi).min(width).min(height))
 }
 
 #[derive(Clone, Copy)]
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn geometry_scales_and_clamps() {
-        for (dpi, diameter) in [(96, 12), (144, 18), (192, 24)] {
+        for (dpi, diameter) in [(96, 8), (144, 12), (192, 16)] {
             assert_eq!(geometry(240, 32, dpi), (240, 32, diameter));
             assert_eq!(geometry(3, 2, dpi), (3, 2, 2));
             assert_eq!(geometry(-2, 0, dpi), (0, 0, 0));
@@ -734,9 +734,9 @@ mod tests {
             let resized = region_bounds(button).unwrap();
             assert_eq!((resized.right, resized.bottom), (210, 36));
             apply(button, theme::Resolved::Dark, p, 192);
-            assert_eq!(state(button).unwrap().get().geometry, Some((210, 36, 24)));
+            assert_eq!(state(button).unwrap().get().geometry, Some((210, 36, 16)));
             SendMessageW(button, WM_DPICHANGED, 144 | (144 << 16), 0);
-            assert_eq!(state(button).unwrap().get().geometry, Some((210, 36, 18)));
+            assert_eq!(state(button).unwrap().get().geometry, Some((210, 36, 12)));
             SendMessageW(button, WM_DPICHANGED_AFTERPARENT, 0, 0);
             assert_eq!(state(button).unwrap().get().dpi, GetDpiForWindow(button));
             for hwnd in native_edges {

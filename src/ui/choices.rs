@@ -402,15 +402,71 @@ unsafe fn fill_round(dc: HDC, rect: RECT, color: u32, diameter: i32) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Colors {
+    fill: u32,
+    ink: u32,
+}
+
+fn colors(p: Palette, kind: Resolved, active: bool, enabled: bool, hot: bool) -> Colors {
+    let track = p.subtle();
+    // A dark selected segment needs elevation above the neutral track, not blue ink.
+    let raised = if kind == Resolved::Dark {
+        blend(p.surface, p.text, 8)
+    } else {
+        p.surface
+    };
+    if !enabled {
+        return Colors {
+            fill: if active {
+                blend(track, raised, 55)
+            } else {
+                track
+            },
+            ink: p.disabled,
+        };
+    }
+    Colors {
+        fill: if active && hot {
+            blend(raised, p.text, 3)
+        } else if active {
+            raised
+        } else if hot {
+            p.hover()
+        } else {
+            track
+        },
+        ink: if active {
+            p.text
+        } else {
+            blend(p.text, p.disabled, 50)
+        },
+    }
+}
+
+struct SavedDc(HDC, i32);
+impl SavedDc {
+    unsafe fn new(dc: HDC) -> Option<Self> {
+        // SAFETY: Borrowed paint/print DC; leave it untouched if saving fails.
+        let index = unsafe { SaveDC(dc) };
+        (index != 0).then_some(Self(dc, index))
+    }
+}
+impl Drop for SavedDc {
+    fn drop(&mut self) {
+        // SAFETY: This guard owns one saved state and cannot outlive the borrowed DC.
+        unsafe { RestoreDC(self.0, self.1) };
+    }
+}
+
 unsafe fn draw(hwnd: HWND, dc: HDC, data: &Choices, appearance: Appearance) {
     // SAFETY: Paint/print supplies a live DC. Choices outlives this callback;
     // no mutable reference crosses native messages. Stock GDI objects are borrowed,
     // and SaveDC/RestoreDC restores selections/colors before this function returns.
     unsafe {
-        let saved = SaveDC(dc);
-        if saved == 0 {
+        let Some(_saved) = SavedDc::new(dc) else {
             return;
-        }
+        };
         let palette = appearance.palette;
         let mut bounds = RECT::default();
         GetClientRect(hwnd, &mut bounds);
@@ -434,7 +490,6 @@ unsafe fn draw(hwnd: HWND, dc: HDC, data: &Choices, appearance: Appearance) {
             }
         }
         let Some(track) = items.and_then(|items| track_rect(bounds, items, appearance.dpi)) else {
-            RestoreDC(dc, saved);
             return;
         };
         let track_color = palette.subtle();
@@ -452,7 +507,8 @@ unsafe fn draw(hwnd: HWND, dc: HDC, data: &Choices, appearance: Appearance) {
         let selected = SendMessageW(hwnd, TCM_GETCURSEL, 0, 0);
         let focused = SendMessageW(hwnd, TCM_GETCURFOCUS, 0, 0);
         let enabled = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_DISABLED == 0;
-        let show_focus = GetFocus() == hwnd
+        let show_focus = enabled
+            && GetFocus() == hwnd
             && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize == 0;
         let hovered = data.hovered.get();
         for index in 0..count {
@@ -464,15 +520,7 @@ unsafe fn draw(hwnd: HWND, dc: HDC, data: &Choices, appearance: Appearance) {
             // Inset only the artwork; native rectangles still define hit testing.
             let active = selected == index as isize;
             let hot = enabled && hovered == Some(index);
-            let color = if active && enabled {
-                palette.surface
-            } else if active {
-                blend(track_color, palette.surface, 55)
-            } else if hot {
-                palette.hover()
-            } else {
-                track_color
-            };
+            let c = colors(palette, appearance.kind, active, enabled, hot);
             let diameter = scale(8, appearance.dpi);
             if active && enabled {
                 let offset = scale(1, appearance.dpi);
@@ -484,18 +532,9 @@ unsafe fn draw(hwnd: HWND, dc: HDC, data: &Choices, appearance: Appearance) {
                 fill_round(dc, shadow, blend(track_color, 0, 10), diameter);
             }
             if active || hot {
-                fill_round(dc, rect, color, diameter);
+                fill_round(dc, rect, c.fill, diameter);
             }
-            SetTextColor(
-                dc,
-                if !enabled {
-                    blend(palette.disabled, track_color, 35)
-                } else if active {
-                    palette.accent
-                } else {
-                    palette.disabled
-                },
-            );
+            SetTextColor(dc, c.ink);
             let mut text = label_rect(rect, appearance.dpi);
             if text.right > text.left {
                 let label = &data.labels[index];
@@ -517,12 +556,11 @@ unsafe fn draw(hwnd: HWND, dc: HDC, data: &Choices, appearance: Appearance) {
                     // Focus stays separate from selection and hover, including when
                     // native keyboard navigation focuses an unselected item.
                     SetTextColor(dc, palette.text);
-                    SetBkColor(dc, color);
+                    SetBkColor(dc, c.fill);
                     DrawFocusRect(dc, &rect);
                 }
             }
         }
-        RestoreDC(dc, saved);
     }
 }
 
@@ -615,6 +653,15 @@ unsafe extern "system" fn procedure(
         }
         let appearance = data.appearance.get();
         if let Some(appearance) = appearance.filter(|a| a.kind != Resolved::Contrast) {
+            if message == WM_PRINT {
+                // WM_PRINT's caller lends a live DC until dispatch returns.
+                // Preserve the entire native pass, not just our PRINTCLIENT
+                // artwork; the retained Rc also survives nested destruction.
+                let Some(_saved) = SavedDc::new(w as HDC) else {
+                    return 0;
+                };
+                return DefSubclassProc(hwnd, message, w, l);
+            }
             if message == WM_MOUSEMOVE && !update_hover(hwnd, &data, l) {
                 return 0;
             }
@@ -692,7 +739,7 @@ mod tests {
     #[test]
     fn compact_artwork_preserves_label_space_and_stays_inside_track() {
         for dpi in [96, 144, 192] {
-            for height in [24, 28, 30, 32] {
+            for height in [24, 28, 30, 32, 36] {
                 let bounds = RECT {
                     right: scale(180, dpi),
                     bottom: scale(height, dpi),
@@ -812,13 +859,95 @@ mod tests {
     }
     fn palette() -> Palette {
         Palette {
-            background: 0xffffff,
-            surface: 0xf5f5f5,
-            text: 0x202020,
-            disabled: 0x606060,
-            accent: 0xa04000,
-            border: 0xc0c0c0,
-            accent_surface: 0xffeee0,
+            background: 0xf3f3f3,
+            surface: 0xffffff,
+            text: 0x1a1a1a,
+            disabled: 0x616161,
+            accent: 0xb85f00,
+            border: 0xe0e0e0,
+            accent_surface: 0xf9f2ea,
+        }
+    }
+
+    fn dark_palette() -> Palette {
+        Palette {
+            background: 0x202020,
+            surface: 0x2b2b2b,
+            text: 0xf5f5f5,
+            disabled: 0xc5c5c5,
+            accent: 0xffcd60,
+            border: 0x454545,
+            accent_surface: 0x473d2d,
+        }
+    }
+
+    fn luminance(color: u32) -> f64 {
+        [0.2126, 0.7152, 0.0722]
+            .into_iter()
+            .enumerate()
+            .map(|(index, weight)| {
+                let channel = f64::from(color >> (index * 8) & 255) / 255.0;
+                weight
+                    * if channel <= 0.04045 {
+                        channel / 12.92
+                    } else {
+                        ((channel + 0.055) / 1.055).powf(2.4)
+                    }
+            })
+            .sum()
+    }
+
+    fn assert_choice_contrast(p: Palette, kind: Resolved) {
+        for active in [false, true] {
+            for enabled in [false, true] {
+                for hot in [false, true] {
+                    let c = colors(p, kind, active, enabled, hot);
+                    let ink = luminance(c.ink);
+                    let fill = luminance(c.fill);
+                    let ratio = (ink.max(fill) + 0.05) / (ink.min(fill) + 0.05);
+                    assert!(
+                        ratio >= 4.5,
+                        "{kind:?} active={active}, enabled={enabled}, hot={hot}: {ratio}"
+                    );
+                    if !enabled {
+                        assert_eq!(c, colors(p, kind, active, false, !hot));
+                        assert_ne!(c.ink, colors(p, kind, active, true, hot).ink);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raised_selection_is_neutral_and_all_label_states_remain_readable() {
+        for (kind, p) in [
+            (Resolved::Light, palette()),
+            (Resolved::Dark, dark_palette()),
+        ] {
+            assert_choice_contrast(p, kind);
+            let selected = colors(p, kind, true, true, false);
+            assert_eq!(selected.ink, p.text);
+            assert!(luminance(selected.fill) > luminance(p.subtle()));
+            for active in [false, true] {
+                for enabled in [false, true] {
+                    for hot in [false, true] {
+                        let c = colors(p, kind, active, enabled, hot);
+                        for color in [c.fill, c.ink] {
+                            assert_eq!(color & 255, color >> 8 & 255);
+                            assert_eq!(color & 255, color >> 16 & 255);
+                        }
+                    }
+                }
+            }
+        }
+        for mode in [
+            crate::config::ThemeMode::Light,
+            crate::config::ThemeMode::Dark,
+        ] {
+            let theme = crate::ui::theme::Theme::new(mode).unwrap();
+            if theme.kind != Resolved::Contrast {
+                assert_choice_contrast(theme.palette, theme.kind);
+            }
         }
     }
 
@@ -863,12 +992,21 @@ mod tests {
             assert_eq!(SendMessageW(hwnd, WM_GETFONT, 0, 0), font as LRESULT);
             MoveWindow(hwnd, 0, 0, 390, 30, 0);
             for kind in [Resolved::Light, Resolved::Dark, Resolved::Contrast] {
-                apply(hwnd, kind, palette(), 96);
+                apply(
+                    hwnd,
+                    kind,
+                    if kind == Resolved::Dark {
+                        dark_palette()
+                    } else {
+                        palette()
+                    },
+                    96,
+                );
                 assert_eq!(SendMessageW(hwnd, CB_GETCURSEL, 0, 0), 0);
                 assert_eq!(SendMessageW(hwnd, WM_GETFONT, 0, 0), font as LRESULT);
             }
             // Other controls, including the native main Tab, are never interpreted as Choices.
-            apply(host.0, Resolved::Dark, palette(), 192);
+            apply(host.0, Resolved::Dark, dark_palette(), 192);
             assert!(marked(host.0).is_null());
             assert_eq!(DestroyWindow(hwnd), 1);
             assert!(marked(hwnd).is_null());
@@ -912,7 +1050,16 @@ mod tests {
                 SendMessageW(hwnd, WM_KEYDOWN, 0x25, 0); // VK_LEFT.
                 assert_eq!(SendMessageW(hwnd, CB_GETCURSEL, 0, 0), 1);
                 for kind in [Resolved::Light, Resolved::Dark, Resolved::Contrast] {
-                    apply(hwnd, kind, palette(), dpi);
+                    apply(
+                        hwnd,
+                        kind,
+                        if kind == Resolved::Dark {
+                            dark_palette()
+                        } else {
+                            palette()
+                        },
+                        dpi,
+                    );
                     assert_eq!(
                         SendMessageW(hwnd, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM),
                         0
@@ -933,15 +1080,7 @@ mod tests {
     fn native_print_uses_one_track_and_preserves_hover_selection_and_dc() {
         let host = Host::new();
         let hwnd = create(host.0, 92, &["全部", "本地", "UTC"]).unwrap();
-        let dark = Palette {
-            background: 0x24201e,
-            surface: 0x322c29,
-            text: 0xf5f2ee,
-            disabled: 0xb2aaa2,
-            accent: 0xffc078,
-            border: 0x574e47,
-            accent_surface: 0x543e29,
-        };
+        let dark = dark_palette();
         // SAFETY: Owner-thread hidden HWNDs and an owned memory DC/bitmap; native
         // messages receive live buffers, and the bitmap is deselected before deletion.
         unsafe {
@@ -991,6 +1130,37 @@ mod tests {
                     assert_eq!(GetDCBrushColor(dc), 0x234567);
                     assert_eq!(GetDCPenColor(dc), 0x345678);
                     assert_eq!(GetCurrentObject(dc, OBJ_FONT as u32), old_font);
+                    let old_pen = GetCurrentObject(dc, OBJ_PEN as u32);
+                    let old_brush = GetCurrentObject(dc, OBJ_BRUSH as u32);
+                    let old_map = GetMapMode(dc);
+                    let mut old_clip = RECT::default();
+                    let clip_kind = GetClipBox(dc, &mut old_clip);
+                    let mut old_viewport = POINT::default();
+                    let mut old_window = POINT::default();
+                    GetViewportOrgEx(dc, &mut old_viewport);
+                    GetWindowOrgEx(dc, &mut old_window);
+                    SendMessageW(hwnd, WM_PRINT, dc as WPARAM, PRF_CLIENT as LPARAM);
+                    assert_eq!(GetTextColor(dc), 0x123456);
+                    assert_eq!(GetBkColor(dc), 0x654321);
+                    assert_eq!(GetBkMode(dc), OPAQUE as i32);
+                    assert_eq!(GetDCBrushColor(dc), 0x234567);
+                    assert_eq!(GetDCPenColor(dc), 0x345678);
+                    assert_eq!(GetCurrentObject(dc, OBJ_FONT as u32), old_font);
+                    assert_eq!(GetCurrentObject(dc, OBJ_PEN as u32), old_pen);
+                    assert_eq!(GetCurrentObject(dc, OBJ_BRUSH as u32), old_brush);
+                    assert_eq!(GetMapMode(dc), old_map);
+                    let mut clip = RECT::default();
+                    assert_eq!(GetClipBox(dc, &mut clip), clip_kind);
+                    assert_eq!(
+                        (clip.left, clip.top, clip.right, clip.bottom),
+                        (old_clip.left, old_clip.top, old_clip.right, old_clip.bottom)
+                    );
+                    let mut origin = POINT::default();
+                    GetViewportOrgEx(dc, &mut origin);
+                    assert_eq!((origin.x, origin.y), (old_viewport.x, old_viewport.y));
+                    GetWindowOrgEx(dc, &mut origin);
+                    assert_eq!((origin.x, origin.y), (old_window.x, old_window.y));
+                    SendMessageW(hwnd, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM);
                     assert_eq!(GetPixel(dc, 0, 0), palette.background);
                     // Inactive items and their shared boundary are the same track,
                     // not individually stroked buttons. Active edges are neutral.
@@ -1001,7 +1171,7 @@ mod tests {
                     );
                     assert_eq!(
                         GetPixel(dc, (active.left + active.right) / 2, active.top),
-                        palette.surface
+                        colors(palette, kind, true, true, false).fill
                     );
                     assert_eq!(
                         GetPixel(dc, (active.left + active.right) / 2, active.bottom),
@@ -1043,7 +1213,7 @@ mod tests {
                     assert_eq!(GetPixel(dc, sample_x, middle), palette.subtle());
                     assert_eq!(
                         GetPixel(dc, (active.left + active.right) / 2, active.top),
-                        blend(palette.subtle(), palette.surface, 55)
+                        colors(palette, kind, true, false, false).fill
                     );
                     EnableWindow(hwnd, 1);
                     SendMessageW(hwnd, WM_MOUSEMOVE, 0, point);
@@ -1136,7 +1306,16 @@ mod tests {
             // only a Weak is kept by the test while the real messages run.
             unsafe {
                 MoveWindow(hwnd, 0, 0, 390, 30, 0);
-                apply(hwnd, kind, palette(), 96);
+                apply(
+                    hwnd,
+                    kind,
+                    if kind == Resolved::Dark {
+                        dark_palette()
+                    } else {
+                        palette()
+                    },
+                    96,
+                );
                 let pointer = marked(hwnd);
                 assert!(!pointer.is_null());
                 Rc::increment_strong_count(pointer);
@@ -1242,7 +1421,7 @@ mod tests {
                 null(),
             );
             assert!(!other.is_null());
-            apply(other, Resolved::Dark, palette(), 192);
+            apply(other, Resolved::Dark, dark_palette(), 192);
             assert!(marked(other).is_null());
             let unrelated = NMHDR {
                 hwndFrom: other,

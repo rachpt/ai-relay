@@ -64,7 +64,7 @@ public static class RoundedNative {
         public string Class,Bounds;
         public int Width,Height,Diameter;
         public uint DPI;
-        public bool CornersOutside,MiddleInside,ExactSixDipRadius;
+        public bool CornersOutside,MiddleInside,ExactFourDipRadius;
     }
     static void Guard(IntPtr pinned,uint pid,IntPtr h) {
         StatusBarNative.CheckProcess(pinned,pid); ProxyUiSmoke.CheckOwner(h,pid);
@@ -83,7 +83,7 @@ public static class RoundedNative {
             var outer=StatusBarNative.Outer(h,pid);
             uint dpi=ClarityNative.GetDpiForWindow(h);
             if(dpi<96 || outer.Width<4 || outer.Height<4) throw new Exception("Invalid physical native geometry");
-            int diameter=Math.Min(Math.Min(outer.Width,outer.Height),(int)((12L*Math.Min(768u,dpi)+48)/96));
+            int diameter=Math.Min(Math.Min(outer.Width,outer.Height),(int)((8L*Math.Min(768u,dpi)+48)/96));
             copy=CreateRectRgn(0,0,0,0);
             if(copy==IntPtr.Zero) throw new Exception("Cannot allocate local HRGN");
             // GetWindowRgn copies a foreign HWND's region into OUR local GDI object.
@@ -102,11 +102,11 @@ public static class RoundedNative {
             // Match the public GDI rasterization, including its exclusive last row/column.
             expected=CreateRoundRectRgn(0,0,outer.Width+1,outer.Height+1,diameter,diameter);
             if(expected==IntPtr.Zero || !outside || !inside || !EqualRgn(copy,expected))
-                throw new Exception("Wrong rounded region: corners/middle/6 DIP radius mismatch");
+                throw new Exception("Wrong rounded region: corners/middle/4 DIP radius mismatch");
             var after=StatusBarNative.Outer(h,pid);
             if(after.Width!=outer.Width || after.Height!=outer.Height) throw new Exception("Control resized during region check");
             return new RegionProof { Class=ProxyUiSmoke.Class(h),Bounds=box.ToString(),Width=outer.Width,Height=outer.Height,
-                Diameter=diameter,DPI=dpi,CornersOutside=outside,MiddleInside=inside,ExactSixDipRadius=true };
+                Diameter=diameter,DPI=dpi,CornersOutside=outside,MiddleInside=inside,ExactFourDipRadius=true };
         } finally {
             bool ok=true;
             if(expected!=IntPtr.Zero) ok=DeleteObject(expected) && ok;
@@ -452,7 +452,7 @@ function Regions([switch]$Log) {
     DateRegions -Log:$Log
     foreach ($id in @(2320,2310)) {
         $proof=[RoundedNative]::Region($childHandle,[uint32]$ownedPid,(Control $id))
-        if ($Log) { Record "region $id full-window/corners/middle/6-DIP" $proof }
+        if ($Log) { Record "region $id full-window/corners/middle/4-DIP" $proof }
     }
 }
 function Resize([bool]$Small) {
@@ -748,4 +748,4 @@ try {
 }
 if ($null -ne $failure) { throw $failure }
 if ($cleanupErrors.Count -gt 0) { throw ($cleanupErrors -join '; ') }
-Write-Output 'PASS: native rectangular Edits and four native date pickers without clipping regions (including hidden HWNDs), 6-DIP rounded button/combo regions and resize, Edit text/margins/selection/caret, unchanged empty masked settings, native combo/calendar popup, observed real pending/completion with zero records, disabled buttons, light/dark physical corner/overview/history evidence, 100 bounded GDI theme+resize cycles and byte-identical config.'
+Write-Output 'PASS: native rectangular Edits and four native date pickers without clipping regions (including hidden HWNDs), 4-DIP rounded button/combo regions and resize, Edit text/margins/selection/caret, unchanged empty masked settings, native combo/calendar popup, observed real pending/completion with zero records, disabled buttons, light/dark physical corner/overview/history evidence, 100 bounded GDI theme+resize cycles and byte-identical config.'

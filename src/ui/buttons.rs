@@ -6,7 +6,7 @@ use super::{
 use crate::windows::scale;
 use std::{mem::size_of, ptr::null};
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::*,
     UI::{Controls::*, WindowsAndMessaging::*},
 };
@@ -82,7 +82,7 @@ pub(super) unsafe fn apply(hwnd: HWND, kind: Resolved) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Colors {
     fill: u32,
     border: u32,
@@ -93,11 +93,10 @@ fn colors(id: u32, flags: u32, hot: bool, p: Palette, kind: Resolved) -> Colors 
         return Colors {
             fill: blend(p.surface, p.background, 60),
             border: blend(p.border, p.background, 55),
-            ink: blend(p.disabled, p.background, 22),
+            ink: p.disabled,
         };
     }
     let pressed = flags & ODS_SELECTED != 0;
-    let focus = flags & ODS_FOCUS != 0;
     if [2001, tabs::START, 2320, 2219].contains(&id) {
         let toward = if kind == Resolved::Dark { 0xffffff } else { 0 };
         let fill = if pressed {
@@ -114,48 +113,53 @@ fn colors(id: u32, flags: u32, hot: bool, p: Palette, kind: Resolved) -> Colors 
         }
     } else if [2210, 2211, 2350, 2352].contains(&id) {
         let danger = if kind == Resolved::Dark {
-            0x00adb1ff
+            0x00abb4ff
         } else {
-            0x004b43b4
+            0x001e0eb1
         };
         let fill = blend(
             p.surface,
             danger,
             if pressed {
-                22
+                12
             } else if hot {
-                15
+                8
             } else {
-                7
+                4
             },
         );
         Colors {
             fill,
-            border: if focus {
-                danger
-            } else {
-                blend(fill, danger, 18)
-            },
+            border: blend(fill, p.border, 85),
             ink: danger,
         }
     } else {
         Colors {
             fill: if pressed {
-                p.accent_surface
+                blend(p.surface, p.text, 10)
             } else if hot {
                 p.hover()
             } else {
                 p.surface
             },
-            border: if focus {
-                p.accent
+            border: if pressed {
+                blend(p.border, p.disabled, 25)
             } else if hot {
-                blend(p.border, p.accent, 40)
+                blend(p.border, p.disabled, 15)
             } else {
                 p.border
             },
             ink: p.text,
         }
+    }
+}
+
+fn text_rect(bounds: RECT, dpi: u32) -> RECT {
+    let padding = scale(8, dpi).min((bounds.right - bounds.left).max(0) / 2);
+    RECT {
+        left: bounds.left + padding,
+        right: bounds.right - padding,
+        ..bounds
     }
 }
 
@@ -191,11 +195,8 @@ pub(super) unsafe fn draw(item: &DRAWITEMSTRUCT, dpi: u32, p: Palette, kind: Res
         SetBkMode(item.hDC, TRANSPARENT as i32);
         SetTextColor(item.hDC, c.ink);
         let title = crate::windows::wide(&settings::text(item.hwndItem));
-        let mut rect = item.rcItem;
-        InflateRect(&mut rect, -scale(8, dpi), 0);
-        if item.itemState & ODS_SELECTED != 0 {
-            OffsetRect(&mut rect, 0, scale(1, dpi));
-        }
+        // Press feedback is a surface change, not a moving text baseline.
+        let mut rect = text_rect(item.rcItem, dpi);
         if rect.right > rect.left {
             DrawTextW(
                 item.hDC,
@@ -213,11 +214,13 @@ pub(super) unsafe fn draw(item: &DRAWITEMSTRUCT, dpi: u32, p: Palette, kind: Res
                     },
             );
         }
-        if item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT) == ODS_FOCUS {
+        if item.itemState & (ODS_DISABLED | ODS_FOCUS | ODS_NOFOCUSRECT) == ODS_FOCUS {
             let mut focus = item.rcItem;
             InflateRect(&mut focus, -scale(4, dpi), -scale(4, dpi));
-            SetBkColor(item.hDC, c.fill);
-            DrawFocusRect(item.hDC, &focus);
+            if focus.right > focus.left && focus.bottom > focus.top {
+                SetBkColor(item.hDC, c.fill);
+                DrawFocusRect(item.hDC, &focus);
+            }
         }
     }
 }
@@ -249,7 +252,10 @@ unsafe extern "system" fn procedure(
             return DefSubclassProc(hwnd, message, w, l);
         }
         if (*(data as *const State)).enabled {
-            if message == WM_MOUSEMOVE && !(*(data as *const State)).hover {
+            if message == WM_MOUSEMOVE
+                && !(*(data as *const State)).hover
+                && GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_DISABLED == 0
+            {
                 let mut tracking = MouseTracking {
                     size: size_of::<MouseTracking>() as u32,
                     flags: 2,
@@ -260,7 +266,10 @@ unsafe extern "system" fn procedure(
                     (*(data as *mut State)).hover = true;
                     InvalidateRect(hwnd, null(), 0);
                 }
-            } else if matches!(message, WM_MOUSELEAVE | WM_ENABLE | WM_SHOWWINDOW) {
+            } else if matches!(
+                message,
+                WM_MOUSELEAVE | WM_ENABLE | WM_SHOWWINDOW | WM_CANCELMODE
+            ) {
                 (*(data as *mut State)).hover = false;
                 InvalidateRect(hwnd, null(), 0);
             }
@@ -274,7 +283,7 @@ mod tests {
     use super::*;
     use std::{cell::Cell, ptr::null_mut, sync::Once};
     use windows_sys::Win32::{
-        Foundation::{POINT, RECT},
+        Foundation::POINT,
         System::{
             LibraryLoader::GetModuleHandleW,
             Threading::{GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources},
@@ -291,23 +300,23 @@ mod tests {
     fn palette(kind: Resolved) -> Palette {
         if kind == Resolved::Dark {
             return Palette {
-                background: 0x221915,
-                surface: 0x32261f,
-                text: 0xf8eee9,
-                disabled: 0xc5afa1,
-                accent: 0xffba9b,
-                border: 0x544035,
-                accent_surface: 0x513929,
+                background: 0x202020,
+                surface: 0x2b2b2b,
+                text: 0xf5f5f5,
+                disabled: 0xc5c5c5,
+                accent: 0xffcd60,
+                border: 0x454545,
+                accent_surface: 0x473d2d,
             };
         }
         Palette {
-            background: 0xfb_f7_f5,
-            surface: 0xff_ff_ff,
-            text: 0x3d_2b_20,
-            disabled: 0x80_6a_5a,
-            accent: 0xce_5c_31,
-            border: 0xeb_df_d7,
-            accent_surface: 0xff_ef_e8,
+            background: 0xf3f3f3,
+            surface: 0xffffff,
+            text: 0x1a1a1a,
+            disabled: 0x616161,
+            accent: 0xb85f00,
+            border: 0xe0e0e0,
+            accent_surface: 0xf9f2ea,
         }
     }
 
@@ -324,10 +333,8 @@ mod tests {
         );
         let neutral = colors(2317, 0, false, p, Resolved::Light);
         assert_eq!(neutral.fill, p.surface);
-        assert_eq!(
-            colors(2317, ODS_FOCUS, false, p, Resolved::Light).border,
-            p.accent
-        );
+        // Keyboard focus has its own native focus rectangle, not a second accent stroke.
+        assert_eq!(colors(2317, ODS_FOCUS, false, p, Resolved::Light), neutral);
         assert_ne!(colors(2350, 0, false, p, Resolved::Light).ink, p.text);
         for id in [2320, 2317, 2350] {
             let disabled = colors(id, ODS_DISABLED | ODS_SELECTED, true, p, Resolved::Light);
@@ -395,6 +402,92 @@ mod tests {
                 eprintln!("system high contrast: app primary fills are inactive; fixtures checked");
             } else {
                 assert_primary_contrast(theme.palette, theme.kind);
+            }
+        }
+    }
+
+    fn assert_action_contrast(p: Palette, kind: Resolved) {
+        for id in [2320, 2317, 2350] {
+            for flags in [
+                0,
+                ODS_SELECTED,
+                ODS_FOCUS,
+                ODS_SELECTED | ODS_FOCUS,
+                ODS_DISABLED,
+            ] {
+                for hot in [false, true] {
+                    let c = colors(id, flags, hot, p, kind);
+                    let ink = luminance(c.ink);
+                    let fill = luminance(c.fill);
+                    let ratio = (ink.max(fill) + 0.05) / (ink.min(fill) + 0.05);
+                    assert!(
+                        ratio >= 4.5,
+                        "{kind:?} action {id}, flags={flags}, hot={hot}: {ratio}"
+                    );
+                    if flags & ODS_DISABLED != 0 {
+                        assert_eq!(
+                            c,
+                            colors(id, flags | ODS_SELECTED | ODS_FOCUS, true, p, kind)
+                        );
+                        assert_ne!(c.ink, p.text);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_action_text_states_preserve_contrast_in_fixtures_and_real_palette() {
+        for kind in [Resolved::Light, Resolved::Dark] {
+            assert_action_contrast(palette(kind), kind);
+        }
+        for mode in [
+            crate::config::ThemeMode::Light,
+            crate::config::ThemeMode::Dark,
+        ] {
+            let theme = crate::ui::theme::Theme::new(mode).unwrap();
+            if theme.kind != Resolved::Contrast {
+                assert_action_contrast(theme.palette, theme.kind);
+            }
+        }
+    }
+
+    #[test]
+    fn neutral_actions_stay_achromatic_and_geometry_keeps_text_centered() {
+        for kind in [Resolved::Light, Resolved::Dark] {
+            let p = palette(kind);
+            for (flags, hot) in [
+                (0, false),
+                (0, true),
+                (ODS_SELECTED, true),
+                (ODS_FOCUS, true),
+                (ODS_DISABLED, true),
+            ] {
+                let c = colors(2317, flags, hot, p, kind);
+                for color in [c.fill, c.border, c.ink] {
+                    assert_eq!(color & 255, color >> 8 & 255);
+                    assert_eq!(color & 255, color >> 16 & 255);
+                }
+            }
+        }
+        for dpi in [96, 144, 192] {
+            for height in [28, 30, 36] {
+                for width in [0, 1, 8, 180] {
+                    let bounds = RECT {
+                        left: 5,
+                        top: 7,
+                        right: 5 + scale(width, dpi),
+                        bottom: 7 + scale(height, dpi),
+                    };
+                    let text = text_rect(bounds, dpi);
+                    assert_eq!((text.top, text.bottom), (bounds.top, bounds.bottom));
+                    assert!(
+                        text.left >= bounds.left
+                            && text.right <= bounds.right
+                            && text.left <= text.right
+                    );
+                    assert_eq!(text.left - bounds.left, bounds.right - text.right);
+                }
             }
         }
     }
@@ -831,6 +924,67 @@ mod tests {
     }
 
     #[test]
+    fn native_pressed_caption_keeps_the_same_ink_pixels_at_fixed_heights() {
+        let host = Host::new();
+        let bitmap = BitmapDc::new();
+        let caption = crate::windows::wide("Stable &action");
+        // SAFETY: Hidden test-owned native Button and memory bitmap. Exact ink
+        // pixels use a stock raster font; no desktop input or screenshot is used.
+        unsafe {
+            SetWindowTextW(host.button, caption.as_ptr());
+            let font = GetStockObject(SYSTEM_FIXED_FONT);
+            SendMessageW(host.button, WM_SETFONT, font as WPARAM, 0);
+            SetFocus(host.native);
+            for dpi in [96, 144, 192] {
+                for kind in [Resolved::Light, Resolved::Dark] {
+                    host.theme(kind, dpi);
+                    for height in [28, 30, 36] {
+                        let bounds = RECT {
+                            right: scale(180, dpi),
+                            bottom: scale(height, dpi),
+                            ..RECT::default()
+                        };
+                        MoveWindow(host.button, 0, 0, bounds.right, bounds.bottom, 0);
+                        let rect = RECT {
+                            top: bounds.top + scale(4, dpi),
+                            bottom: bounds.bottom - scale(4, dpi),
+                            ..text_rect(bounds, dpi)
+                        };
+                        let ink = palette(kind).on_accent();
+                        let capture_ink = || {
+                            let mut mask = Vec::new();
+                            for y in rect.top..rect.bottom {
+                                for x in rect.left..rect.right {
+                                    mask.push(GetPixel(bitmap.dc, x, y) == ink);
+                                }
+                            }
+                            mask
+                        };
+                        SendMessageW(host.button, BM_SETSTATE, 0, 0);
+                        host.print(bitmap.dc, WM_PRINTCLIENT);
+                        let normal = capture_ink();
+                        assert!(normal.iter().any(|pixel| *pixel), "no caption ink");
+                        assert!(
+                            normal.iter().any(|pixel| !*pixel),
+                            "solid/invalid caption image"
+                        );
+                        SendMessageW(host.button, BM_SETSTATE, 1, 0);
+                        host.print(bitmap.dc, WM_PRINTCLIENT);
+                        assert_ne!(host.probe.get().flags & ODS_SELECTED, 0);
+                        assert_eq!(
+                            normal,
+                            capture_ink(),
+                            "caption moved in {kind:?}, dpi={dpi}, height={height}"
+                        );
+                        assert_native_values(host.button, &caption, font);
+                        SendMessageW(host.button, BM_SETSTATE, 0, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_hover_contrast_detach_and_reentrant_command_cleanup() {
         let host = Host::new();
         let bitmap = BitmapDc::new();
@@ -850,7 +1004,13 @@ mod tests {
             SendMessageW(host.button, WM_MOUSEMOVE, 0, 10 | (10 << 16));
             EnableWindow(host.button, 0);
             assert!(!state(host.button).unwrap().hover);
+            SendMessageW(host.button, WM_MOUSEMOVE, 0, 10 | (10 << 16));
+            assert!(!state(host.button).unwrap().hover);
             EnableWindow(host.button, 1);
+            SendMessageW(host.button, WM_MOUSEMOVE, 0, 10 | (10 << 16));
+            assert!(state(host.button).unwrap().hover);
+            SendMessageW(host.button, WM_CANCELMODE, 0, 0);
+            assert!(!state(host.button).unwrap().hover);
             host.theme(Resolved::Contrast, 96);
             let mut data = 0;
             assert_eq!(

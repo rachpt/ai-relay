@@ -343,7 +343,7 @@ public static class DashboardNative {
     }
     public sealed class RegionProof {
         public string Name,Role,WidthScope;
-        public int X,Y,Width,Height,Blue,Red,Teal,Ink,Colored,ExpectedContractTextWidth,ExpectedLayoutTextBudget;
+        public int X,Y,Width,Height,Blue,Red,Ink,Colored,NeutralInk,NeutralSurface,ExpectedContractTextWidth,ExpectedLayoutTextBudget;
     }
     // Actual full HWND/PNG/DPI, but font widths are HARNESS-OWNED expected contract
     // budgets, never target-HFONT measurements or exported painter rectangles.
@@ -384,7 +384,7 @@ public static class DashboardNative {
                 int second=Math.Min(b,Math.Max(0,available-first));
                 for(int j=0;j<2;j++) {
                     int x=j==0?left:left+first+gap,w=j==0?first:second;
-                    string role=i==0?(j==0?"legend-blue":"legend-red"):(j==0?"legend-teal":"legend-blue");
+                    string role=i==0?(j==0?"legend-blue":"legend-red"):(j==0?"legend-neutral":"legend-blue");
                     result.Add(Region(image,"chart-"+i+"-legend-"+j+"-glyph",role,x,top+px(34),px(14),px(20),dark));
                     var label=Region(image,"chart-"+i+"-legend-"+j+"-text","legend-text",x+marker,top+px(34),w-marker,px(20),dark);
                     label.ExpectedContractTextWidth=contractWidths[2*i+j]; label.ExpectedLayoutTextBudget=label.Width; label.WidthScope=ExpectedFontWidthScope; result.Add(label);
@@ -396,6 +396,30 @@ public static class DashboardNative {
         }
         return result.ToArray();
     }
+    public static void RequireBadgeInk(RegionProof proof,bool error) {
+        if(proof.Ink<4 || proof.NeutralSurface<proof.Width*proof.Height/2)
+            throw new Exception("Missing readable badge icon or neutral surface: "+proof.Name);
+        if(error?proof.Red<4:(proof.NeutralInk<4 || proof.Colored!=0))
+            throw new Exception("Badge must use neutral ink except for a nonzero error count: "+proof.Name);
+    }
+    public static string ValidatePresentation() {
+        foreach(bool dark in new[]{false,true}) using(var image=new Bitmap(22,22)) {
+            Color surface=dark?Color.FromArgb(51,51,51):Color.FromArgb(245,245,245);
+            Color ink=dark?Color.FromArgb(197,197,197):Color.FromArgb(97,97,97);
+            using(var graphics=Graphics.FromImage(image)) graphics.Clear(surface);
+            int rejected=0;
+            try { RequireBadgeInk(Region(image,"blank","badge",0,0,22,22,dark),false); }
+            catch(Exception) { rejected++; }
+            for(int x=5;x<17;x++) image.SetPixel(x,10,ink);
+            RequireBadgeInk(Region(image,"neutral","badge",0,0,22,22,dark),false);
+            for(int x=5;x<17;x++) image.SetPixel(x,10,dark?Color.FromArgb(228,154,139):Color.FromArgb(179,80,63));
+            try { RequireBadgeInk(Region(image,"wrong-color","badge",0,0,22,22,dark),false); }
+            catch(Exception) { rejected++; }
+            RequireBadgeInk(Region(image,"error","badge",0,0,22,22,dark),true);
+            if(rejected!=2) throw new Exception("Blank or unexpected colored badge was accepted");
+        }
+        return "neutral badge surface/ink and nonzero-error red checks, blank and unexpected-colored icon rejection in both themes; synthetic helper only";
+    }
     static RegionProof Region(Bitmap b,string name,string role,int x,int y,int w,int h,bool dark) {
         if(w<1 || h<1 || x<0 || y<0 || x+w>b.Width || y+h>b.Height) throw new Exception("Expected inspection region outside complete viewport-contained dashboard crop: "+name);
         var p=new RegionProof { Name=name,Role=role,X=x,Y=y,Width=w,Height=h };
@@ -404,10 +428,13 @@ public static class DashboardNative {
             var c=b.GetPixel(xx,yy);
             if(c.B>c.R+25 && c.B>c.G+12) p.Blue++;
             if(c.R>c.G+25 && c.R>c.B+25) p.Red++;
-            if(c.G>c.R+18 && c.B>c.R+18 && c.G>=c.B-25) p.Teal++;
-            if(Math.Max(c.R,Math.Max(c.G,c.B))-Math.Min(c.R,Math.Min(c.G,c.B))>45) p.Colored++;
+            int span=Math.Max(c.R,Math.Max(c.G,c.B))-Math.Min(c.R,Math.Min(c.G,c.B));
+            if(span>45) p.Colored++;
             int l=(int)(0.2126*c.R+0.7152*c.G+0.0722*c.B);
-            if(dark?l>150:l<125) p.Ink++;
+            bool ink=dark?l>150:l<125;
+            if(ink) p.Ink++;
+            if(span<=8 && ink) p.NeutralInk++;
+            if(span<=8 && (dark?l>=30 && l<=100:l>=180)) p.NeutralSurface++;
         }
         return p;
     }
@@ -502,9 +529,10 @@ foreach ($call in $ast.FindAll({ param($n) $n -is [Management.Automation.Languag
 }
 $cropValidation=[DashboardNative]::ValidateCrop()
 $fontValidation=[DashboardNative]::ValidateExpectedFont()
+$presentationValidation=[DashboardNative]::ValidatePresentation()
 if ($ValidateOnly) {
-    Write-Output "PASS: PowerShell parser/public helper call sites, declaration extraction, combined C# compilation; $cropValidation; $fontValidation"
-    Write-Output 'VALIDATION ONLY: local expected-contract memory DC/font lifecycle and pure crop helpers only; no target EXE lookup/build, mutex, GUI, target geometry/font/PrintWindow, fixture, mock, network or acceptance tests run'
+    Write-Output "PASS: PowerShell parser/public helper call sites, declaration extraction, combined C# compilation; $cropValidation; $fontValidation; $presentationValidation"
+    Write-Output 'VALIDATION ONLY: local expected-contract memory DC/font lifecycle, synthetic neutral/error ink checks and pure crop helpers only; no target EXE lookup/build, mutex, GUI, target geometry/font/PrintWindow, fixture, mock, network or acceptance tests run'
     return
 }
 
@@ -904,9 +932,9 @@ function Assert-DashboardPixels([string]$Name,[bool]$Dark) {
         if (($before.Labels -join '|') -cne ($current.Labels -join '|') -or $before.UnknownReasonRow -ne $current.UnknownReasonRow) { continue }
         $proof=[DashboardNative]::Inspect($shot.Path,$dashboard,[uint32]$ownedPid,$Dark,[string[]]$current.Labels,$current.UnknownReasonRow)
         foreach ($p in $proof) {
-            if ($p.Role -eq 'badge' -and $p.Colored -lt 4) { throw "No rough colored badge ink: $($p.Name)" }
+            if ($p.Role -eq 'badge') { [DashboardNative]::RequireBadgeInk($p,($p.Name -eq 'card-1-badge' -and $current.Errors -gt 0)) }
             if ($p.Role -in @('value','title','units','legend-text') -and $p.Ink -lt 4) { throw "No rough theme-text ink (not a glyph/value identification): $($p.Name)" }
-            if (($p.Role -eq 'legend-blue' -and $p.Blue -lt 4) -or ($p.Role -eq 'legend-red' -and $p.Red -lt 4) -or ($p.Role -eq 'legend-teal' -and $p.Teal -lt 4)) { throw "No expected colored compact series glyph: $($p.Name)" }
+            if (($p.Role -eq 'legend-blue' -and $p.Blue -lt 4) -or ($p.Role -eq 'legend-red' -and $p.Red -lt 4) -or ($p.Role -eq 'legend-neutral' -and $p.NeutralInk -lt 4)) { throw "No expected compact series glyph ink: $($p.Name)" }
             if ($p.Role -in @('units','legend-text') -and $p.ExpectedContractTextWidth -gt $p.ExpectedLayoutTextBudget) { throw "Harness expected painter-font contract text exceeds expected inspection budget: $($p.Name); NOT a target-font measurement or painter-rectangle observation" }
             if ($p.Role -eq 'plot' -and $null -ne $current.Rates -and $p.Colored -lt 4) { throw "No real sampled curve color in expected plot region: $($p.Name)" }
         }

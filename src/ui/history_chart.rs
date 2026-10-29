@@ -3,6 +3,7 @@
 //! equivalents. This module does not create controls, perform I/O or retain the report.
 //! Compact numbers use decimal K/M with up to two decimals; `≈` marks truncation,
 //! never missing data. Exact values remain available in the caller's text/table.
+use super::theme::{Palette, Resolved, blend};
 use crate::history::{QueryReport, Summary};
 use crate::windows::scale;
 use windows_sys::Win32::{
@@ -99,7 +100,7 @@ struct Canvas {
     dc: HDC,
     font: HFONT,
     heading: HFONT,
-    palette: super::theme::Palette,
+    palette: Palette,
     contrast: bool,
     bounds: RECT,
     dpi: u32,
@@ -107,6 +108,22 @@ struct Canvas {
 impl Canvas {
     fn px(&self, value: i32) -> i32 {
         scale(value, self.dpi)
+    }
+
+    fn secondary(&self) -> u32 {
+        if self.contrast {
+            self.palette.text
+        } else {
+            self.palette.disabled
+        }
+    }
+
+    fn edge(&self) -> u32 {
+        if self.contrast {
+            self.palette.border
+        } else {
+            blend(self.palette.surface, self.palette.border, 80)
+        }
     }
 
     fn rect(&self, x: i32, y: i32, width: i32, height: i32) -> RECT {
@@ -139,11 +156,23 @@ impl Canvas {
     }
 
     fn panel(&self, rect: RECT, fill: u32, border: u32, diameter: i32) {
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return;
+        }
+        let diameter = diameter
+            .max(0)
+            .min(rect.right - rect.left)
+            .min(rect.bottom - rect.top);
         // SAFETY: Canvas is used only under draw's saved DC; stock selections
         // and colors are restored, and no GDI objects are owned or retained.
         unsafe {
-            SelectObject(self.dc, GetStockObject(DC_BRUSH));
-            SelectObject(self.dc, GetStockObject(DC_PEN));
+            let brush = GetStockObject(DC_BRUSH);
+            let pen = GetStockObject(DC_PEN);
+            if brush.is_null() || pen.is_null() {
+                return;
+            }
+            SelectObject(self.dc, brush);
+            SelectObject(self.dc, pen);
             SetDCBrushColor(self.dc, fill);
             SetDCPenColor(self.dc, border);
             RoundRect(
@@ -158,7 +187,7 @@ impl Canvas {
         }
     }
 
-    fn text(&self, text: &str, mut rect: RECT, heading: bool, centered: bool) {
+    fn text(&self, text: &str, mut rect: RECT, color: u32, heading: bool, centered: bool) {
         if rect.right <= rect.left || rect.bottom <= rect.top {
             return;
         }
@@ -168,14 +197,7 @@ impl Canvas {
         // used. Font selection and text/DC attributes are restored by SavedDc.
         unsafe {
             SelectObject(self.dc, if heading { self.heading } else { self.font });
-            SetTextColor(
-                self.dc,
-                if heading || self.contrast {
-                    self.palette.text
-                } else {
-                    self.palette.disabled
-                },
-            );
+            SetTextColor(self.dc, color);
             DrawTextW(
                 self.dc,
                 text.as_ptr(),
@@ -225,23 +247,16 @@ impl Canvas {
                     right - card_left - self.px(6),
                     self.px(70),
                 ),
-                if self.contrast {
-                    self.palette.surface
-                } else {
-                    self.palette.subtle()
-                },
-                if self.contrast {
-                    self.palette.border
-                } else {
-                    self.palette.subtle()
-                },
-                self.px(12),
+                self.palette.surface,
+                self.edge(),
+                self.px(16),
             );
             let x = card_left + self.px(10);
             let cell = (right - x - self.px(14)).max(0);
             self.text(
                 title,
                 self.rect(x, self.px(4), cell, self.px(20)),
+                self.palette.text,
                 false,
                 false,
             );
@@ -258,6 +273,7 @@ impl Canvas {
             self.text(
                 &value,
                 self.rect(x, self.px(24), cell, self.px(28)),
+                self.palette.text,
                 true,
                 false,
             );
@@ -275,6 +291,7 @@ impl Canvas {
             self.text(
                 &note,
                 self.rect(x, self.px(52), cell, self.px(20)),
+                self.secondary(),
                 false,
                 false,
             );
@@ -286,6 +303,7 @@ impl Canvas {
             self.text(
                 "总 Token · 无趋势桶（不是 0 Token）",
                 self.rect(x, self.px(106), width, self.px(70)),
+                self.palette.text,
                 false,
                 false,
             );
@@ -313,6 +331,7 @@ impl Canvas {
         self.text(
             &title,
             self.rect(x, self.px(78), width, self.px(20)),
+            self.palette.text,
             false,
             false,
         );
@@ -346,12 +365,14 @@ impl Canvas {
                         cell / 2,
                         height.max(1),
                     ),
-                    if height == 0 {
+                    if height == 0 || self.contrast {
                         self.palette.text
                     } else {
                         self.palette.accent
                     },
-                    false,
+                    self.contrast
+                        && height != 0
+                        && point.summary.coverage[2] < point.summary.requests,
                 );
             }
             self.text(
@@ -362,14 +383,22 @@ impl Canvas {
                     cell,
                     self.px(20),
                 ),
+                self.palette.text,
                 false,
                 true,
             );
             let (date, hour) = bucket_lines(&point.label);
-            self.text(date, self.rect(left, base, cell, self.px(20)), false, true);
+            self.text(
+                date,
+                self.rect(left, base, cell, self.px(20)),
+                self.secondary(),
+                false,
+                true,
+            );
             self.text(
                 hour,
                 self.rect(left, base + self.px(20), cell, self.px(20)),
+                self.secondary(),
                 false,
                 true,
             );
@@ -380,6 +409,7 @@ impl Canvas {
         self.text(
             "字段完整度 · 请求占比",
             self.rect(x, self.px(78), width, self.px(20)),
+            self.palette.text,
             false,
             false,
         );
@@ -399,6 +429,7 @@ impl Canvas {
                     percentage(count, summary.requests)
                 ),
                 self.rect(x, top, width, self.px(20)),
+                self.palette.text,
                 false,
                 false,
             );
@@ -425,14 +456,19 @@ impl Canvas {
                         right: track.left + length.max(1),
                         ..track
                     },
-                    self.palette.accent,
-                    false,
+                    if self.contrast {
+                        self.palette.text
+                    } else {
+                        self.palette.accent
+                    },
+                    self.contrast && index == 1,
                 );
             }
         }
         self.text(
             "字段完整 ≠ 账单完整；不补未知桶",
             self.rect(x, self.px(180), width, self.px(20)),
+            self.secondary(),
             false,
             false,
         );
@@ -459,6 +495,8 @@ pub(super) unsafe fn draw(
     let palette = theme.palette;
     let kind = theme.kind;
     if item.hDC.is_null()
+        || font.is_null()
+        || heading.is_null()
         || item.rcItem.right <= item.rcItem.left
         || item.rcItem.bottom <= item.rcItem.top
     {
@@ -492,7 +530,7 @@ pub(super) unsafe fn draw(
             font,
             heading,
             palette,
-            contrast: kind == super::theme::Resolved::Contrast,
+            contrast: kind == Resolved::Contrast,
             bounds,
             dpi: if dpi == 0 { 96 } else { dpi },
         };
@@ -501,7 +539,11 @@ pub(super) unsafe fn draw(
         canvas.summaries(report, pending, width);
         canvas.fill(
             canvas.rect(canvas.px(8), canvas.px(74), width, canvas.px(1)),
-            palette.border,
+            if canvas.contrast {
+                palette.border
+            } else {
+                blend(palette.background, palette.border, 65)
+            },
             false,
         );
         let message = if pending {
@@ -517,6 +559,7 @@ pub(super) unsafe fn draw(
             canvas.text(
                 message,
                 canvas.rect(canvas.px(8), canvas.px(90), width, canvas.px(90)),
+                palette.text,
                 false,
                 true,
             );
@@ -532,6 +575,9 @@ pub(super) unsafe fn draw(
         }
     }
 }
+
+#[cfg(test)]
+mod paint_tests;
 
 #[cfg(test)]
 mod tests {

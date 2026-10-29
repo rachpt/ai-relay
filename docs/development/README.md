@@ -4,6 +4,8 @@
 
 - [当前状态与下一步](STATUS.md)
 - [批次记录模板](TEMPLATE.md)
+- [2026-10-29-02：明暗UI精修提交前独立复核](2026-10-29-02-precommit-ui-review.md)
+- [2026-10-29-01：明暗主题与 Windows 原生组件精修](2026-10-29-01-fluent-theme-polish.md)
 - [2026-10-25-04：修复暗色月历翻月后变亮](2026-10-25-04-dark-calendar-navigation.md)
 - [2026-10-25-03：修复暗色统计表滚动期间的白色条带](2026-10-25-03-dark-report-scroll.md)
 - [2026-10-25-02：日志查看区按内容溢出显示滚动条](2026-10-25-02-log-scrollbar-visibility.md)

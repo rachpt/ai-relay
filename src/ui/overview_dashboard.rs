@@ -272,7 +272,7 @@ pub(super) use painting::draw;
 
 #[cfg(windows)]
 mod painting {
-    use super::super::theme::{Palette, Resolved};
+    use super::super::theme::{Palette, Resolved, blend};
     use super::*;
     use crate::windows::scale;
     use windows_sys::Win32::{
@@ -300,14 +300,40 @@ mod painting {
         }
     }
 
-    fn blend(a: u32, b: u32, percent: u32) -> u32 {
-        let mut color = 0;
-        for shift in [0, 8, 16] {
-            let channel =
-                (((a >> shift) & 255) * (100 - percent) + ((b >> shift) & 255) * percent) / 100;
-            color |= channel << shift;
+    struct PaintColors {
+        series: [u32; 3],
+        edge: u32,
+        grid: u32,
+        secondary: u32,
+        badge: u32,
+    }
+    impl PaintColors {
+        fn new(palette: Palette, kind: Resolved) -> Self {
+            if kind == Resolved::Contrast {
+                return Self {
+                    series: [palette.text; 3],
+                    edge: palette.border,
+                    grid: palette.border,
+                    secondary: palette.text,
+                    badge: palette.surface,
+                };
+            }
+            Self {
+                series: [
+                    palette.accent,
+                    if kind == Resolved::Dark {
+                        0x008b9ae4 // Muted error coral, COLORREF (#E49A8B).
+                    } else {
+                        0x003f50b3 // Muted error terracotta, COLORREF (#B3503F).
+                    },
+                    palette.disabled,
+                ],
+                edge: blend(palette.surface, palette.border, 80),
+                grid: blend(palette.surface, palette.border, 65),
+                secondary: palette.disabled,
+                badge: blend(palette.surface, palette.text, 4),
+            }
         }
-        color
     }
 
     struct ChartLayout {
@@ -385,7 +411,7 @@ mod painting {
         dpi: u32,
         palette: Palette,
         kind: Resolved,
-        colors: [u32; 4],
+        colors: PaintColors,
     }
     impl Canvas {
         fn px(&self, n: i32) -> i32 {
@@ -413,7 +439,15 @@ mod painting {
                 }
             }
         }
-        fn panel(&self, rect: RECT, fill: u32, border: u32, radius: i32) {
+        fn panel(&self, rect: RECT, fill: u32, border: u32, diameter: i32) {
+            if rect.right <= rect.left || rect.bottom <= rect.top {
+                return;
+            }
+            let diameter = self
+                .px(diameter)
+                .max(0)
+                .min(rect.right - rect.left)
+                .min(rect.bottom - rect.top);
             // SAFETY: Live guarded DC; draw selected valid stock pen/brush.
             // Their selections and per-DC colors are restored, never deleted.
             unsafe {
@@ -425,8 +459,8 @@ mod painting {
                     rect.top,
                     rect.right,
                     rect.bottom,
-                    self.px(radius),
-                    self.px(radius),
+                    diameter,
+                    diameter,
                 );
             }
         }
@@ -471,6 +505,16 @@ mod painting {
                 SetDCPenColor(self.dc, color);
                 MoveToEx(self.dc, a.0, a.1, std::ptr::null_mut());
                 LineTo(self.dc, b.0, b.1);
+            }
+        }
+        fn grid_line(&self, left: i32, right: i32, y: i32) {
+            if self.kind == Resolved::Contrast {
+                // System-color dots leave continuous data lines visually stronger.
+                for x in (left..right).step_by(self.px(6).max(1) as usize) {
+                    self.line((x, y), ((x + self.px(2)).min(right), y), self.colors.grid);
+                }
+            } else {
+                self.line((left, y), (right, y), self.colors.grid);
             }
         }
         fn series_line(&self, a: (i32, i32), b: (i32, i32), color: u32, secondary: bool) {
@@ -561,33 +605,19 @@ mod painting {
                 let x = i as i32 * (cell + gap);
                 let w = if i == 3 { width - x } else { cell };
                 let card = self.rect(bounds, x, 0, w, self.px(112));
-                let color = self.colors[i];
-                self.panel(
-                    card,
-                    self.palette.surface,
-                    if self.kind == Resolved::Contrast {
-                        self.palette.border
-                    } else {
-                        blend(self.palette.background, self.palette.border, 55)
-                    },
-                    16,
-                );
-                let badge = self.rect(card, self.px(12), self.px(12), self.px(22), self.px(22));
-                let tint = if self.kind == Resolved::Contrast {
-                    self.palette.surface
+                let color = if i == 1 && values[i].is_some_and(|value| value != 0) {
+                    self.colors.series[1]
                 } else {
-                    blend(self.palette.surface, color, 12)
+                    self.colors.secondary
                 };
-                self.panel(badge, tint, tint, 6);
+                self.panel(card, self.palette.surface, self.colors.edge, 16);
+                let badge = self.rect(card, self.px(12), self.px(12), self.px(22), self.px(22));
+                self.panel(badge, self.colors.badge, self.colors.badge, 8);
                 self.icon(badge, i, color);
                 self.text(
                     ["累计请求", "错误次数", "活动请求", "下载累计"][i],
                     self.rect(card, self.px(42), self.px(12), w - self.px(52), self.px(22)),
-                    if self.kind == Resolved::Contrast {
-                        self.palette.text
-                    } else {
-                        self.palette.disabled
-                    },
+                    self.palette.text,
                     false,
                     0,
                 );
@@ -602,11 +632,7 @@ mod painting {
                 self.text(
                     &details[i],
                     self.rect(card, self.px(12), self.px(82), w - self.px(24), self.px(20)),
-                    if self.kind == Resolved::Contrast {
-                        self.palette.text
-                    } else {
-                        self.palette.disabled
-                    },
+                    self.colors.secondary,
                     false,
                     0,
                 );
@@ -624,11 +650,11 @@ mod painting {
             unsafe {
                 IntersectClipRect(self.dc, panel.left, panel.top, panel.right, panel.bottom);
             }
-            self.panel(panel, self.palette.surface, self.palette.border, 16);
+            self.panel(panel, self.palette.surface, self.colors.edge, 16);
             let color = if bytes {
-                [self.colors[2], self.colors[0]]
+                [self.colors.series[2], self.colors.series[0]]
             } else {
-                [self.colors[0], self.colors[1]]
+                [self.colors.series[0], self.colors.series[1]]
             };
             let names = if bytes {
                 ["上传", "下载"]
@@ -669,17 +695,7 @@ mod painting {
                 false,
                 0,
             );
-            self.text(
-                &unit,
-                layout.unit,
-                if self.kind == Resolved::Contrast {
-                    self.palette.text
-                } else {
-                    self.palette.disabled
-                },
-                false,
-                DT_RIGHT,
-            );
+            self.text(&unit, layout.unit, self.colors.secondary, false, DT_RIGHT);
             for i in 0..2 {
                 let rect = layout.legends[i];
                 let y = (rect.top + rect.bottom) / 2;
@@ -724,7 +740,7 @@ mod painting {
             // for idle data does not imply a nonzero rate; unknowns remain gaps.
             for i in 0..3 {
                 let y = plot.top + (plot.bottom - plot.top) * i / 2;
-                self.line((plot.left, y), (plot.right, y), self.palette.border);
+                self.grid_line(plot.left, plot.right, y);
                 self.text(
                     &rate_number(maximum * (2 - i) as f64 / 2.0),
                     RECT {
@@ -733,7 +749,7 @@ mod painting {
                         right: plot.left - self.px(6),
                         bottom: y + self.px(10),
                     },
-                    self.palette.text,
+                    self.colors.secondary,
                     false,
                     DT_RIGHT,
                 );
@@ -742,7 +758,7 @@ mod painting {
             self.line(
                 (plot.left, plot.top),
                 (plot.left, plot.bottom),
-                self.palette.border,
+                self.colors.edge,
             );
             for (i, label) in ["-120s", "-60s", "现在"].iter().enumerate() {
                 let x = plot.left + (plot.right - plot.left) * i as i32 / 2;
@@ -758,7 +774,7 @@ mod painting {
                             bottom: plot.bottom + self.px(24),
                         }
                     },
-                    self.palette.text,
+                    self.colors.secondary,
                     false,
                     DT_CENTER,
                 );
@@ -869,11 +885,7 @@ mod painting {
             SelectObject(item.hDC, pen);
             SelectObject(item.hDC, brush);
             SetBkMode(item.hDC, TRANSPARENT as i32);
-            let colors = match kind {
-                Resolved::Contrast => [palette.text, palette.text, palette.text, palette.text],
-                Resolved::Dark => [palette.accent, 0x008bb2ff, 0x00c4d25e, 0x00efca71],
-                Resolved::Light => [palette.accent, 0x00333dc2, 0x007d7711, 0x00a06c12],
-            };
+            let colors = PaintColors::new(palette, kind);
             let canvas = Canvas {
                 dc: item.hDC,
                 font,
@@ -959,12 +971,15 @@ mod painting {
                     right: bounds.right,
                     bottom: bounds.bottom,
                 },
-                palette.text,
+                canvas.colors.secondary,
                 false,
                 0,
             );
         }
     }
+    #[cfg(test)]
+    mod visual_tests;
+
     #[cfg(test)]
     mod layout_tests {
         use super::*;
@@ -1042,7 +1057,7 @@ mod painting {
                                 dpi,
                                 palette: theme.palette,
                                 kind,
-                                colors: [theme.palette.accent, 0x333dc2, 0x7d7711, 0xa06c12],
+                                colors: PaintColors::new(theme.palette, kind),
                             };
                             let level = SaveDC(dc);
                             assert_ne!(level, 0);
