@@ -1117,15 +1117,22 @@ fn dark_applied_while_both_axes_fit_tracks_later_overflow_without_reapplication(
             assert_ne!(GetCapture(), f.edit);
         }
         assert_eq!(probe.native_entries.get(), 0);
-        for kind in [theme::Resolved::Light, theme::Resolved::Contrast] {
-            theme(&f, kind, 96);
-            SendMessageW(f.edit, WM_NCLBUTTONDOWN, HTVSCROLL as WPARAM, 0);
-            assert_ne!(GetCapture(), f.edit);
-        }
+        theme(&f, theme::Resolved::Light, 96);
+        let point = press(f.edit, true, Press::Thumb);
+        assert_eq!(GetCapture(), f.edit);
+        captured_mouse(f.edit, WM_LBUTTONUP, point);
         assert_eq!(
             probe.native_entries.get(),
-            2,
-            "Light/Contrast must restore native input"
+            0,
+            "Light must retain themed tracking"
+        );
+        theme(&f, theme::Resolved::Contrast, 96);
+        SendMessageW(f.edit, WM_NCLBUTTONDOWN, HTVSCROLL as WPARAM, packed(point));
+        assert_ne!(GetCapture(), f.edit);
+        assert_eq!(
+            probe.native_entries.get(),
+            1,
+            "Contrast must restore native input"
         );
     }
 }

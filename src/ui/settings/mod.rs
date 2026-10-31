@@ -6,12 +6,16 @@ use crate::config::{Config, ThemeMode};
 mod commands;
 mod draft;
 mod events;
+mod layout;
+mod numeric;
 mod panel;
+mod secret;
 #[cfg(test)]
 mod tests;
 
 pub(super) use commands::handle_command;
 pub(super) use events::poll;
+pub(super) use secret::draw;
 
 // winuser.h definitions not exposed by the currently enabled windows-sys features.
 const EM_SETLIMITTEXT: u32 = 0x00c5;
@@ -43,6 +47,7 @@ const DISCARD: u32 = 2037;
 const CATEGORY: u32 = 2039;
 const LOG_SETTINGS: u32 = 2062;
 const AUTO_START: u32 = 2065;
+const KEY_VISIBILITY: u32 = 2066;
 
 #[derive(Default)]
 pub(super) struct Settings {
@@ -51,6 +56,11 @@ pub(super) struct Settings {
     ip: HWND,
     port: HWND,
     key: HWND,
+    key_visibility: HWND,
+    base_labels: [HWND; 6],
+    numbers: Vec<numeric::NumberControl>,
+    field_rows: Vec<(HWND, HWND)>,
+    layout_width: std::cell::Cell<i32>,
     injection: HWND,
     theme: HWND,
     storage: HWND,

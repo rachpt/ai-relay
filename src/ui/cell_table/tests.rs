@@ -399,6 +399,8 @@ fn scroll_theme_light_dark_light_preserves_active_cell_and_full_copy() {
             (Resolved::Light, ThemeMode::Light),
             (Resolved::Dark, ThemeMode::Dark),
             (Resolved::Light, ThemeMode::Light),
+            (Resolved::Contrast, ThemeMode::Light),
+            (Resolved::Light, ThemeMode::Light),
         ] {
             let palette = Theme::new(mode).unwrap().palette;
             super::super::scroll_theme::apply(host.list, kind, palette, 96);
@@ -406,7 +408,7 @@ fn scroll_theme_light_dark_light_preserves_active_cell_and_full_copy() {
             assert_eq!(
                 GetWindowLongPtrW(host.list, GWL_EXSTYLE),
                 style
-                    | if kind == Resolved::Dark {
+                    | if kind != Resolved::Contrast {
                         WS_EX_COMPOSITED as isize
                     } else {
                         0
@@ -424,7 +426,7 @@ fn scroll_theme_light_dark_light_preserves_active_cell_and_full_copy() {
             );
             assert_eq!(current(host.list), Some(target));
         }
-        assert_eq!(writes, vec![text; 3]);
+        assert_eq!(writes, vec![text; 5]);
     }
 }
 

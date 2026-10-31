@@ -66,7 +66,7 @@ cargo build --release --target x86_64-pc-windows-msvc
 - 按需求执行目录迁移、单实例、自启、托盘、DPI、SSE、长稳及性能验收。
 - ZIP 中不包含旧脚本、配置、密钥、日志、PID 或调试符号。
 
-`tools/package.ps1` 可生成静态CRT x64便携预览ZIP，PE导入检查只发现系统DLL；不是完成签名/许可证/干净系统验收的正式版。Release EXE 为开发预览。`tools/smoke-proxy-ui.ps1` 使用临时配置和本地 mock 验证保存、启停、转发、重新加载与退出清理。`tools/smoke-native-host.ps1` 提供有限时 GUI 自动冒烟；`tools/generate-icon.ps1` 从 SVG 生成 ICO，可用 `-ValidateOnly` 检查现有图标。`tools/smoke-logs-ui.ps1 -RequireAccessLog` 验证实时/文件日志及安全清理。真实托盘菜单退出、Explorer 重启和多屏 DPI 仍需手工验收。
+`tools/package.ps1` 可生成静态CRT x64便携预览ZIP，PE导入检查只发现系统DLL；不是完成签名/许可证/干净系统验收的正式版。Release EXE 的“关于”按编译profile显示Release构建，不再固定显示开发预览；产品是否正式发行仍以验收状态为准。`tools/smoke-proxy-ui.ps1` 使用临时配置和本地 mock 验证保存、启停、转发、重新加载与退出清理。`tools/smoke-native-host.ps1` 提供有限时 GUI 自动冒烟；`tools/generate-icon.ps1` 从 SVG 生成 ICO，可用 `-ValidateOnly` 检查现有图标。`tools/smoke-logs-ui.ps1 -RequireAccessLog` 验证实时/文件日志及安全清理。真实托盘菜单退出、Explorer 重启和多屏 DPI 仍需手工验收。
 
 日志高度/暗色按住滚动专项：`powershell.exe -NoProfile -NonInteractive -File tools/smoke-logs-interaction-ui.ps1 -ValidateOnly` 先检查声明/纯逻辑；随后不带该开关在独占桌面执行，默认使用Debug，显式 `-ExePath` 必须是绝对路径。脚本使用私有停止配置/关闭的虚构JSONL文件，不保存配置或修改剪贴板/Startup；按住未释放阶段检查capture、native位置和实际CopyFromScreen条带，不以PrintWindow代替。遮挡或前台请求拒绝使Complete=false，即使功能Passed=true也不能宣称视觉全验收。保留临时fixture和报告供复核。缩放以异步请求、完整外框和活动日志后代布局的有界观察确认完成（含仅宽度变化）；进程原始handle/PID/start/实际EXE始终严格核验，仅空托管Path有界等待。不要与原生HWND测试或其他GUI冒烟并行执行；整条测试命令超时应分段补齐，不把未执行项记为通过。最新修复及一次早轮Debug白条失败的保留边界见[08记录](development/2026-10-19-08-review-interaction-fixes.md)。
 

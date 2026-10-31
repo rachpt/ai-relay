@@ -1,7 +1,7 @@
 # 0017：暗色统计表滚动的局部合成呈现
 
 - 日期：2026-10-25
-- 状态：已接受
+- 状态：已接受；仅Dark合成／Light-native主题范围自2026-10-31由[ADR0021](0021-light-scrollbars-small-shapes-settings.md)取代，下文保留当时决策
 - 关联：需求8.1／8.5；补充[ADR0014](0014-scrollbar-tracking-log-resize.md)，仅替代Report列表先原生绘制再覆盖的呈现方式
 
 ## 背景

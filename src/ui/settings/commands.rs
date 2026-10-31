@@ -8,6 +8,17 @@ use crate::{
 pub unsafe fn handle_command(hwnd: HWND, state: *mut State, id: u32) {
     // SAFETY: Caller supplies the stable UI-owned State pointer; no references cross modal calls.
     unsafe {
+        if id == KEY_VISIBILITY {
+            if !(*state).settings.modal
+                && !(*state).settings.busy
+                && !(*state).settings.action_busy
+                && (*state).settings.file_task.is_none()
+                && (*state).settings.config.is_some()
+            {
+                (*state).settings.toggle_key_visibility();
+            }
+            return;
+        }
         if id == 2038 {
             if let Err(error) = (*state).controller.send(Command::OpenDataDirectory) {
                 show_error(hwnd, &error);
@@ -163,6 +174,7 @@ pub unsafe fn handle_command(hwnd: HWND, state: *mut State, id: u32) {
         let command = if id == STOP {
             Command::Stop
         } else if id == LOAD {
+            (*state).settings.hide_secrets();
             Command::Load
         } else if id == START {
             let Some(config) = (*state).settings.config.clone() else {

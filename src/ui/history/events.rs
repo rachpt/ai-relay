@@ -23,10 +23,9 @@ impl History {
             return false;
         }
         self.rejected_commands = self.rejected_commands.wrapping_add(1);
-        settings::set_text(
-            self.control(2325),
-            &format!("历史操作仍在进行；命令 {id} 未执行，请等待完成后重试（未排队或重复发送）。"),
-        );
+        self.set_status(&format!(
+            "历史操作仍在进行；命令 {id} 未执行，请等待完成后重试（未排队或重复发送）。"
+        ));
         self.publish_operation_state();
         true
     }
@@ -40,12 +39,9 @@ impl History {
                     generation: self.generation,
                     key,
                 });
-                settings::set_text(
-                    self.control(2325),
-                    "历史后台操作中；筛选已冻结，单请求在途……",
-                );
+                self.set_status("历史后台操作中；筛选已冻结，单请求在途……");
             }
-            Err(e) => settings::set_text(self.control(2325), &e),
+            Err(e) => self.set_status(&e),
         }
         self.invalidate();
         self.enable();
@@ -165,8 +161,7 @@ impl History {
                     settings::set_text(self.control(id), "");
                 }
                 settings::set_text(self.control(2313), "");
-                settings::set_text(
-                    self.control(2325),
+                self.set_status(
                     "筛选草稿已重置；点击查询应用。图表／分页／导出仍使用上次已应用查询。",
                 );
                 self.show(self.visible);
@@ -192,7 +187,7 @@ impl History {
                         let key = format!("{q:?}");
                         self.send(controller, Command::HistoryQuery(q), key);
                     }
-                    Err(e) => settings::set_text(self.control(2325), &e),
+                    Err(e) => self.set_status(&e),
                 }
             }
             COUNTERS => self.send(controller, Command::HistoryCounters, "counters".into()),
@@ -215,10 +210,7 @@ impl History {
                 files::Result::HistoryPath(path) => {
                     if let Some((scope, generation, query, all)) = self.export_query.take() {
                         if self.scope.as_ref() != Some(&scope) || self.generation != generation {
-                            settings::set_text(
-                                self.control(2325),
-                                "数据目录已变化；已取消旧目录导出，未写文件。",
-                            );
+                            self.set_status("数据目录已变化；已取消旧目录导出，未写文件。");
                             self.enable();
                             return;
                         }
@@ -243,11 +235,11 @@ impl History {
                 }
                 files::Result::Error(e) => {
                     self.export_query = None;
-                    settings::set_text(self.control(2325), &e);
+                    self.set_status(&e);
                 }
                 _ => {
                     self.export_query = None;
-                    settings::set_text(self.control(2325), "已取消历史导出，未写文件。");
+                    self.set_status("已取消历史导出，未写文件。");
                 }
             }
         }
@@ -268,7 +260,7 @@ impl History {
                 HistoryResponse::Error { directory, .. } => directory.as_ref(),
             };
             if !pending.matches_scope(&self.scope, self.generation, directory) {
-                settings::set_text(self.control(2325), "已拒绝旧目录历史结果；请重新查询。");
+                self.set_status("已拒绝旧目录历史结果；请重新查询。");
                 continue;
             }
             let key = pending.key;
@@ -285,22 +277,15 @@ impl History {
                     page_only,
                     counters,
                     ..
-                } if key == "export" => settings::set_text(
-                    self.control(2325),
-                    &format!(
-                        "CSV 已导出：{}；{} 行；仅当前页 {}；{:?}",
-                        path.display(),
-                        rows,
-                        page_only,
-                        counters
-                    ),
-                ),
+                } if key == "export" => {
+                    self.set_status(&status_text::exported(&path, rows, page_only, counters))
+                }
                 HistoryResponse::Counters { counters, .. } if key == "counters" => {
-                    settings::set_text(self.control(2325), &format!("历史记录状态：{counters:?}"))
+                    self.set_status(&status_text::counters(counters))
                 }
                 HistoryResponse::Storage { stats, .. } if key == "storage" => {
                     self.storage(&stats);
-                    settings::set_text(self.control(2325), "历史存储状态已刷新（后台真实值）。");
+                    self.set_status("历史存储状态已刷新（后台真实值）。");
                 }
                 HistoryResponse::AliasChanged { .. } if key == "alias" => {
                     settings::set_text(
@@ -312,7 +297,7 @@ impl History {
                         self.clear_report("别名已更新；正在重新查询真实历史。");
                         self.send(controller, Command::HistoryQuery(query), key);
                     } else {
-                        settings::set_text(self.control(2325), "别名已更新，请重新查询。");
+                        self.set_status("别名已更新，请重新查询。");
                     }
                 }
                 HistoryResponse::PolicyChanged { report, .. } if key == "policy" => {
@@ -320,13 +305,10 @@ impl History {
                     self.preview = None;
                     self.storage(&report.storage);
                     self.clear_report("策略已更新；旧报表已失效，请重新查询。");
-                    settings::set_text(
-                        self.control(2325),
-                        &format!(
-                            "历史策略已保存并应用；删除 {} 条记录；checkpoint {:?}。",
-                            report.removed_records, report.checkpoint
-                        ),
-                    );
+                    self.set_status(&format!(
+                        "历史策略已保存并应用；删除 {} 条记录；checkpoint {:?}。",
+                        report.removed_records, report.checkpoint
+                    ));
                 }
                 HistoryResponse::ClearPreview {
                     directory,
@@ -345,7 +327,7 @@ impl History {
                             "清空预览：整个当前目录历史，约 {records} 条（不限当前筛选）；同时移除别名：{remove_aliases}。\r\n保留 HMAC 身份、配置、密钥、日志；不可撤销。后台写入可能增加实际删除数。\r\n请点击“确认清空…”进行最终确认；未确认不删除。"
                         ),
                     );
-                    settings::set_text(self.control(2325), "清空预览已收到；尚未删除任何记录。");
+                    self.set_status("清空预览已收到；尚未删除任何记录。");
                 }
                 HistoryResponse::Cleared { remove_aliases, .. } if key == "clear" => {
                     self.preview = None;
@@ -365,25 +347,18 @@ impl History {
                         self.control(STORAGE_TEXT),
                         "清空已完成；HMAC 身份／配置／密钥／日志未删除。请刷新存储状态。",
                     );
-                    settings::set_text(
-                        self.control(2325),
-                        &format!("历史已清空；移除别名 {remove_aliases}；后续请求仍会记录。"),
-                    );
+                    self.set_status(&format!(
+                        "历史已清空；移除别名 {remove_aliases}；后续请求仍会记录。"
+                    ));
                 }
                 HistoryResponse::Error { message, .. } => {
                     self.preview = None;
-                    settings::set_text(
-                        self.control(2325),
-                        &format!("历史不可用／操作失败：{message}"),
-                    );
+                    self.set_status(&format!("历史不可用／操作失败：{message}"));
                     if self.management {
                         settings::set_text(self.control(STORAGE_TEXT), &message);
                     }
                 }
-                _ => settings::set_text(
-                    self.control(2325),
-                    "已拒绝不匹配的过期历史结果；请重新查询。",
-                ),
+                _ => self.set_status("已拒绝不匹配的过期历史结果；请重新查询。"),
             }
         }
         self.enable();

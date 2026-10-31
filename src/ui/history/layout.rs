@@ -225,7 +225,7 @@ impl History {
             2325,
             "STATIC",
             "历史尚未查询；不可用时将显示后台真实错误。",
-            0,
+            SS_NOPREFIX,
             (24, 436, 696, 44),
         )?;
         self.add(
@@ -505,18 +505,26 @@ impl History {
             }
         }
     }
+    pub(in crate::ui) fn page_height(&self, dpi: u32, height: i32, width: i32) -> i32 {
+        let extra = if self.session {
+            0
+        } else {
+            status_layout::height(self.control(2325), dpi, (width - scale(48, dpi)).max(1))
+                - scale(status_layout::MIN_HEIGHT, dpi)
+        };
+        height.max(scale(820, dpi) + extra)
+    }
+
     pub fn layout(&self, dpi: u32, width: i32, height: i32) {
-        let chart_top = scale(312, dpi);
+        let status_height =
+            status_layout::height(self.control(2325), dpi, (width - scale(48, dpi)).max(1));
+        let geometry = status_layout::Geometry::new(dpi, self.advanced, status_height);
+        let chart_top = geometry.chart_top;
         let bottom = viewport::content_bottom(dpi, height);
         let chart_height = scale(200, dpi);
-        let gap = scale(8, dpi);
         // Expanding filters temporarily replaces the chart, not the usable table.
-        let sort_top = if self.advanced {
-            scale(466, dpi)
-        } else {
-            chart_top + chart_height + gap
-        };
-        let table_top = sort_top + scale(72, dpi);
+        let sort_top = geometry.sort_top;
+        let table_top = geometry.table_top;
         let editor_height = (bottom - table_top).max(scale(28, dpi));
         let mut moves = MoveBatch::with_capacity(self.controls.len());
         for &(h, id, x, y, w, ht) in &self.controls {
@@ -529,7 +537,7 @@ impl History {
                 CLEAR_CONFIRM => (scale(y, dpi), scale(ht, dpi)),
                 STORAGE_TEXT => (
                     scale(y, dpi),
-                    (bottom - scale(y + 34 + 8, dpi)).max(scale(70, dpi)),
+                    (bottom - scale(y + 8, dpi) - status_height).max(scale(70, dpi)),
                 ),
                 _ if (ALIAS_PICK..=STORAGE_TEXT).contains(&id) || id == MANAGEMENT_LABEL => {
                     (scale(y, dpi), scale(ht, dpi))
@@ -540,11 +548,11 @@ impl History {
                 ),
                 2325 => (
                     if self.management {
-                        bottom - scale(34, dpi)
+                        bottom - status_height
                     } else {
-                        scale(if self.advanced { 424 } else { 270 }, dpi)
+                        geometry.status_top
                     },
-                    scale(34, dpi),
+                    geometry.status_height,
                 ),
                 _ => (scale(if y == 292 { 284 } else { y }, dpi), scale(ht, dpi)),
             };
@@ -590,10 +598,7 @@ impl History {
             for id in [2307, 2308] {
                 settings::set_text(self.control(id), "");
             }
-            settings::set_text(
-                self.control(2325),
-                "数据目录已变化；旧查询／导出结果不会用于当前目录。",
-            );
+            self.set_status("数据目录已变化；旧查询／导出结果不会用于当前目录。");
             settings::set_text(self.control(2330), "数据目录已变化；请重新查询历史。");
             settings::set_text(self.control(2331), "");
             self.invalidate();

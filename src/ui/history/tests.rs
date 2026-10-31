@@ -94,11 +94,19 @@ fn rejects_results_after_scope_changes_including_return_to_same_directory() {
 }
 #[test]
 fn chart_and_results_fit_minimum_client_at_common_dpi() {
-    for dpi in [96, 144, 192] {
-        let bottom = viewport::content_bottom(dpi, scale(820, dpi));
-        for sort_top in [312 + 200 + 8, 466] {
-            let table_top = scale(sort_top + 72, dpi);
-            assert!(bottom - table_top >= scale(80, dpi));
+    for dpi in [96, 120, 144, 168, 192] {
+        for extra in [0, 20, 60, 160] {
+            let status_height = scale(status_layout::MIN_HEIGHT + extra, dpi);
+            let bottom =
+                viewport::content_bottom(dpi, scale(820, dpi) + status_height - scale(34, dpi));
+            for advanced in [false, true] {
+                let geometry = status_layout::Geometry::new(dpi, advanced, status_height);
+                assert_eq!(
+                    geometry.chart_top,
+                    geometry.status_top + status_height + scale(8, dpi)
+                );
+                assert!(bottom - geometry.table_top >= scale(80, dpi));
+            }
         }
     }
 }
@@ -268,8 +276,8 @@ fn native_query_results_preserve_hidden_views_and_cached_coordinates() {
             });
         native.state.history.poll(&native.state.controller);
         assert!(native.state.history.report.is_some());
-        // WM_SETREDRAW(TRUE) must not reveal a table that missed scrolling while
-        // hidden; a result is content-only, not another document transform.
+        // Content population must not synchronously rearrange the page or reveal
+        // hidden controls. The queued status change performs the final reflow.
         // SAFETY: Live test-owned child; inspect its own style because the
         // top-level fixture stays hidden during command/cache transitions.
         let visible = unsafe { GetWindowLongPtrW(table, GWL_STYLE) as u32 & WS_VISIBLE != 0 };
@@ -279,6 +287,10 @@ fn native_query_results_preserve_hidden_views_and_cached_coordinates() {
         if active {
             assert_eq!(native.scroll(SB_ENDSCROLL), offset);
         }
+        dispatch_status_layout(&native);
+        let visible = unsafe { GetWindowLongPtrW(table, GWL_STYLE) as u32 & WS_VISIBLE != 0 };
+        assert_eq!(visible, active && !session && !management && selection <= 1);
+        assert_eq!(settings::text(draft), "127.0.0.2");
         native.state.show_page(0);
         native.state.show_page(1);
         native.command(VIEW, Some(0));
@@ -286,8 +298,35 @@ fn native_query_results_preserve_hidden_views_and_cached_coordinates() {
             native.command(MANAGE, None);
         }
         native.command(TABLE_VIEW, Some(0));
-        assert_eq!(native.rect(table).top, 592 - HEADER_HEIGHT - offset);
+        let status = native.rect(native.control(2325));
+        assert_eq!(
+            native.rect(table).top,
+            status.bottom + scale(8 + 200 + 8 + 72, native.state.dpi)
+        );
+        assert_eq!(native.scroll(SB_ENDSCROLL), offset);
     }
+}
+
+pub(super) fn dispatch_status_layout(native: &super::super::tests::NativeState) -> usize {
+    let mut count = 0;
+    // SAFETY: Dispatch only the test-owned window's scalar status notifications;
+    // no timers, background work, real input or other windows are pumped.
+    unsafe {
+        let mut message = MSG::default();
+        while PeekMessageW(
+            &mut message,
+            native.hwnd,
+            STATUS_CHANGED,
+            STATUS_CHANGED,
+            PM_REMOVE,
+        ) != 0
+        {
+            assert!(count < 32, "status layout notification loop");
+            DispatchMessageW(&message);
+            count += 1;
+        }
+    }
+    count
 }
 
 #[test]

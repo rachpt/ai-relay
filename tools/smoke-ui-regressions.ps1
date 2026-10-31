@@ -65,6 +65,30 @@ public static class Native {
         public string Text,NativeFrame; public bool Password;
     }
     public sealed class Difference { public long Pixels; public string Box; public int Compared; }
+    // This harness requires actual 96 DPI. Status is a complete document-space
+    // HWND rect, not an intersection or a cross-process font measurement.
+    public static int HistoryResultTop(N.Rect status,bool advanced) {
+        if(status.Width<=0 || status.Height<34 || status.Top!=(advanced?424:270))
+            throw new ArgumentException("History status lost its full 34-DIP minimum or document anchor");
+        return checked(status.Bottom+8+(advanced?0:208)+72);
+    }
+    public static string ValidateHistoryGeometry() {
+        foreach(bool advanced in new bool[]{false,true}) {
+            foreach(int extra in new int[]{0,20,60}) {
+                var status=new N.Rect { Left=24,Top=advanced?424:270,Right=720 };
+                status.Bottom=status.Top+34+extra;
+                if(HistoryResultTop(status,advanced)!=(advanced?538:592)+extra) throw new Exception("Dynamic history result top self-check failed");
+                var truncated=status; truncated.Bottom=truncated.Top+33;
+                var stale=status; stale.Top+=1; stale.Bottom+=1;
+                foreach(var invalid in new N.Rect[]{truncated,stale}) {
+                    bool rejected=false;
+                    try { HistoryResultTop(invalid,advanced); } catch(ArgumentException) { rejected=true; }
+                    if(!rejected) throw new Exception("Truncated/stale history status accepted");
+                }
+            }
+        }
+        return "96-DPI complete history status minimum/anchor and dynamic normal/advanced result tops, extra 0/20/60";
+    }
     public static void Resize(IntPtr h,uint pid,int w,int height) {
         N.Check(h,pid);
         if(!SetWindowPos(h,IntPtr.Zero,20,20,w,height,0x10)) throw new Exception("Owned SetWindowPos failed");
@@ -228,6 +252,7 @@ public static class Native {
 '@
 Add-Type -ReferencedAssemblies System.dll,System.Core.dll,System.Drawing.dll,Accessibility.dll -TypeDefinition ($declarations[0].Groups[1].Value + "`n" + $extra)
 $layout = [TitleMenuSmoke.Native]::Validate()
+$historyLayout = [UiRegression.Native]::ValidateHistoryGeometry()
 $tokens=$null; $parseErrors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($PSCommandPath,[ref]$tokens,[ref]$parseErrors)
 if ($parseErrors.Count) { throw 'PowerShell parser errors' }
@@ -238,7 +263,7 @@ foreach ($typeName in @('TitleMenuSmoke.Native','UiRegression.Native')) {
     }
 }
 if ($ValidateOnly) {
-    Write-Output "PASS: parser, public static call sites, combined C# compilation; $layout"
+    Write-Output "PASS: parser, public static call sites, combined C# compilation; $layout; $historyLayout"
     Write-Output 'VALIDATION ONLY: no EXE lookup/build, files, mutex, launch, GUI, network, Explorer or system changes'
     return
 }
@@ -295,6 +320,28 @@ function Geometry([int]$Id,[int]$DocumentTop) {
     $proof=[pscustomobject]@{Id=$Id;ActualY=$actual;ExpectedY=$expected;Scroll=$offset;Visible=[TitleMenuSmoke.Native]::IsWindowVisible($h);X=$r.Left-$p.X;Width=$r.Width;Height=$r.Height}
     Record 'HWND geometry' $proof
     Assert-True ($actual -eq $expected -and $proof.Visible) "Control $Id actual viewport Y=$actual expected=$expected"
+}
+function History-Geometry([int]$Id) {
+    $statusHandle=Control 2325; $status=[TitleMenuSmoke.Native]::Outer($statusHandle,[uint32]$ownedPid)
+    $hostOrigin=[TitleMenuSmoke.Native]::Origin((Control 2400),[uint32]$ownedPid); $offset=Offset
+    Assert-True ([TitleMenuSmoke.Native]::GetDpiForWindow($window) -eq 96 -and [TitleMenuSmoke.Native]::IsWindowVisible($statusHandle)) 'History relationship check requires actual 96 DPI and visible full status HWND'
+    Assert-True (-not [TitleMenuSmoke.Native]::IsWindowVisible((Control 2351)) -and -not [TitleMenuSmoke.Native]::IsWindowVisible((Control 2020))) 'History relationship check requires statistics, not management/session'
+    $document=New-Object TitleMenuSmoke.Native+Rect
+    $document.Left=$status.Left-$hostOrigin.X; $document.Right=$status.Right-$hostOrigin.X
+    $document.Top=$status.Top-$hostOrigin.Y+44+$offset; $document.Bottom=$document.Top+$status.Height
+    $advanced=[TitleMenuSmoke.Native]::IsWindowVisible((Control 2310))
+    $resultTop=[UiRegression.Native]::HistoryResultTop($document,$advanced)
+    $chartTop=$document.Bottom+8; $sortTop=$resultTop-72
+    Geometry 2325 $document.Top
+    Assert-True ([TitleMenuSmoke.Native]::IsWindowVisible((Control 2332)) -ne $advanced) 'Advanced filters/chart visibility contract changed'
+    if(-not $advanced) {
+        Geometry 2332 $chartTop
+        Assert-True (([TitleMenuSmoke.Native]::Outer((Control 2332),[uint32]$ownedPid)).Height -eq 200) 'History chart must retain 200 DIP height'
+    }
+    foreach($sortId in @(2335,2336,2353)) { Geometry $sortId $sortTop }
+    Geometry 2338 ($sortTop+36)
+    Geometry $Id $resultTop
+    Record 'history complete-HWND status/row relationship (not font/text-fit proof)' @{StatusDocument=$document;StatusExtraPhysical=($status.Height-34);Advanced=$advanced;ChartTop=$chartTop;SortTop=$sortTop;ResultTop=$resultTop;Scroll=$offset}
 }
 function Resize([int]$Width,[int]$Height) { Guard; [UiRegression.Native]::Resize($window,[uint32]$ownedPid,$Width,$Height); Start-Sleep -Milliseconds 140; All-DateRegions }
 function Screen([string]$Name) {
@@ -414,13 +461,13 @@ try {
         foreach($selection in @(2,3,0,1,2)) {
             Choice 2338 $selection
             $id=if($selection -eq 2) {2330} elseif($selection -eq 3) {2331} else {2337}
-            Geometry $id 592; Geometry 2300 60
+            History-Geometry $id; Geometry 2300 60
             $remembered=Offset; Page 0; Page 1
-            Geometry $id 592; Assert-True ((Offset) -eq $remembered) 'History page return changed scroll'
+            History-Geometry $id; Assert-True ((Offset) -eq $remembered) 'History page return changed scroll'
         }
         Choice 2300 1; Geometry 2020 110; Geometry 2300 60
         Msg (Control 2400) 0x115 1 | Out-Null; Geometry 2020 110
-        Choice 2300 0; Geometry 2330 592; Geometry 2300 60
+        Choice 2300 0; History-Geometry 2330; Geometry 2300 60
         $now=Edit-State (Control 2304)
         Assert-True ($now.Text -ceq $draft.Text -and $now.Selection -eq $draft.Selection) 'History draft/selection lost during subview/scroll/page return'
     }
@@ -531,7 +578,7 @@ finally {
         try { No-Instance; Record 'post-exit process and mutex absent' $true } catch { Record 'post-exit guard limitation' $_.Exception.GetBaseException().Message; if(-not $failure) { $failure='Post-exit process/mutex guard failed' } }
     if($oldDpi -ne [IntPtr]::Zero) { [void][TitleMenuSmoke.Native]::SetThreadDpiAwarenessContext($oldDpi) }
     $skips=@($events | Where-Object { $_.Name.StartsWith('SKIPPED') })
-    [pscustomobject]@{Failure=$failure;Stage=$stage;NormalExit=$normalExit;Complete=($null -eq $failure -and $skips.Count -eq 0);Skipped=$skips;Events=$events.ToArray();TempRetained=$temp;NoBuild=$true;NoNetwork=$true;NoSave=$true;BudgetSeconds=$BudgetSeconds;InputScope='Pinned owned HWNDs only; main tabs native mouse messages; segmented choices scalar selection + normal WM_COMMAND; no remote pointer/WM_NOTIFY/IPC/global input';DpiScope='96 DPI only';ExplorerScope='One temp folder launch, read-only exact-path metadata, no closing Explorer'} | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $output 'report.json') -Encoding UTF8
+    [pscustomobject]@{Failure=$failure;Stage=$stage;NormalExit=$normalExit;Complete=($null -eq $failure -and $skips.Count -eq 0);Skipped=$skips;Events=$events.ToArray();TempRetained=$temp;NoBuild=$true;NoNetwork=$true;NoSave=$true;BudgetSeconds=$BudgetSeconds;InputScope='Pinned owned HWNDs only; main tabs native mouse messages; segmented choices scalar selection + normal WM_COMMAND; no remote pointer/WM_NOTIFY/IPC/global input';DpiScope='96 DPI only';HistoryGeometryScope='Complete status HWND minimum/anchor and chart/sort/result relationships only; no cross-process HFONT use or full-text-fit/query acceptance';ExplorerScope='One temp folder launch, read-only exact-path metadata, no closing Explorer'} | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $output 'report.json') -Encoding UTF8
     Write-Output ('REPORT '+(Join-Path $output 'report.json'))
 }
 if($failure) { throw $failure }

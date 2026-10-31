@@ -4,6 +4,9 @@
 
 - [当前状态与下一步](STATUS.md)
 - [批次记录模板](TEMPLATE.md)
+- [2026-10-31-03：提交前UI复核与禁用时Key重掩码](2026-10-31-03-precommit-ui-review.md)
+- [2026-10-31-02：统计状态中文分段与窄屏自适应布局](2026-10-31-02-history-status-layout.md)
+- [2026-10-31-01：浅深滚动条、平滑图标与设置输入布局](2026-10-31-01-ui-input-scroll-polish.md)
 - [2026-10-30-03：提交推送后构建并核验Release](2026-10-30-03-release-build.md)
 - [2026-10-30-02：独立复核、工具回归加固与提交前验证](2026-10-30-02-precommit-review-release.md)
 - [2026-10-30-01：分段限宽、深色月历白边与概览稳定刷新](2026-10-30-01-ui-width-calendar-chart.md)

@@ -243,6 +243,18 @@ unsafe extern "system" fn procedure(
                 result
             }
             WM_ERASEBKGND => 1,
+            WM_PRINT => {
+                // Native WM_PRINT may touch the lender's DC outside our own
+                // PRINTCLIENT pass. Guard the entire synchronous dispatch.
+                let dc = w as HDC;
+                let saved = SaveDC(dc);
+                if saved == 0 {
+                    return 0;
+                }
+                let result = DefSubclassProc(hwnd, message, w, l);
+                RestoreDC(dc, saved);
+                result
+            }
             WM_PAINT | WM_PRINTCLIENT => {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = if message == WM_PAINT {
@@ -263,7 +275,82 @@ unsafe extern "system" fn procedure(
     }
 }
 
+fn status_raster(
+    size: i32,
+    kind: StatusKind,
+    colors: StatusColors,
+    background: u32,
+) -> Option<raster::Raster> {
+    let mut raster = raster::Raster::new(size, size, background)?;
+    let size = size as f32;
+    let center = size * 0.5;
+    let stroke = (size / 16.0).max(1.0);
+    raster.circle(center, center, center, colors.icon);
+    raster.circle(center, center, (center - stroke).max(0.0), colors.badge);
+    match kind {
+        StatusKind::Running => raster.polygon(
+            &[
+                (size * 0.36, size * 0.28),
+                (size * 0.36, size * 0.72),
+                (size * 0.72, size * 0.50),
+            ],
+            colors.icon,
+        ),
+        StatusKind::Stopped => raster.round_rect(
+            [size * 0.28, size * 0.28, size * 0.72, size * 0.72],
+            size * 0.045,
+            colors.icon,
+        ),
+        StatusKind::Busy => {
+            for offset in [-0.25, 0.0, 0.25] {
+                raster.circle(center + size * offset, center, size * 0.095, colors.icon);
+            }
+        }
+        StatusKind::Error => {
+            let width = (size * 0.115).max(1.0);
+            raster.line(
+                (center, size * 0.28),
+                (center, size * 0.56),
+                width,
+                colors.icon,
+            );
+            raster.circle(center, size * 0.74, width * 0.5, colors.icon);
+        }
+    }
+    Some(raster)
+}
+
 unsafe fn status_icon(
+    dc: HDC,
+    rect: RECT,
+    status: StatusKind,
+    colors: StatusColors,
+    background: u32,
+    theme: theme::Resolved,
+) {
+    // SAFETY: Caller saved this live paint/print DC. High contrast keeps the
+    // existing binary system-color GDI symbols, never coverage-blended colors.
+    unsafe {
+        let size = rect.right.saturating_sub(rect.left);
+        if theme != theme::Resolved::Contrast
+            && let Some(mut raster) = status_raster(size, status, colors, background)
+            && raster.paint(dc, rect.left, rect.top)
+        {
+            return;
+        }
+        status_icon_gdi(
+            dc,
+            rect.left,
+            rect.top,
+            size,
+            status,
+            colors.icon,
+            colors.badge,
+        );
+    }
+}
+
+unsafe fn status_icon_gdi(
     dc: HDC,
     left: i32,
     top: i32,
@@ -383,12 +470,16 @@ unsafe fn draw(hwnd: HWND, dc: HDC, state: *mut State) {
         let colors = colors(status_kind(status), (*state).theme.kind, palette);
         status_icon(
             dc,
-            padding,
-            icon_top,
-            icon_size,
+            RECT {
+                left: padding,
+                top: icon_top,
+                right: padding + icon_size,
+                bottom: icon_top + icon_size,
+            },
             status_kind(status),
-            colors.icon,
-            colors.badge,
+            colors,
+            background,
+            (*state).theme.kind,
         );
         let text_left = padding + icon_size + scale(8, dpi);
         let text_right = (rect.right - padding).max(text_left);

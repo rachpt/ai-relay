@@ -12,6 +12,7 @@ mod logs;
 mod menu_theme;
 mod overview;
 mod overview_dashboard;
+mod raster;
 mod rounded;
 mod scroll_theme;
 mod settings;
@@ -275,12 +276,15 @@ impl State {
         }
     }
 
-    fn page_height(&self, height: i32, active: usize) -> i32 {
-        if active == 2 {
+    fn page_height(&self, height: i32, active: usize, page_width: i32) -> i32 {
+        if active == 1 {
+            self.history.page_height(self.dpi, height, page_width)
+        } else if active == 2 {
             self.logs.page_height(self.dpi, height)
         } else if active == 3 {
             height.max(
-                self.settings.document_bottom(self.dpi)
+                self.settings
+                    .document_bottom(self.dpi, (page_width - scale(48, self.dpi)).max(1))
                     + scale(status_bar::HEIGHT + viewport::BOTTOM_PADDING, self.dpi),
             )
         } else {
@@ -300,7 +304,6 @@ impl State {
             return;
         }
         let active = self.tabs.active;
-        let page_height = self.page_height(rect.bottom, active);
         if (rect.right, rect.bottom, self.dpi)
             != (self.layout_size.0, self.layout_size.1, self.layout_size.2)
         {
@@ -308,7 +311,15 @@ impl State {
             self.viewport
                 .layout(self.dpi, rect.right, rect.bottom, active);
         }
-        let page_width = self.viewport.prepare(self.dpi, page_height, active);
+        // Resolve responsive form height before and after native scrollbar width.
+        // A narrower client can require one column (and a taller scroll extent).
+        let mut page_height = self.page_height(rect.bottom, active, rect.right);
+        let mut page_width = self.viewport.prepare(self.dpi, page_height, active);
+        let fitted_height = self.page_height(rect.bottom, active, page_width);
+        if fitted_height != page_height {
+            page_height = fitted_height;
+            page_width = self.viewport.prepare(self.dpi, page_height, active);
+        }
         let size = (rect.right, rect.bottom, self.dpi, page_width);
         if size != self.layout_size {
             self.layout_size = size;
@@ -327,8 +338,9 @@ impl State {
         if !self.pages_prelaid {
             // Pay the first native-layout cost once, while the window is still
             // hidden. Every page then only needs one arrange pass on first show.
-            let heights =
-                std::array::from_fn::<_, 4, _>(|page| self.page_height(rect.bottom, page));
+            let heights = std::array::from_fn::<_, 4, _>(|page| {
+                self.page_height(rect.bottom, page, page_width)
+            });
             self.overview.layout(self.dpi, page_width, heights[0]);
             self.history.layout(self.dpi, page_width, heights[1]);
             self.logs.layout(self.dpi, page_width, heights[2]);
@@ -533,7 +545,11 @@ pub(crate) fn run(
         return Err(last_error("获取应用模块"));
     }
     let class_name = wide(WINDOW_CLASS);
-    let title = wide("AI Relay 开发版");
+    let title = wide(if cfg!(debug_assertions) {
+        "AI Relay 开发版"
+    } else {
+        "AI Relay"
+    });
     let taskbar_message = wide("TaskbarCreated");
     // SAFETY: The string is NUL-terminated and valid for the call.
     let taskbar_created = unsafe { RegisterWindowMessageW(taskbar_message.as_ptr()) };
@@ -945,7 +961,7 @@ fn show_window(hwnd: HWND) {
 
 fn show_error(hwnd: HWND, text: &str) {
     let text = wide(text);
-    let title = wide("AI Relay 开发版");
+    let title = wide("AI Relay");
     // SAFETY: Both strings live through this modal call; no State borrow is held
     // because MessageBox runs a nested message loop.
     unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
@@ -1016,6 +1032,18 @@ unsafe fn update_title_menu(hwnd: HWND, state: *mut State) {
     }
 }
 
+fn about_text(debug: bool) -> String {
+    let build = if debug {
+        "Debug 开发构建"
+    } else {
+        "Release 构建"
+    };
+    format!(
+        "AI Relay {} · {build}\nRust + Win32 原生流式代理\n\n标题栏 ☰：文件 / 代理 / 视图 / 帮助\nF10 或 Alt+M 打开；Alt+Space 保留系统菜单。\n关闭窗口依照设置隐藏到托盘或退出。\n统计与流量观测不是 Provider 账单。",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 unsafe fn dispatch_title_menu(hwnd: HWND, state: *mut State, action: title_menu::Action) {
     use title_menu::Action;
     // SAFETY: Menus reuse existing commands and confirmation paths. No State
@@ -1047,11 +1075,7 @@ unsafe fn dispatch_title_menu(hwnd: HWND, state: *mut State, action: title_menu:
                 return;
             }
             Action::About => {
-                let text = wide(concat!(
-                    "AI Relay ",
-                    env!("CARGO_PKG_VERSION"),
-                    " · 开发预览\nRust + Win32 原生流式代理\n\n标题栏 ☰：文件 / 代理 / 视图 / 帮助\nF10 或 Alt+M 打开；Alt+Space 保留系统菜单。\n关闭窗口依照设置隐藏到托盘或退出。\n统计与流量观测不是 Provider 账单。"
-                ));
+                let text = wide(&about_text(cfg!(debug_assertions)));
                 MessageBoxW(
                     hwnd,
                     text.as_ptr(),
@@ -1121,7 +1145,15 @@ unsafe extern "system" fn window_proc(
     // SAFETY: Valid WM_DRAWITEM payload, handled before theme's generic owner drawing.
     if message == WM_DRAWITEM
         && unsafe {
-            logs::draw(lparam) || history::draw(state, lparam) || overview::draw(state, lparam)
+            logs::draw(lparam)
+                || history::draw(state, lparam)
+                || overview::draw(state, lparam)
+                || settings::draw(
+                    lparam,
+                    (*state).dpi,
+                    (*state).theme.palette,
+                    (*state).theme.kind,
+                )
         }
     {
         return 1;
@@ -1166,6 +1198,14 @@ unsafe extern "system" fn window_proc(
                 }
                 0
             }
+            history::STATUS_CHANGED => {
+                (*state).page_geometry[1] = false;
+                (*state).page_positioned[1] = false;
+                if (*state).tabs.active == 1 && (*state).exiting.is_none() {
+                    (*state).layout(hwnd, false);
+                }
+                0
+            }
             logs::HEIGHT_CHANGED => {
                 if lparam == 2230
                     && (*state).tabs.active == 2
@@ -1179,7 +1219,14 @@ unsafe extern "system" fn window_proc(
                 0
             }
             WM_MOUSEWHEEL => SendMessageW((*state).viewport.handle, message, wparam, lparam),
+            WM_SHOWWINDOW if wparam == 0 => {
+                (*state).settings.hide_secrets();
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            }
             WM_SIZE => {
+                if wparam as u32 == SIZE_MINIMIZED {
+                    (*state).settings.hide_secrets();
+                }
                 (*state).layout(hwnd, false);
                 0
             }
@@ -1260,6 +1307,7 @@ unsafe extern "system" fn window_proc(
                 0
             }
             WM_CLOSE => {
+                (*state).settings.hide_secrets();
                 if (*state).exiting.is_some() {
                     return 0;
                 }
@@ -1270,7 +1318,7 @@ unsafe extern "system" fn window_proc(
                 if !(*state).tray_present {
                     show_error(
                         hwnd,
-                        "托盘图标不可用，窗口将保持显示。请重启 Explorer 后重试，或结束本开发版进程。",
+                        "托盘图标不可用，窗口将保持显示。请重启 Explorer 后重试，或通过菜单退出程序。",
                     );
                 } else {
                     if !(*state).close_notice_shown {
@@ -1278,7 +1326,7 @@ unsafe extern "system" fn window_proc(
                         let text = wide(
                             "关闭窗口只会隐藏到托盘，正在运行的代理继续转发。双击托盘图标可恢复，右键菜单可停止并退出。",
                         );
-                        let title = wide("AI Relay 开发版");
+                        let title = wide("AI Relay");
                         MessageBoxW(
                             hwnd,
                             text.as_ptr(),

@@ -11,6 +11,7 @@ use crate::{
 use std::path::PathBuf;
 use windows_sys::Win32::{Graphics::Gdi::*, UI::Controls::*};
 const SS_OWNERDRAW: u32 = 0x000d;
+const SS_NOPREFIX: u32 = 0x0080;
 
 pub(super) const VIEW: u32 = 2300;
 const QUERY: u32 = 2320;
@@ -47,6 +48,7 @@ const ADVANCED_LABEL: u32 = 2399;
 // Read-only automation state and an owner-thread queue fence. Neither performs I/O.
 const OPERATION_STATE: u32 = 2354;
 const QUEUE_FENCE: u32 = 2397;
+pub(in crate::ui) const STATUS_CHANGED: u32 = WM_APP + 96;
 
 struct ClearPreview {
     scope: PathBuf,
@@ -99,6 +101,10 @@ mod events;
 mod filters;
 mod layout;
 mod management;
+mod status_layout;
+#[cfg(test)]
+mod status_tests;
+mod status_text;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -115,6 +121,19 @@ impl History {
             settings::selected(self.control(2301)) == 4,
             settings::selected(self.control(TABLE_VIEW)),
         )
+    }
+
+    fn set_status(&self, text: &str) {
+        let control = self.control(2325);
+        // SAFETY: Owner-thread native status; defer layout until this History
+        // borrow ends. Text changes never rearrange controls synchronously.
+        let root = unsafe { GetAncestor(control, GA_ROOT) };
+        settings::set_text(control, text);
+        if !root.is_null() {
+            // SAFETY: A scalar-only queued notification; the root validates its
+            // current page/state before rearranging. No borrowed text is retained.
+            unsafe { PostMessageW(root, STATUS_CHANGED, 0, 0) };
+        }
     }
 
     pub(super) fn take_applied_policy(&mut self) -> Option<db::Options> {
@@ -241,7 +260,7 @@ pub(super) unsafe fn command(hwnd: HWND, state: *mut State, id: u32) {
                     (*state).history.file = Some(rx);
                     (*state).history.export_query = Some((scope, generation, query, all));
                 }
-                Err(e) => settings::set_text((*state).history.control(2325), &e),
+                Err(e) => (*state).history.set_status(&e),
             }
             (*state).history.enable();
         } else {

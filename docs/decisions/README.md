@@ -42,6 +42,8 @@
 
 - [0020：概览有界整帧呈现与月历宿主边沿](0020-bounded-dashboard-popup-chrome.md)
 
+- [0021：浅深滚动条、小图形抗锯齿与类型化设置输入](0021-light-scrollbars-small-shapes-settings.md)
+
 ## 使用规则
 
 - 文件名使用递增四位编号，例如 `0002-config-discovery.md`。

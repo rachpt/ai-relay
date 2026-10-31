@@ -514,8 +514,8 @@ unsafe fn draw_combo(hwnd: HWND, dc: HDC, value: Appearance) {
 }
 
 fn switch_rects(client: RECT, dpi: u32, checked: bool, right: bool) -> (RECT, RECT, RECT) {
-    let width = px(34, dpi).min((client.right - client.left).max(0));
-    let height = px(18, dpi).min((client.bottom - client.top).max(0));
+    let width = px(38, dpi).min((client.right - client.left).max(0));
+    let height = px(20, dpi).min((client.bottom - client.top).max(0));
     let top = client.top + ((client.bottom - client.top) - height) / 2;
     let left = if right {
         client.right - width
@@ -600,6 +600,64 @@ fn switch_colors(
     }
 }
 
+unsafe fn switch_shapes(
+    dc: HDC,
+    track: RECT,
+    knob: RECT,
+    dpi: u32,
+    background: u32,
+    colors: (u32, u32, u32),
+) {
+    let (track_color, border, knob_color) = colors;
+    let width = track.right.saturating_sub(track.left);
+    let height = track.bottom.saturating_sub(track.top);
+    if let Some(mut raster) = super::raster::Raster::new(width, height, background) {
+        let radius = height as f32 * 0.5;
+        let stroke = (dpi.clamp(96, 768) as f32 / 96.0).min(radius);
+        raster.round_rect([0.0, 0.0, width as f32, height as f32], radius, border);
+        raster.round_rect(
+            [
+                stroke,
+                stroke,
+                width as f32 - stroke,
+                height as f32 - stroke,
+            ],
+            (radius - stroke).max(0.0),
+            track_color,
+        );
+        raster.circle(
+            (knob.left - track.left) as f32 + (knob.right - knob.left) as f32 * 0.5,
+            (knob.top - track.top) as f32 + (knob.bottom - knob.top) as f32 * 0.5,
+            (knob.right - knob.left) as f32 * 0.5,
+            knob_color,
+        );
+        // SAFETY: Same live saved paint/print DC as the GDI fallback below.
+        if unsafe { raster.paint(dc, track.left, track.top) } {
+            return;
+        }
+    }
+    // SAFETY: Caller saves the borrowed DC; only stock objects are selected.
+    // Allocation/budget/driver failures retain the original readable GDI shapes.
+    unsafe {
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SetDCPenColor(dc, border);
+        SetDCBrushColor(dc, track_color);
+        RoundRect(
+            dc,
+            track.left,
+            track.top,
+            track.right,
+            track.bottom,
+            height,
+            height,
+        );
+        SetDCPenColor(dc, knob_color);
+        SetDCBrushColor(dc, knob_color);
+        Ellipse(dc, knob.left, knob.top, knob.right, knob.bottom);
+    }
+}
+
 unsafe fn draw_switch(hwnd: HWND, dc: HDC, value: Appearance) {
     // SAFETY: native Button owns its caption/check/state and all input handling.
     // Only client painting changes; styles and BM_GET/SETCHECK are never replaced.
@@ -617,26 +675,15 @@ unsafe fn draw_switch(hwnd: HWND, dc: HDC, value: Appearance) {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let (track, knob, mut label) =
             switch_rects(client, value.dpi, checked, style & BS_LEFTTEXT as u32 != 0);
-        let (track_color, border, knob_color) =
-            switch_colors(p, checked, enabled, value.hover, pressed);
-        SelectObject(dc, GetStockObject(DC_BRUSH));
-        SelectObject(dc, GetStockObject(DC_PEN));
-        SetDCPenColor(dc, border);
-        SetDCBrushColor(dc, track_color);
-        let height = track.bottom - track.top;
-        RoundRect(
+        switch_shapes(
             dc,
-            track.left,
-            track.top,
-            track.right,
-            track.bottom,
-            height,
-            height,
+            track,
+            knob,
+            value.dpi,
+            p.background,
+            switch_colors(p, checked, enabled, value.hover, pressed),
         );
         let ink = if enabled { p.text } else { p.disabled };
-        SetDCPenColor(dc, knob_color);
-        SetDCBrushColor(dc, knob_color);
-        Ellipse(dc, knob.left, knob.top, knob.right, knob.bottom);
         font(hwnd, dc);
         SetTextColor(dc, ink);
         let ui = SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) as u32;
@@ -1427,7 +1474,8 @@ mod tests {
             for right in [false, true] {
                 let (track, off, label) = switch_rects(client, dpi, false, right);
                 let (_, on, _) = switch_rects(client, dpi, true, right);
-                assert_eq!(track.right - track.left, px(34, dpi));
+                assert_eq!(track.right - track.left, px(38, dpi));
+                assert_eq!(track.bottom - track.top, px(20, dpi));
                 assert!(off.left >= track.left && on.right <= track.right);
                 assert!(off.left < on.left);
                 assert!(off.top >= track.top && on.bottom <= track.bottom);
@@ -1449,7 +1497,7 @@ mod tests {
         assert!(track.right <= tiny.right && track.bottom <= tiny.bottom);
         assert!(knob.left >= track.left && knob.right <= track.right);
         for dpi in [96, 144, 192] {
-            for width in [0, 1, 8, 34, 240] {
+            for width in [0, 1, 8, 34, 38, 240] {
                 for height in [0, 1, 5, 28, 30, 36] {
                     let client = RECT {
                         left: 5,
@@ -1488,10 +1536,11 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     struct DcState {
         colors: [u32; 4],
-        objects: [HGDIOBJ; 3],
-        modes: [i32; 2],
+        objects: [HGDIOBJ; 4],
+        modes: [i32; 5],
         viewport: (i32, i32),
         window: (i32, i32),
+        position: (i32, i32),
         clip: (i32, i32, i32, i32, i32),
     }
     impl DcState {
@@ -1500,9 +1549,11 @@ mod tests {
             unsafe {
                 let mut viewport = POINT::default();
                 let mut window = POINT::default();
+                let mut position = POINT::default();
                 let mut clip = RECT::default();
                 GetViewportOrgEx(dc, &mut viewport);
                 GetWindowOrgEx(dc, &mut window);
+                GetCurrentPositionEx(dc, &mut position);
                 let clip_kind = GetClipBox(dc, &mut clip);
                 Self {
                     colors: [
@@ -1515,10 +1566,18 @@ mod tests {
                         GetCurrentObject(dc, OBJ_FONT as u32),
                         GetCurrentObject(dc, OBJ_PEN as u32),
                         GetCurrentObject(dc, OBJ_BRUSH as u32),
+                        GetCurrentObject(dc, OBJ_BITMAP as u32),
                     ],
-                    modes: [GetBkMode(dc), GetMapMode(dc)],
+                    modes: [
+                        GetBkMode(dc),
+                        GetMapMode(dc),
+                        GetROP2(dc),
+                        GetPolyFillMode(dc),
+                        GetStretchBltMode(dc),
+                    ],
                     viewport: (viewport.x, viewport.y),
                     window: (window.x, window.y),
+                    position: (position.x, position.y),
                     clip: (clip_kind, clip.left, clip.top, clip.right, clip.bottom),
                 }
             }
@@ -1546,6 +1605,345 @@ mod tests {
             );
             assert!(!hwnd.is_null());
             hwnd
+        }
+    }
+
+    struct SwitchTarget {
+        dc: HDC,
+        bitmap: HBITMAP,
+        previous: HGDIOBJ,
+        parent: HWND,
+    }
+    impl SwitchTarget {
+        unsafe fn new() -> Self {
+            // SAFETY: All handles are privately owned by this test on one thread.
+            // Initialize the partial owner before assertions for reliable cleanup.
+            unsafe {
+                let mut target = Self {
+                    dc: CreateCompatibleDC(std::ptr::null_mut()),
+                    bitmap: std::ptr::null_mut(),
+                    previous: std::ptr::null_mut(),
+                    parent: window("STATIC", WS_POPUP, std::ptr::null_mut()),
+                };
+                assert!(!target.dc.is_null());
+                target.bitmap = CreateBitmap(720, 96, 1, 32, null());
+                assert!(!target.bitmap.is_null());
+                target.previous = SelectObject(target.dc, target.bitmap);
+                assert!(!target.previous.is_null() && target.previous as isize != -1);
+                target
+            }
+        }
+    }
+    impl Drop for SwitchTarget {
+        fn drop(&mut self) {
+            // SAFETY: Hidden child windows/subclasses die before their test-owned
+            // DC/bitmap; no saved-DC guard can outlive this enclosing owner.
+            unsafe {
+                DestroyWindow(self.parent);
+                if !self.previous.is_null() && self.previous as isize != -1 {
+                    SelectObject(self.dc, self.previous);
+                }
+                if !self.bitmap.is_null() {
+                    DeleteObject(self.bitmap);
+                }
+                DeleteDC(self.dc);
+            }
+        }
+    }
+
+    fn coverage(pixel: u32, background: u32, foreground: u32) -> bool {
+        pixel != background
+            && pixel != foreground
+            && (1..16u32).any(|coverage| {
+                pixel
+                    == [0, 8, 16].into_iter().fold(0, |color, shift| {
+                        let a = (background >> shift) & 255;
+                        let b = (foreground >> shift) & 255;
+                        color | (((a * (16 - coverage) + b * coverage + 8) / 16) << shift)
+                    })
+            })
+    }
+
+    #[test]
+    fn antialiased_switch_print_keeps_native_state_caption_clip_and_gdi_stable() {
+        use windows_sys::Win32::System::Threading::{
+            GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources,
+        };
+        // SAFETY: Hidden native BUTTON, private memory DC and synthetic caption.
+        // Never shows a window, sets focus, pumps input, or touches user data.
+        unsafe {
+            let target = SwitchTarget::new();
+            let sentinel = 0x765432;
+            let clear_bitmap = || {
+                // Clear the whole bitmap, including clip holes, without changing
+                // the borrowed DC state used by the next print message.
+                let _saved = SavedDc::new(target.dc).unwrap();
+                assert_ne!(SelectClipRgn(target.dc, std::ptr::null_mut()), ERROR);
+                SetDCBrushColor(target.dc, sentinel);
+                assert_ne!(
+                    FillRect(
+                        target.dc,
+                        &RECT {
+                            left: 0,
+                            top: 0,
+                            right: 720,
+                            bottom: 96,
+                        },
+                        GetStockObject(DC_BRUSH),
+                    ),
+                    0
+                );
+            };
+            let hwnd = window(
+                "BUTTON",
+                WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+                target.parent,
+            );
+            let native_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let caption: Vec<_> = "启用代理 &switch".encode_utf16().chain(Some(0)).collect();
+            SendMessageW(hwnd, WM_SETTEXT, 0, caption.as_ptr() as LPARAM);
+            let focus = GetFocus();
+            for dpi in [96, 144, 192] {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    px(240, dpi),
+                    px(32, dpi),
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW,
+                );
+                let mut client = RECT::default();
+                GetClientRect(hwnd, &mut client);
+                for (kind, p) in [
+                    (Resolved::Light, light_palette()),
+                    (Resolved::Dark, palette()),
+                ] {
+                    for right in [false, true] {
+                        let style = native_style | if right { BS_LEFTTEXT as isize } else { 0 };
+                        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                        apply(hwnd, kind, p, dpi);
+                        for checked in [false, true] {
+                            for (enabled, hover, pressed) in [
+                                (true, false, false),
+                                (true, true, false),
+                                (true, false, true),
+                                (false, true, true),
+                            ] {
+                                EnableWindow(hwnd, i32::from(enabled));
+                                SendMessageW(hwnd, BM_SETCHECK, WPARAM::from(checked), 0);
+                                SendMessageW(hwnd, BM_SETSTATE, WPARAM::from(pressed), 0);
+                                set_hover(hwnd, hover);
+                                let state = SendMessageW(hwnd, BM_GETSTATE, 0, 0);
+                                SetTextColor(target.dc, 0x123456);
+                                SetBkColor(target.dc, 0x234567);
+                                SetDCPenColor(target.dc, 0x345678);
+                                SetDCBrushColor(target.dc, 0x456789);
+                                SetStretchBltMode(target.dc, HALFTONE);
+                                let before = DcState::capture(target.dc);
+                                for message in [WM_PRINT, WM_PRINTCLIENT] {
+                                    clear_bitmap();
+                                    assert_eq!(DcState::capture(target.dc), before);
+                                    SendMessageW(
+                                        hwnd,
+                                        message,
+                                        target.dc as WPARAM,
+                                        PRF_CLIENT as LPARAM,
+                                    );
+                                    assert_eq!(DcState::capture(target.dc), before);
+                                    assert_eq!(
+                                        SendMessageW(hwnd, BM_GETCHECK, 0, 0),
+                                        LRESULT::from(checked)
+                                    );
+                                    assert_eq!(SendMessageW(hwnd, BM_GETSTATE, 0, 0), state);
+                                    assert_eq!(GetFocus(), focus);
+                                    assert_eq!(
+                                        GetWindowLongPtrW(hwnd, GWL_STYLE),
+                                        style | if enabled { 0 } else { WS_DISABLED as isize }
+                                    );
+                                    let mut text = [0u16; 64];
+                                    let count = SendMessageW(
+                                        hwnd,
+                                        WM_GETTEXT,
+                                        text.len(),
+                                        text.as_mut_ptr() as LPARAM,
+                                    ) as usize;
+                                    assert_eq!(&text[..count], &caption[..caption.len() - 1]);
+                                    let (track, knob, _) =
+                                        switch_rects(client, dpi, checked, right);
+                                    let actual_pressed = state as u32 & BST_PUSHED != 0;
+                                    let (track_color, border, knob_color) =
+                                        switch_colors(p, checked, enabled, hover, actual_pressed);
+                                    assert_eq!(
+                                        GetPixel(
+                                            target.dc,
+                                            (track.left + track.right) / 2,
+                                            (track.top + track.bottom) / 2
+                                        ),
+                                        track_color
+                                    );
+                                    assert_eq!(
+                                        GetPixel(
+                                            target.dc,
+                                            (knob.left + knob.right) / 2,
+                                            (knob.top + knob.bottom) / 2
+                                        ),
+                                        knob_color
+                                    );
+                                    let mut outer_aa = 0;
+                                    let mut knob_aa = 0;
+                                    for y in track.top..track.bottom {
+                                        for x in track.left..track.right {
+                                            let pixel = GetPixel(target.dc, x, y);
+                                            outer_aa +=
+                                                usize::from(coverage(pixel, p.background, border));
+                                            if x >= knob.left
+                                                && x < knob.right
+                                                && y >= knob.top
+                                                && y < knob.bottom
+                                            {
+                                                knob_aa += usize::from(coverage(
+                                                    pixel,
+                                                    track_color,
+                                                    knob_color,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    assert!(
+                                        outer_aa >= 4,
+                                        "outer coverage: message={message:#x}, dpi={dpi}, checked={checked}, enabled={enabled}"
+                                    );
+                                    assert!(
+                                        knob_aa >= 4,
+                                        "knob coverage: message={message:#x}, dpi={dpi}, checked={checked}, enabled={enabled}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            EnableWindow(hwnd, 1);
+            SendMessageW(hwnd, BM_SETSTATE, 0, 0);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, native_style);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                360,
+                40,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW,
+            );
+            apply(hwnd, Resolved::Dark, palette(), 96);
+            SendMessageW(hwnd, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
+            set_hover(hwnd, false);
+            let mut client = RECT::default();
+            GetClientRect(hwnd, &mut client);
+            let (track, knob, _) = switch_rects(client, 96, true, false);
+            let p = palette();
+            let (track_color, border, knob_color) = switch_colors(p, true, true, false, false);
+            // Complex borrowed-print clip: verify the region and pixels in its
+            // hole, not just a bounding box that could miss lost subregions.
+            let dc = target.dc;
+            let _saved = SavedDc::new(dc).unwrap();
+            let clip = CreateRectRgn(0, 0, 360, 40);
+            let hole = CreateRectRgn(5, 14, 11, 23);
+            let after = CreateRectRgn(0, 0, 0, 0);
+            assert!(!clip.is_null() && !hole.is_null() && !after.is_null());
+            assert_eq!(CombineRgn(clip, clip, hole, RGN_DIFF), COMPLEXREGION);
+            assert_ne!(SelectClipRgn(dc, clip), ERROR);
+            let before = DcState::capture(dc);
+            for message in [WM_PRINT, WM_PRINTCLIENT] {
+                clear_bitmap();
+                assert_eq!(DcState::capture(dc), before);
+                assert_eq!(GetClipRgn(dc, after), 1);
+                assert_ne!(EqualRgn(clip, after), 0);
+                SendMessageW(hwnd, message, dc as WPARAM, PRF_CLIENT as LPARAM);
+                assert_eq!(DcState::capture(dc), before);
+                assert_eq!(GetClipRgn(dc, after), 1);
+                assert_ne!(EqualRgn(clip, after), 0);
+                let _inspect = SavedDc::new(dc).unwrap();
+                assert_ne!(SelectClipRgn(dc, std::ptr::null_mut()), ERROR);
+                assert_eq!(GetPixel(dc, 8, 18), sentinel);
+                assert_eq!(
+                    GetPixel(
+                        dc,
+                        (track.left + track.right) / 2,
+                        (track.top + track.bottom) / 2
+                    ),
+                    track_color
+                );
+                assert_eq!(
+                    GetPixel(
+                        dc,
+                        (knob.left + knob.right) / 2,
+                        (knob.top + knob.bottom) / 2
+                    ),
+                    knob_color
+                );
+                assert!((track.top..track.bottom).any(|y| {
+                    (track.left..track.right)
+                        .any(|x| coverage(GetPixel(dc, x, y), p.background, border))
+                }));
+                assert!((knob.top..knob.bottom).any(|y| {
+                    (knob.left..knob.right)
+                        .any(|x| coverage(GetPixel(dc, x, y), track_color, knob_color))
+                }));
+            }
+            let process = GetCurrentProcess();
+            let count = GetGuiResources(process, GR_GDIOBJECTS);
+            for _ in 0..200 {
+                SendMessageW(hwnd, WM_PRINTCLIENT, dc as WPARAM, PRF_CLIENT as LPARAM);
+            }
+            assert_eq!(GetGuiResources(process, GR_GDIOBJECTS), count);
+            assert_eq!(DcState::capture(dc), before);
+            DeleteObject(clip);
+            DeleteObject(hole);
+            DeleteObject(after);
+        }
+    }
+
+    #[test]
+    fn oversized_switch_shape_budget_keeps_readable_gdi_fallback() {
+        // SAFETY: Private memory target only. Oversized track rejects CPU raster
+        // allocation, while the original GDI geometry is still visible in it.
+        unsafe {
+            let target = SwitchTarget::new();
+            let _saved = SavedDc::new(target.dc).unwrap();
+            let track = RECT {
+                left: 0,
+                top: 0,
+                right: 4097,
+                bottom: 40,
+            };
+            let knob = RECT {
+                left: 5,
+                top: 5,
+                right: 35,
+                bottom: 35,
+            };
+            fill(
+                target.dc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: 720,
+                    bottom: 96,
+                },
+                0x202020,
+            );
+            switch_shapes(
+                target.dc,
+                track,
+                knob,
+                96,
+                0x202020,
+                (0xb85f00, 0xb85f00, 0xffffff),
+            );
+            assert_eq!(GetPixel(target.dc, 200, 20), 0xb85f00);
+            assert_eq!(GetPixel(target.dc, 20, 20), 0xffffff);
         }
     }
 

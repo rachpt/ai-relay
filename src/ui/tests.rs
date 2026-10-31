@@ -215,6 +215,19 @@ impl Drop for NativeState {
 }
 
 #[test]
+fn about_identifies_build_profile_without_claiming_release_acceptance() {
+    for debug in [false, true] {
+        let text = about_text(debug);
+        assert!(text.starts_with(&format!("AI Relay {} · ", env!("CARGO_PKG_VERSION"))));
+        assert!(!text.contains("开发预览"));
+        assert!(!text.contains("正式版"));
+        assert!(text.contains("统计与流量观测不是 Provider 账单"));
+        assert_eq!(text.contains("Debug 开发构建"), debug);
+        assert_eq!(text.contains("Release 构建"), !debug);
+    }
+}
+
+#[test]
 fn native_initial_log_cache_uses_its_own_minimum_height() {
     let mut native = NativeState::new();
     for dpi in [96, 144, 192] {
@@ -309,11 +322,12 @@ fn native_history_commands_rearrange_revealed_controls_without_drift() {
                 3 => 2331,
                 _ => 2337,
             });
-            assert_eq!(native.rect(result).top, 592 - HEADER_HEIGHT - offset);
+            let expected = native.rect(native.control(2325)).bottom + 8 + 200 + 8 + 72;
+            assert_eq!(native.rect(result).top, expected);
             assert_eq!(native.rect(view).top, top);
             native.state.show_page(0);
             native.state.show_page(1);
-            assert_eq!(native.rect(result).top, 592 - HEADER_HEIGHT - offset);
+            assert_eq!(native.rect(result).top, expected);
             assert_eq!(native.scroll(SB_ENDSCROLL), offset);
         }
         native.command(2301, Some(4));
@@ -467,13 +481,14 @@ fn native_settings_scroll_extent_tracks_category_instead_of_an_empty_page() {
                 "category {category}, segment {id} has a stale or uncapped width"
             );
         }
-        // This input is laid out for every category, even while hidden. Its
-        // uncapped width still catches both scrollbar show/hide regressions.
+        // This bounded dropdown is laid out for every category, even while
+        // hidden, and must use the current native scrollbar width.
         let input = native.rect(native.control(2010));
         assert_eq!(input.left, scale(180, dpi));
         assert_eq!(
-            input.right, right,
-            "category {category} input used the previous scrollbar width"
+            input.right,
+            right.min(scale(180 + 320, dpi)),
+            "category {category} input used the previous scrollbar width or lost its cap"
         );
     };
     for dpi in [96, 144, 192] {
@@ -494,7 +509,14 @@ fn native_settings_scroll_extent_tracks_category_instead_of_an_empty_page() {
                 let offset = native.scroll(SB_BOTTOM);
                 let last = native.rect(native.control(2001));
                 let footer = native.rect(native.state.status_label);
-                let bottom = scale([326, 416, 640, 464, 594, 536][category], dpi);
+                let mut host = RECT::default();
+                // SAFETY: Live host after native scrollbar visibility settled.
+                assert_ne!(
+                    unsafe { GetClientRect(native.state.viewport.handle, &mut host) },
+                    0
+                );
+                let content_width = (host.right - scale(48, dpi)).max(1);
+                let bottom = native.state.settings.document_bottom(dpi, content_width);
                 let expected = (bottom + scale(status_bar::HEIGHT + viewport::BOTTOM_PADDING, dpi)
                     - scale(height, dpi))
                 .max(0);

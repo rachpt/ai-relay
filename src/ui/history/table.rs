@@ -366,20 +366,7 @@ impl History {
             }
         }
         settings::set_text(self.control(2331), &detail);
-        settings::set_text(
-            self.control(2325),
-            &format!(
-                "历史已查询：匹配 {} 请求；明细 offset {} / {} 行（每页 {}）；{:?}/{:?}；汇总本页 {} 组；记录计数 {:?}",
-                report.summary.requests,
-                query.offset,
-                report.details.len(),
-                query.limit,
-                query.time_zone,
-                query.trend_granularity,
-                report.groups.len(),
-                counters
-            ),
-        );
+        self.set_status(&status_text::query(&query, &report, counters));
         self.applied = Some(query);
         self.report = Some(report);
         self.render_table();

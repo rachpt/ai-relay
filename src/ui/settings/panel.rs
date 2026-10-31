@@ -3,9 +3,6 @@ use super::*;
 use crate::config::{Config, InjectionMode, SecretStorage, StorageMode};
 use windows_sys::Win32::{Foundation::HINSTANCE, Graphics::Gdi::HFONT};
 
-const CATEGORY_MAX_WIDTH_DIP: i32 = 864;
-const THEME_MAX_WIDTH_DIP: i32 = 456;
-
 impl Settings {
     #[allow(clippy::too_many_arguments)]
     fn control(
@@ -56,15 +53,18 @@ impl Settings {
         Ok(control)
     }
     pub fn create(&mut self, hwnd: HWND, instance: HINSTANCE) -> Result<(), String> {
-        for (caption, y) in [
+        for (index, (caption, y)) in [
             ("上游 URL", 120),
-            ("监听 IP / 端口", 162),
+            ("监听 IP", 162),
             ("上游 Key", 204),
             ("密钥注入模式", 246),
             ("配置存储目录", 288),
             ("密钥保存方式", 330),
-        ] {
-            self.control(
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.base_labels[index] = self.control(
                 hwnd,
                 instance,
                 "STATIC",
@@ -85,7 +85,34 @@ impl Settings {
             0,
             (180, 162, 360, 30),
         )?;
-        self.port = self.control(hwnd, instance, "EDIT", "8080", edit, 0, (552, 162, 178, 30))?;
+        let port_label =
+            self.control(hwnd, instance, "STATIC", "端口", 0, 0, (452, 166, 40, 24))?;
+        self.port = self.control(
+            hwnd,
+            instance,
+            "EDIT",
+            "8080",
+            edit | ES_NUMBER as u32,
+            0,
+            (500, 162, 108, 30),
+        )?;
+        let port_hint = self.control(
+            hwnd,
+            instance,
+            "STATIC",
+            numeric::PORT.hint,
+            0,
+            0,
+            (180, 192, 550, 20),
+        )?;
+        let port = numeric::NumberControl {
+            control: self.port,
+            label: port_label,
+            hint: port_hint,
+            spec: numeric::PORT,
+        };
+        numeric::attach(port)?;
+        self.numbers.push(port);
         self.key = self.control(
             hwnd,
             instance,
@@ -95,6 +122,16 @@ impl Settings {
             0,
             (180, 204, 550, 30),
         )?;
+        self.key_visibility = self.control(
+            hwnd,
+            instance,
+            "BUTTON",
+            "显示上游 Key(&K)",
+            WS_TABSTOP | BS_PUSHBUTTON as u32,
+            KEY_VISIBILITY,
+            (582, 204, 148, 30),
+        )?;
+        self.hide_secrets();
         self.injection = self.control(
             hwnd,
             instance,
@@ -263,6 +300,9 @@ impl Settings {
         Ok(())
     }
     pub fn show_page(&mut self, page: usize) {
+        if page != 3 || selected(self.category) != 0 {
+            self.hide_secrets();
+        }
         self.page = page;
         let mut shows = ShowBatch::with_capacity(self.controls.len());
         for &(control, ..) in &self.controls {
@@ -287,7 +327,13 @@ impl Settings {
         }
     }
     pub(super) fn actions_y(&self) -> i32 {
+        self.actions_y_for_width(self.layout_width.get())
+    }
+    fn actions_y_for_width(&self, width_dip: i32) -> i32 {
         let category = selected(self.category);
+        if category == 3 {
+            return layout::network_actions_y(width_dip);
+        }
         self.controls
             .iter()
             .filter(|(control, ..)| {
@@ -301,11 +347,16 @@ impl Settings {
             .unwrap_or(142)
             + 24
     }
-    pub(in crate::ui) fn document_bottom(&self, dpi: u32) -> i32 {
-        scale(self.actions_y() - 48 + 32, dpi)
+    pub(in crate::ui) fn document_bottom(&self, dpi: u32, content_width: i32) -> i32 {
+        let width = layout::logical_width(content_width, dpi);
+        scale(
+            self.actions_y_for_width(width) - 48 + if width < 688 { 76 } else { 32 },
+            dpi,
+        )
     }
 
     pub fn layout(&self, dpi: u32, width: i32, height: i32) {
+        self.layout_width.set(layout::logical_width(width, dpi));
         let actions_y = self.actions_y();
         let mut moves = MoveBatch::with_capacity(self.controls.len());
         for &(control, x, y, w, h) in &self.controls {
@@ -319,27 +370,14 @@ impl Settings {
                 );
                 continue;
             }
+            let (x, y, w, h) = self.row_geometry(dpi, width, (control, x, y, w, h));
             // SAFETY: Owned live child; querying its ID neither dispatches nor mutates state.
             let id = unsafe { GetDlgCtrlID(control) as u32 };
-            let y = if matches!(id, SAVE | START | STOP | LOAD) {
-                actions_y
+            if let Some((x, y, w, h)) = self.action_geometry(dpi, width, id, actions_y) {
+                moves.add(control, x, y, w, h);
             } else {
-                y
-            };
-            let w = if control == self.port || w == 550 || w == 706 {
-                (width - scale(x - 24, dpi)).max(1)
-            } else {
-                scale(w, dpi)
-            };
-            // Bound only the segmented tracks, preserving form anchors and narrow-window fit.
-            let w = if control == self.category {
-                w.min(scale(CATEGORY_MAX_WIDTH_DIP, dpi))
-            } else if control == self.theme {
-                w.min(scale(THEME_MAX_WIDTH_DIP, dpi))
-            } else {
-                w
-            };
-            moves.add(control, scale(x, dpi), scale(y - 48, dpi), w, scale(h, dpi));
+                moves.add(control, x, y, w, h);
+            }
         }
         moves.commit();
     }
@@ -352,6 +390,9 @@ impl Settings {
         }
     }
     pub(super) fn enable(&self) {
+        if self.busy || self.action_busy || self.file_task.is_some() || self.config.is_none() {
+            self.hide_secrets();
+        }
         for &(control, ..) in &self.controls {
             // SAFETY: Owner-thread live controls, no State reentry from child EnableWindow.
             unsafe {
@@ -377,10 +418,12 @@ impl Settings {
         }
     }
     pub fn disable(&mut self) {
+        self.hide_secrets();
         self.busy = true;
         self.enable();
     }
     pub(super) fn populate(&mut self, config: Config) {
+        self.hide_secrets();
         select(
             self.theme,
             match config.ui.theme {
@@ -485,7 +528,7 @@ impl Settings {
                 .iter()
                 .any(|(h, group)| *h == row.0 && *group == 0)
             {
-                row.2 += 40;
+                row.2 += if row.2 >= 204 { 56 } else { 40 };
             }
             if self
                 .groups
@@ -547,68 +590,45 @@ impl Settings {
             ),
             (
                 3,
-                vec![
-                    (
-                        "建连超时（秒，非零）",
-                        "network",
-                        "connect_timeout_secs",
-                        false,
-                    ),
-                    (
-                        "响应头超时（秒，非零）",
-                        "network",
-                        "response_header_timeout_secs",
-                        false,
-                    ),
-                    (
-                        "响应体空闲（秒，0 禁用）",
-                        "network",
-                        "response_body_idle_timeout_secs",
-                        false,
-                    ),
-                    (
-                        "隧道空闲（秒，0 禁用）",
-                        "network",
-                        "tunnel_idle_timeout_secs",
-                        false,
-                    ),
-                    (
-                        "停止宽限（秒，非零）",
-                        "network",
-                        "shutdown_grace_secs",
-                        false,
-                    ),
-                    (
-                        "最大活动请求（非零）",
-                        "network",
-                        "max_active_requests",
-                        false,
-                    ),
-                ],
+                numeric::NETWORK
+                    .into_iter()
+                    .map(|spec| (spec.caption, spec.section, spec.field, false))
+                    .collect(),
             ),
         ] {
             for (index, (caption, section, field, checkbox)) in fields.into_iter().enumerate() {
-                let y = 160 + index as i32 * 52;
-                let label = self.control(
-                    hwnd,
-                    instance,
-                    "STATIC",
-                    caption,
-                    0,
-                    0,
-                    (24, y + 4, 300, 32),
-                )?;
+                let number = numeric::find(section, field);
+                let caption = number.map_or(caption, |spec| spec.caption);
+                let y = 160 + index as i32 * if number.is_some() { 88 } else { 52 };
+                let label = if checkbox {
+                    null_mut()
+                } else {
+                    self.control(
+                        hwnd,
+                        instance,
+                        "STATIC",
+                        caption,
+                        0,
+                        0,
+                        (24, y + 4, 244, 32),
+                    )?
+                };
                 let control = self.control(
                     hwnd,
                     instance,
                     if checkbox { "BUTTON" } else { "EDIT" },
-                    "",
+                    if checkbox { caption } else { "" },
                     WS_TABSTOP
                         | if checkbox {
                             BS_AUTOCHECKBOX as u32
                         } else {
                             WS_BORDER
                                 | ES_AUTOHSCROLL as u32
+                                | if number.is_some() {
+                                    ES_NUMBER as u32
+                                } else {
+                                    0
+                                }
                                 | if field == "client_token" {
                                     ES_PASSWORD as u32
                                 } else {
@@ -616,10 +636,35 @@ impl Settings {
                                 }
                         },
                     2040 + self.fields.len() as u32,
-                    (340, y, 380, 30),
+                    (280, y, 380, 30),
                 )?;
-                self.groups.extend([(label, group), (control, group)]);
+                self.groups.push((control, group));
+                if !label.is_null() {
+                    self.groups.push((label, group));
+                }
                 self.fields.push((control, section, field));
+                if let Some(spec) = number {
+                    let hint = self.control(
+                        hwnd,
+                        instance,
+                        "STATIC",
+                        spec.hint,
+                        0,
+                        0,
+                        (24, y + 62, 400, 22),
+                    )?;
+                    self.groups.push((hint, group));
+                    let number = numeric::NumberControl {
+                        control,
+                        label,
+                        hint,
+                        spec,
+                    };
+                    numeric::attach(number)?;
+                    self.numbers.push(number);
+                } else {
+                    self.field_rows.push((label, control));
+                }
             }
         }
         for (group, caption) in [
@@ -681,6 +726,7 @@ impl Settings {
             self.groups.push((control, 5));
             self.fields.push((control, "ui", field));
         }
+        self.reorder_navigation();
         Ok(())
     }
 }

@@ -91,6 +91,11 @@ public static class ModernNative {
         public int Gap,Padding,Extent,ExpectedExtent,LastDocumentBottom;
         public string Failure;
     }
+    public sealed class HistoryGeometryProof {
+        public StatusBarNative.Rect Status;
+        public int StatusExtra,ChartTop,SortTop,TableTop;
+        public string Failure;
+    }
     public sealed class RightMarginProof {
         public int HostClientWidth,Right,ExpectedRight,Margin,ExpectedMargin;
         public string Failure;
@@ -99,6 +104,10 @@ public static class ModernNative {
         public int ID,HostClientWidth,Left,ExpectedLeft,Width,ExpectedWidth,Right,ExpectedRight,MaxWidthDIP;
         public string Failure;
     }
+    public sealed class SettingsGeometryProof {
+        public string Name,Failure;
+        public StatusBarNative.Rect Actual,Expected;
+    }
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr VirtualAllocEx(IntPtr process,IntPtr address,UIntPtr size,uint kind,uint protection);
@@ -106,6 +115,7 @@ public static class ModernNative {
     [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr process,IntPtr address,byte[] bytes,UIntPtr size,out UIntPtr read);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeoutW(IntPtr window,uint message,UIntPtr w,IntPtr l,uint flags,uint timeout,out UIntPtr result);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeoutW(IntPtr window,uint message,UIntPtr w,StringBuilder l,uint flags,uint timeout,out UIntPtr result);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeoutW(IntPtr window,uint message,UIntPtr w,string l,uint flags,uint timeout,out UIntPtr result);
     public static long Message(IntPtr window,uint pid,uint message,uint w,int l) {
         return ClarityNative.Message(window,pid,message,w,l);
     }
@@ -241,8 +251,8 @@ public static class ModernNative {
         if(regression.Failure==null || regression.ExpectedRight!=959)
             throw new Exception("976-vs-959 scrollbar-width regression was not detected");
     }
-    // Only these two settings tracks are capped; PageRightMargin remains strict
-    // for every stretched input/tail, including after native scrollbar show/hide.
+    // The segmented tracks keep their own exact caps. Other field types have
+    // explicit contracts below, never a blanket right-margin exemption.
     public static SegmentWidthProof SettingsSegmentWidth(int id,int hostClientWidth,StatusBarNative.Rect fullControl,uint dpi) {
         if(hostClientWidth<1 || dpi==0) throw new ArgumentException("Invalid host-client width/DPI");
         int leftDip,maxDip;
@@ -310,15 +320,261 @@ public static class ModernNative {
         catch(ArgumentException) { rejected=true; }
         if(!rejected) throw new Exception("Ordinary settings input acquired a segment-width exemption");
     }
+    public static int SettingsContentWidth(int hostClientWidth,uint dpi) {
+        if(hostClientWidth<1 || dpi==0) throw new ArgumentException("Invalid settings host-client width/DPI");
+        return Math.Max(1,hostClientWidth-2*Scale(24,dpi));
+    }
+    public static int SettingsContentDip(int hostClientWidth,uint dpi) {
+        return (int)((SettingsContentWidth(hostClientWidth,dpi)*96L+dpi/2)/dpi);
+    }
+    public static int SettingsActionsY(int category,int contentWidthDip) {
+        if(category<0 || category>5 || contentWidthDip<1) throw new ArgumentException("Invalid settings category/content width");
+        return category==3?(contentWidthDip>=680?444:708):new int[]{358,432,656,0,610,552}[category];
+    }
+    public static int SettingsDocumentBottom(int category,int hostClientWidth,uint dpi) {
+        int dip=SettingsContentDip(hostClientWidth,dpi);
+        return Scale(SettingsActionsY(category,dip)-48+(dip<688?76:32),dpi);
+    }
+    public static StatusBarNative.Rect SettingsActionBounds(int category,int id,int hostClientWidth,uint dpi) {
+        int index=Array.IndexOf(new int[]{2001,2002,2003,2004},id);
+        if(index<0) throw new ArgumentException("Only settings actions 2001..2004 have action geometry");
+        int content=SettingsContentWidth(hostClientWidth,dpi),dip=SettingsContentDip(hostClientWidth,dpi);
+        bool narrow=dip<688;
+        int x=narrow?24+index%2*212:new int[]{24,188,400,564}[index];
+        int y=SettingsActionsY(category,dip)-48+(narrow?index/2*44:0);
+        int width=Math.Min(Scale(narrow?196:(id==2002?196:148),dpi),Math.Max(1,content-Scale(x-24,dpi)));
+        return new StatusBarNative.Rect { Left=Scale(x,dpi),Top=Scale(y,dpi),Right=Scale(x,dpi)+width,Bottom=Scale(y,dpi)+Scale(32,dpi) };
+    }
+    public static StatusBarNative.Rect SettingsNetworkBounds(int id,int hostClientWidth,uint dpi) {
+        int index=id-2050;
+        if(index<0 || index>=6) throw new ArgumentException("Only network numeric fields 2050..2055 have grid geometry");
+        int content=SettingsContentWidth(hostClientWidth,dpi),columns=SettingsContentDip(hostClientWidth,dpi)>=680?2:1;
+        int columnWidth=Math.Max(1,Math.Min(Scale(400,dpi),(content-Scale(24,dpi)*(columns-1))/columns));
+        int left=Scale(24,dpi)+index%columns*(columnWidth+Scale(24,dpi));
+        int top=Scale(112+index/columns*88,dpi)+Scale(28,dpi);
+        return new StatusBarNative.Rect { Left=left,Top=top,Right=left+Math.Min(Scale(148,dpi),columnWidth),Bottom=top+Scale(30,dpi) };
+    }
+    static SettingsGeometryProof SettingsGeometry(string name,StatusBarNative.Rect actual,StatusBarNative.Rect expected,bool vertical) {
+        var proof=new SettingsGeometryProof { Name=name,Actual=actual,Expected=expected };
+        if(actual.Width<=0 || actual.Height<=0 || Math.Abs((long)actual.Left-expected.Left)>1 ||
+           Math.Abs((long)actual.Right-expected.Right)>1 || Math.Abs((long)actual.Width-expected.Width)>1 ||
+           (vertical && (Math.Abs((long)actual.Top-expected.Top)>1 || Math.Abs((long)actual.Bottom-expected.Bottom)>1 || Math.Abs((long)actual.Height-expected.Height)>1)))
+            proof.Failure="Exact settings "+name+" geometry differs (+/-1 physical pixel): actual="+actual+", expected="+expected;
+        return proof;
+    }
+    public static SettingsGeometryProof SettingsAction(int category,int id,int hostClientWidth,StatusBarNative.Rect actual,uint dpi) {
+        return SettingsGeometry("action-"+id,actual,SettingsActionBounds(category,id,hostClientWidth,dpi),true);
+    }
+    public static SettingsGeometryProof SettingsNetwork(int id,int hostClientWidth,StatusBarNative.Rect actual,uint dpi) {
+        return SettingsGeometry("network-"+id,actual,SettingsNetworkBounds(id,hostClientWidth,dpi),true);
+    }
+    public static SettingsGeometryProof SettingsFieldWidth(string field,int hostClientWidth,StatusBarNative.Rect actual,uint dpi) {
+        int content=SettingsContentWidth(hostClientWidth,dpi),left=Scale(180,dpi);
+        int available=Math.Max(1,content-Scale(156,dpi)),width;
+        int ipWidth=Math.Min(Scale(256,dpi),Math.Max(1,available-Scale(172,dpi)));
+        int buttonWidth=Math.Min(Scale(148,dpi),available/2);
+        switch(field) {
+            case "url": width=available; break;
+            case "ip": width=ipWidth; break;
+            case "port":
+                left+=ipWidth+Scale(16,dpi)+Scale(48,dpi);
+                width=Math.Min(Scale(108,dpi),Math.Max(1,content-(left-Scale(24,dpi)))); break;
+            case "key": width=Math.Max(1,available-buttonWidth-Scale(8,dpi)); break;
+            case "key-visibility": left+=available-buttonWidth; width=Math.Max(1,buttonWidth); break;
+            case "injection": case "storage": width=Math.Min(Scale(320,dpi),available); break;
+            case "secrets": width=Math.Min(Scale(440,dpi),available); break;
+            case "whitelist": case "client-token": case "origins":
+                left=Scale(280,dpi); width=Math.Max(1,content-Scale(256,dpi)); break;
+            case "connect-ports": left=Scale(280,dpi); width=Math.Min(Scale(220,dpi),Math.Max(1,content-Scale(256,dpi))); break;
+            default: throw new ArgumentException("Unknown settings field width contract: "+field);
+        }
+        var expected=new StatusBarNative.Rect { Left=left,Right=left+width,Top=actual.Top,Bottom=actual.Bottom };
+        return SettingsGeometry(field,actual,expected,false);
+    }
+    static void ValidateSettingsFieldsAndActions() {
+        // Literal 96-DPI contracts prevent a self-consistent but incorrect helper
+        // from redefining caps/elastic inputs or the two responsive thresholds.
+        string[] fields={"url","ip","port","key","key-visibility","injection","storage","secrets","whitelist","client-token","origins","connect-ports"};
+        int[] lefts={180,180,500,180,572,180,180,180,280,280,280,280};
+        int[] widths={540,256,108,384,148,320,320,440,440,440,440,220};
+        for(int i=0;i<fields.Length;i++) {
+            var actual=new StatusBarNative.Rect { Left=lefts[i],Top=112,Right=lefts[i]+widths[i],Bottom=142 };
+            if(SettingsFieldWidth(fields[i],744,actual,96).Failure!=null) throw new Exception("Literal settings width contract failed: "+fields[i]);
+        }
+        var oldStorage=new StatusBarNative.Rect { Left=180,Top=112,Right=720,Bottom=142 };
+        if(SettingsFieldWidth("storage",744,oldStorage,96).Failure==null) throw new Exception("Legacy stretched storage dropdown was accepted");
+        foreach(int contentDip in new int[]{320,475,476,477,696,1440}) {
+            foreach(uint dpi in new uint[]{96,120,144,168,192}) {
+                int host=Scale(contentDip+48,dpi),left=Scale(180,dpi);
+                int available=SettingsContentWidth(host,dpi)-Scale(156,dpi);
+                var full=new StatusBarNative.Rect { Left=left,Top=60,Right=left+Math.Min(available,Scale(320,dpi)),Bottom=90 };
+                if(SettingsFieldWidth("storage",host,full,dpi).Failure!=null) throw new Exception("Storage min(available,320 DIP) cap boundary rejected");
+                var wrong=full; wrong.Right=left+(available<Scale(320,dpi)?Scale(320,dpi)+2:available+2);
+                if(SettingsFieldWidth("storage",host,wrong,dpi).Failure==null) throw new Exception("Overwide/cap-ignoring storage dropdown accepted");
+            }
+        }
+        foreach(uint dpi in new uint[]{96,120,144,168,192}) {
+            foreach(int contentDip in new int[]{528,576,679,680,687,688,696,952,1440,696}) {
+                foreach(int scrollbar in new int[]{0,17}) {
+                    int host=Scale(contentDip+48,dpi)-Scale(scrollbar,dpi),dip=SettingsContentDip(host,dpi);
+                    foreach(string field in fields) {
+                        var seed=new StatusBarNative.Rect { Top=-Scale(60,dpi),Right=1,Bottom=Scale(80,dpi) };
+                        var expected=SettingsFieldWidth(field,host,seed,dpi).Expected;
+                        foreach(int delta in new int[]{-1,0,1}) {
+                            var rounded=expected; rounded.Right+=delta;
+                            if(SettingsFieldWidth(field,host,rounded,dpi).Failure!=null) throw new Exception("Settings field one-pixel tolerance rejected");
+                        }
+                        foreach(int delta in new int[]{-Scale(17,dpi),-2,2,Scale(17,dpi)}) {
+                            var stale=expected; stale.Right+=delta;
+                            if(SettingsFieldWidth(field,host,stale,dpi).Failure==null) throw new Exception("Stale/wrong-cap settings field width accepted");
+                            var shifted=expected; shifted.Left+=delta; shifted.Right+=delta;
+                            if(SettingsFieldWidth(field,host,shifted,dpi).Failure==null) throw new Exception("Shifted settings field anchor accepted");
+                        }
+                    }
+                    for(int category=0;category<6;category++) {
+                        int actions=new int[]{358,432,656,dip>=680?444:708,610,552}[category];
+                        int bottom=Scale(actions-16+(dip<688?44:0),dpi);
+                        if(SettingsDocumentBottom(category,host,dpi)!=bottom) throw new Exception("Settings document/action extent contract failed");
+                        int last=0;
+                        for(int index=0;index<4;index++) {
+                            int id=2001+index,x=dip<688?24+index%2*212:new int[]{24,188,400,564}[index];
+                            int top=Scale(actions-48+(dip<688?index/2*44:0),dpi);
+                            int width=Scale(dip<688?196:(id==2002?196:148),dpi);
+                            var expected=new StatusBarNative.Rect { Left=Scale(x,dpi),Top=top,Right=Scale(x,dpi)+width,Bottom=top+Scale(32,dpi) };
+                            if(SettingsAction(category,id,host,expected,dpi).Failure!=null) throw new Exception("Settings responsive action geometry rejected");
+                            last=Math.Max(last,expected.Bottom);
+                            var stale=expected; stale.Top+=2; stale.Bottom+=2;
+                            if(SettingsAction(category,id,host,stale,dpi).Failure==null) throw new Exception("Stale settings action Y accepted");
+                            if(dip<688 && index>=2) {
+                                stale=expected; stale.Top-=Scale(44,dpi); stale.Bottom-=Scale(44,dpi);
+                                if(SettingsAction(category,id,host,stale,dpi).Failure==null) throw new Exception("Legacy single-row actions accepted below 688 DIP");
+                            }
+                        }
+                        if(Math.Abs(last-bottom)>1) throw new Exception("Settings document tail differs from final action row");
+                    }
+                    for(int index=0;index<6;index++) {
+                        int columns=dip>=680?2:1,column=Math.Max(1,Math.Min(Scale(400,dpi),(SettingsContentWidth(host,dpi)-Scale(24,dpi)*(columns-1))/columns));
+                        int left=Scale(24,dpi)+index%columns*(column+Scale(24,dpi)),top=Scale(112+index/columns*88,dpi)+Scale(28,dpi);
+                        var expected=new StatusBarNative.Rect { Left=left,Top=top,Right=left+Scale(148,dpi),Bottom=top+Scale(30,dpi) };
+                        if(SettingsNetwork(2050+index,host,expected,dpi).Failure!=null) throw new Exception("Settings 680-DIP network grid contract rejected");
+                        var stale=expected; stale.Top+=Scale(44,dpi); stale.Bottom+=Scale(44,dpi);
+                        if(SettingsNetwork(2050+index,host,stale,dpi).Failure==null) throw new Exception("Stale network grid Y accepted");
+                    }
+                }
+            }
+        }
+        foreach(int dip in new int[]{528,679,680,687,688,696}) {
+            int host=dip+48;
+            int expected=dip<680?736:(dip<688?472:428);
+            if(SettingsDocumentBottom(3,host,96)!=expected) throw new Exception("Network one/two-column and wrapped-action threshold regression");
+        }
+        bool rejected=false;
+        try { SettingsFieldWidth("unknown",744,new StatusBarNative.Rect(),96); } catch(ArgumentException) { rejected=true; }
+        if(!rejected) throw new Exception("Unknown field acquired a width exemption");
+    }
+    // Complete native status HWND geometry only. Never select a cross-process
+    // HFONT or claim text fit; actual-font DrawText measurement belongs in Rust.
+    public static HistoryGeometryProof HistoryGeometry(bool advanced,bool management,StatusBarNative.Rect status,uint dpi) {
+        if(dpi==0) throw new ArgumentException("Invalid history DPI");
+        var proof=new HistoryGeometryProof { Status=status };
+        if(status.Width<=0 || status.Height<Scale(34,dpi)) {
+            proof.Failure="History status must have a complete positive-width HWND and at least 34 DIP height";
+            return proof;
+        }
+        proof.StatusExtra=status.Height-Scale(34,dpi);
+        if(!management) {
+            int expectedTop=Scale(advanced?424:270,dpi);
+            if(Math.Abs((long)status.Top-expectedTop)>1) proof.Failure="History status lost its fixed filter-row anchor";
+            proof.ChartTop=status.Bottom+Scale(8,dpi);
+            proof.SortTop=advanced?proof.ChartTop:proof.ChartTop+Scale(208,dpi);
+            proof.TableTop=proof.SortTop+Scale(72,dpi);
+        }
+        return proof;
+    }
+    public static string HistoryReportLabel(string expected) {
+        if(expected==null) throw new ArgumentException("Missing history timezone/granularity");
+        string[] parts=expected.Split('/');
+        if(parts.Length!=2) throw new ArgumentException("Invalid history timezone/granularity");
+        string zone,grain;
+        switch(parts[0]) {
+            case "Local": zone="本地"; break;
+            case "Utc": zone="协调世界时"; break;
+            default: throw new ArgumentException("Unknown history timezone");
+        }
+        switch(parts[1]) {
+            case "Hour": grain="小时"; break;
+            case "Day": grain="天"; break;
+            case "Month": grain="月"; break;
+            default: throw new ArgumentException("Unknown history granularity");
+        }
+        return zone+"/"+grain;
+    }
+    // This smoke's applied fixture is exactly ten requests, offset zero, limit 50.
+    public static bool HistoryReportStatus(string status,string expected) {
+        string label=HistoryReportLabel(expected);
+        string pattern=@"\A历史已查询：匹配 10 请求 · 明细第 1–10 条 · 本页汇总 [0-9]+ 组\r\n"+
+            System.Text.RegularExpressions.Regex.Escape(label)+
+            @" · 每页 50 条 · 记录累计：已入队 [0-9]+ 条 · 已写入 [0-9]+ 条 · 队满丢弃 [0-9]+ 条 · 数据库失败 [0-9]+ 次 · 关闭丢弃 [0-9]+ 条\z";
+        return status!=null && System.Text.RegularExpressions.Regex.IsMatch(status,pattern,System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    }
+    static void ValidateHistoryGeometryAndStatus() {
+        foreach(uint dpi in new uint[]{96,120,144,168,192}) {
+            foreach(bool advanced in new bool[]{false,true}) {
+                foreach(int extraDip in new int[]{0,20,60}) {
+                    var status=new StatusBarNative.Rect { Left=Scale(24,dpi),Top=Scale(advanced?424:270,dpi),Right=Scale(720,dpi) };
+                    status.Bottom=status.Top+Scale(34,dpi)+Scale(extraDip,dpi);
+                    var proof=HistoryGeometry(advanced,false,status,dpi);
+                    int chart=status.Bottom+Scale(8,dpi),sort=chart+(advanced?0:Scale(208,dpi));
+                    if(proof.Failure!=null || proof.StatusExtra!=Scale(extraDip,dpi) || proof.ChartTop!=chart ||
+                        proof.SortTop!=sort || proof.TableTop!=sort+Scale(72,dpi)) throw new Exception("Dynamic history status/row geometry rejected");
+                    if(extraDip>0 && proof.TableTop<=Scale(advanced?538:592,dpi)) throw new Exception("History result row retained its legacy fixed top");
+                    var shortStatus=status; shortStatus.Bottom=shortStatus.Top+Scale(34,dpi)-1;
+                    if(HistoryGeometry(advanced,false,shortStatus,dpi).Failure==null) throw new Exception("Truncated minimum history status accepted");
+                    var stale=status; stale.Top+=2; stale.Bottom+=2;
+                    if(HistoryGeometry(advanced,false,stale,dpi).Failure==null) throw new Exception("Stale history status anchor accepted");
+                    var management=status; management.Top+=Scale(100,dpi); management.Bottom+=Scale(100,dpi);
+                    var managed=HistoryGeometry(advanced,true,management,dpi);
+                    if(managed.Failure!=null || managed.StatusExtra!=Scale(extraDip,dpi)) throw new Exception("Management status incorrectly acquired a filter-row anchor");
+                }
+            }
+        }
+        foreach(string zone in new string[]{"Local","Utc"}) {
+            foreach(string grain in new string[]{"Hour","Day","Month"}) {
+                string expected=zone+"/"+grain,label=(zone=="Local"?"本地":"协调世界时")+"/"+(grain=="Hour"?"小时":grain=="Day"?"天":"月");
+                if(HistoryReportLabel(expected)!=label) throw new Exception("Localized history status mapping failed");
+                string status="历史已查询：匹配 10 请求 · 明细第 1–10 条 · 本页汇总 3 组\r\n"+label+
+                    " · 每页 50 条 · 记录累计：已入队 11 条 · 已写入 7 条 · 队满丢弃 3 条 · 数据库失败 5 次 · 关闭丢弃 2 条";
+                if(!HistoryReportStatus(status,expected)) throw new Exception("Exact Chinese query status rejected");
+                foreach(string invalid in new string[]{status.Replace(label,expected),status.Replace("匹配 10 请求","匹配 11 请求"),
+                    status.Replace("明细第 1–10 条","明细第 1–9 条"),status.Replace("每页 50 条","每页 100 条"),
+                    status.Replace("队满丢弃 3 条","queue_full: 3"),status+" Counters {",status.Replace("\r\n","\n")}) {
+                    if(HistoryReportStatus(invalid,expected)) throw new Exception("Stale/debug/incomplete query status accepted");
+                }
+            }
+        }
+        foreach(string invalid in new string[]{"UTC/Day","Local/Week","Local/Day/Hour","Local",null}) {
+            bool rejected=false;
+            try { HistoryReportLabel(invalid); } catch(ArgumentException) { rejected=true; }
+            if(!rejected) throw new Exception("Unknown history status mapping accepted");
+        }
+    }
     // Pure geometry: fullTail is the complete HWND rectangle in main-client
     // coordinates, NEVER an intersection with the viewport. Tall editors may
     // extend above the viewport at SB_BOTTOM, but their actual bottom must fit.
     public static TailProof PageTail(int page,int clientHeight,StatusBarNative.Rect clip,
         StatusBarNative.Rect footer,ScrollInfo scroll,StatusBarNative.Rect fullTail,int lastDocumentBottom,uint dpi) {
-        if(page<0 || page>3 || dpi==0 || clientHeight<1 || clip.Height<1) throw new ArgumentException("Invalid page-tail geometry");
+        return PageTail(page,clientHeight,clip,footer,scroll,fullTail,lastDocumentBottom,dpi,0);
+    }
+    // historyStatusExtra is physical pixels from the complete status HWND minus
+    // scale(34), never inferred from the scroll range; session callers pass zero.
+    public static TailProof PageTail(int page,int clientHeight,StatusBarNative.Rect clip,
+        StatusBarNative.Rect footer,ScrollInfo scroll,StatusBarNative.Rect fullTail,int lastDocumentBottom,uint dpi,int historyStatusExtra) {
+        if(page<0 || page>3 || dpi==0 || clientHeight<1 || clip.Height<1 || historyStatusExtra<0 ||
+            (page!=1 && historyStatusExtra!=0)) throw new ArgumentException("Invalid page-tail geometry/history status extra");
         int padding=Scale(16,dpi),extent=scroll.Max-scroll.Min+1;
+        int minimum=checked(Scale(page==2?952:820,dpi)+historyStatusExtra);
         int expected=page==3?Math.Max(clip.Height,lastDocumentBottom-Scale(44,dpi)+padding):
-            Math.Max(clientHeight,Scale(page==2?952:820,dpi))-Scale(44+40,dpi);
+            Math.Max(clientHeight,minimum)-Scale(44+40,dpi);
         var proof=new TailProof { AtBottom=scroll.Position==scroll.Limit,
             StrictGap=scroll.Position==scroll.Limit && (page!=3 || scroll.Limit>0),
             Gap=footer.Top-fullTail.Bottom,Padding=padding,Extent=extent,ExpectedExtent=expected,LastDocumentBottom=lastDocumentBottom };
@@ -340,40 +596,59 @@ public static class ModernNative {
     static void ValidatePageTails() {
         foreach(uint dpi in new uint[]{96,120,144,192}) {
             foreach(int page in new int[]{0,1,2}) {
-                int minimum=page==2?952:820;
-                foreach(int height in new int[]{560,680,minimum-28,minimum-1,minimum,1000}) {
-                    int client=Scale(height,dpi),virtualHeight=Math.Max(client,Scale(minimum,dpi));
-                    var clip=new StatusBarNative.Rect { Top=Scale(44,dpi),Right=Scale(744,dpi),Bottom=client-Scale(40,dpi) };
-                    var footer=new StatusBarNative.Rect { Top=clip.Bottom,Right=clip.Right,Bottom=client };
-                    var scroll=new ScrollInfo { Min=0,Max=virtualHeight-Scale(84,dpi)-1,Page=(uint)clip.Height };
-                    scroll.Position=scroll.Limit;
-                    int documentBottom=virtualHeight-Scale(40+16,dpi);
-                    var tail=new StatusBarNative.Rect { Left=Scale(24,dpi),Top=Scale(110,dpi)-scroll.Position,
-                        Right=clip.Right-Scale(24,dpi),Bottom=documentBottom-scroll.Position };
-                    var proof=PageTail(page,client,clip,footer,scroll,tail,documentBottom,dpi);
-                    if(proof.Failure!=null || !proof.AtBottom || !proof.StrictGap) throw new Exception("Bottom-padding self-check failed: "+proof.Failure);
-                    var legacy=tail; legacy.Bottom-=Scale(28,dpi);
-                    if(PageTail(page,client,clip,footer,scroll,legacy,documentBottom-Scale(28,dpi),dpi).Failure==null)
-                        throw new Exception("Legacy extra 28-DIP tail space was accepted");
-                    var clipped=tail; clipped.Bottom=clip.Bottom+Scale(40,dpi);
-                    if(PageTail(page,client,clip,footer,scroll,clipped,clipped.Bottom+scroll.Position,dpi).Failure==null)
-                        throw new Exception("Clipped complete tail was accepted");
-                    foreach(int pixel in new int[]{-1,1}) {
-                        var rounded=tail; rounded.Bottom+=pixel;
-                        if(PageTail(page,client,clip,footer,scroll,rounded,documentBottom+pixel,dpi).Failure!=null)
-                            throw new Exception("One-physical-pixel tail tolerance rejected");
+                foreach(int extraDip in page==1?new int[]{0,20,60}:new int[]{0}) {
+                    int baseMinimum=page==2?952:820,minimum=baseMinimum+extraDip,extra=Scale(extraDip,dpi);
+                    foreach(int height in new int[]{560,680,minimum-28,minimum-1,minimum,1000}) {
+                        int client=Scale(height,dpi),virtualHeight=Math.Max(client,Scale(baseMinimum,dpi)+extra);
+                        var clip=new StatusBarNative.Rect { Top=Scale(44,dpi),Right=Scale(744,dpi),Bottom=client-Scale(40,dpi) };
+                        var footer=new StatusBarNative.Rect { Top=clip.Bottom,Right=clip.Right,Bottom=client };
+                        var scroll=new ScrollInfo { Min=0,Max=virtualHeight-Scale(84,dpi)-1,Page=(uint)clip.Height };
+                        scroll.Position=scroll.Limit;
+                        int documentBottom=virtualHeight-Scale(40+16,dpi);
+                        var tail=new StatusBarNative.Rect { Left=Scale(24,dpi),Top=Scale(110,dpi)-scroll.Position,
+                            Right=clip.Right-Scale(24,dpi),Bottom=documentBottom-scroll.Position };
+                        var proof=PageTail(page,client,clip,footer,scroll,tail,documentBottom,dpi,extra);
+                        if(proof.Failure!=null || !proof.AtBottom || !proof.StrictGap) throw new Exception("Bottom-padding/status-extra self-check failed: "+proof.Failure);
+                        if(extra==0) {
+                            var compatible=PageTail(page,client,clip,footer,scroll,tail,documentBottom,dpi);
+                            if(compatible.Failure!=null || compatible.ExpectedExtent!=proof.ExpectedExtent) throw new Exception("Legacy PageTail overload/session zero-extra contract changed");
+                        }
+                        int legacyHeight=Math.Max(client,Scale(baseMinimum,dpi));
+                        if(extra>0 && virtualHeight-legacyHeight>1) {
+                            // Internally consistent OLD range and tail: reject on
+                            // independent extra-derived extent, not a clipped tail.
+                            int legacyBottom=legacyHeight-Scale(40+16,dpi);
+                            var staleScroll=scroll; staleScroll.Max=legacyHeight-Scale(84,dpi)-1; staleScroll.Position=staleScroll.Limit;
+                            var staleTail=tail; staleTail.Top=Scale(110,dpi)-staleScroll.Position; staleTail.Bottom=legacyBottom-staleScroll.Position;
+                            var staleProof=PageTail(page,client,clip,footer,staleScroll,staleTail,legacyBottom,dpi,extra);
+                            if(staleProof.Failure==null || !staleProof.Failure.StartsWith("Unexpected/phantom scroll extent:"))
+                                throw new Exception("Legacy 820-DIP history extent accepted for a taller status");
+                        }
+                        var legacy=tail; legacy.Bottom-=Scale(28,dpi);
+                        if(PageTail(page,client,clip,footer,scroll,legacy,documentBottom-Scale(28,dpi),dpi,extra).Failure==null)
+                            throw new Exception("Legacy extra 28-DIP tail space was accepted");
+                        var clipped=tail; clipped.Bottom=clip.Bottom+Scale(40,dpi);
+                        if(PageTail(page,client,clip,footer,scroll,clipped,clipped.Bottom+scroll.Position,dpi,extra).Failure==null)
+                            throw new Exception("Clipped complete tail was accepted");
+                        foreach(int pixel in new int[]{-1,1}) {
+                            var rounded=tail; rounded.Bottom+=pixel;
+                            if(PageTail(page,client,clip,footer,scroll,rounded,documentBottom+pixel,dpi,extra).Failure!=null)
+                                throw new Exception("One-physical-pixel tail tolerance rejected");
+                        }
+                        if(scroll.Limit>0) {
+                            tail.Top+=scroll.Position; tail.Bottom+=scroll.Position; scroll.Position=0;
+                            proof=PageTail(page,client,clip,footer,scroll,tail,documentBottom,dpi,extra);
+                            if(proof.Failure!=null || proof.StrictGap || proof.AtBottom) throw new Exception("Nonterminal scroll must not require a 16-DIP gap");
+                        }
+                        var oldExtent=scroll; oldExtent.Max-=Scale(28,dpi);
+                        if(PageTail(page,client,clip,footer,oldExtent,tail,documentBottom,dpi,extra).Failure==null)
+                            throw new Exception("Legacy extent subtraction was accepted");
                     }
-                    if(scroll.Limit>0) {
-                        tail.Top+=scroll.Position; tail.Bottom+=scroll.Position; scroll.Position=0;
-                        proof=PageTail(page,client,clip,footer,scroll,tail,documentBottom,dpi);
-                        if(proof.Failure!=null || proof.StrictGap || proof.AtBottom) throw new Exception("Nonterminal scroll must not require a 16-DIP gap");
-                    }
-                    var oldExtent=scroll; oldExtent.Max-=Scale(28,dpi);
-                    if(PageTail(page,client,clip,footer,oldExtent,tail,documentBottom,dpi).Failure==null)
-                        throw new Exception("Legacy extent subtraction was accepted");
                 }
             }
-            foreach(int documentBottomDip in new int[]{326,416,640,464,594,536}) {
+            // Wide six-category bottoms, then wrapped rows (+44 DIP); the
+            // network one-column form is 736 DIP including its wrapped actions.
+            foreach(int documentBottomDip in new int[]{342,416,640,428,594,536,386,460,684,472,638,580,736}) {
                 foreach(int height in new int[]{560,1000}) {
                     int client=Scale(height,dpi),documentBottom=Scale(documentBottomDip,dpi);
                     var clip=new StatusBarNative.Rect { Top=Scale(44,dpi),Right=Scale(744,dpi),Bottom=client-Scale(40,dpi) };
@@ -424,6 +699,15 @@ public static class ModernNative {
             Length=Message(edit,pid,14,0,0),Selection=Message(edit,pid,0xB0,0,0),Margins=Message(edit,pid,0xD4,0,0),
             Mask=Message(edit,pid,0xD2,0,0),Limit=Message(edit,pid,0xD5,0,0),Text=password?null:ClarityNative.Text(edit,pid) };
     }
+    public static long TryNumericText(IntPtr edit,uint pid,string text) {
+        ProxyUiSmoke.CheckOwner(edit,pid);
+        if(ProxyUiSmoke.Class(edit)!="Edit" || (ProxyUiSmoke.GetWindowLongW(edit,-16)&0x2000)==0 || text==null || text.Length>64)
+            throw new Exception("Numeric WM_SETTEXT probe must target a numeric Edit with bounded synthetic text");
+        UIntPtr result;
+        if(SendMessageTimeoutW(edit,12,UIntPtr.Zero,text,0x22,2000,out result)==IntPtr.Zero)
+            throw new Exception("Numeric WM_SETTEXT probe timed out; rejection NOT validated");
+        return unchecked((long)result.ToUInt64());
+    }
     static double Linear(int channel) {
         double c=channel/255.0; return c<=0.04045?c/12.92:Math.Pow((c+0.055)/1.055,2.4);
     }
@@ -469,8 +753,10 @@ public static class ModernNative {
     }
     public static string Validate() {
         ValidatePageTails();
+        ValidateHistoryGeometryAndStatus();
         ValidatePageRightMargins();
         ValidateSettingsSegmentWidths();
+        ValidateSettingsFieldsAndActions();
         if(Marshal.SizeOf(typeof(ScrollInfo))!=28) throw new Exception("Unexpected x64 SCROLLINFO layout");
         var scroll=new ScrollInfo { Min=0,Max=715,Page=400 };
         if(scroll.Limit!=316) throw new Exception("Inclusive scroll range self-check failed");
@@ -493,7 +779,7 @@ public static class ModernNative {
             var sparse=InspectContrast(bitmap,arrow,3,3.0,2); var dense=InspectContrast(bitmap,arrow,3,3.0,1);
             if(sparse.InkSamples!=0 || dense.InkSamples<2 || dense.Contrast<3.0) throw new Exception("One-pixel chevron aliasing/dense contrast self-check failed");
         }
-        return "SCROLLINFO, full-tail 16-DIP padding/terminal-only checks, content-sized settings/phantom extents, actual-host-client 24-DIP right margins (+/-1px, scrollbar show/hide and 976-vs-959 regressions), exact anchored 864/456-DIP settings segment widths (narrow/threshold/wide, stale client/cap/anchor rejection), 96/120/144/192-DPI geometry, clip/document bounds, narrow metadata contract, padded arrow geometry and dense one-pixel chevron contrast";
+        return "SCROLLINFO, full-tail 16-DIP padding/terminal-only checks, history status minimum/dynamic rows and 0/20/60-DIP extra extents (legacy 820 rejection, compatible zero-extra/session overload), exact Chinese ten-request status and six timezone/granularity mappings, content-sized settings/phantom extents, actual-host-client 24-DIP right margins (+/-1px, scrollbar show/hide and 976-vs-959 regressions), exact anchored 864/456-DIP settings segments plus typed 320/440/256/148/108/220-DIP caps and elastic URL/list/Key widths, 680-DIP network reflow and 688-DIP wrapped actions with exact six-category tails (stale/cap/anchor/row rejection), 96/120/144/168/192-DPI geometry, clip/document bounds, narrow metadata contract, padded arrow geometry and dense one-pixel chevron contrast";
     }
     public static StatusBarNative.Rect TabItem(IntPtr pinned,uint pid,IntPtr tab,int index) {
         StatusBarNative.CheckProcess(pinned,pid); ProxyUiSmoke.CheckOwner(tab,pid);
@@ -754,7 +1040,7 @@ function Ensure-Reachable([IntPtr]$Handle) {
     throw "Control did not become reachable through bounded native scrolling: ID=$([ClarityNative]::GetDlgCtrlID($Handle))"
 }
 function Click([int]$Id) {
-    if ($Id -notin @(2102,2103,2317,2318,2320,2228)) { throw "Action not allowlisted by modern smoke: $Id" }
+    if ($Id -notin @(2102,2103,2317,2318,2320,2228,2066)) { throw "Action not allowlisted by modern smoke: $Id" }
     $h=Control $Id; Ensure-Reachable $h
     [ModernNative]::Click($h,[uint32]$ownedPid)
     Fence
@@ -910,18 +1196,40 @@ function Assert-PageLayout([string]$Label,[ValidateSet('any','top','bottom')][st
     }
     $active=Message 2100 0x130B
     Assert-OverviewMetadata $Label
-    $anchors=@{}
+    $anchors=@{}; $pixelAnchors=@{}
+    $historyStatusExtra=0; $historyGeometry=$null; $historyMode=$null; $historyManagement=$false
     switch ($active) {
         0 { $anchors=@{2108=108;2109=282;2102=220;2103=220;2104=220;2105=220;2106=220} }
         1 {
             $anchors=@{2300=60}
-            if (Visible 2020) { $anchors[2020]=110 }
-            elseif (-not (Visible 2351)) {
+            if (Visible 2020) {
+                $anchors[2020]=110; $historyMode='session'
+                if (Visible 2325) { $uiFailures.Add("$Label session must hide historical status and retain zero status extra") }
+            } else {
+                $historyManagement=Visible 2351
                 $advanced=Visible 2310
-                $anchors[2320]=if ($advanced) { 386 } else { 232 }
-                $anchors[2332]=312
-                $resultTop=if ($advanced) { 538 } else { 592 }
-                foreach ($id in @(2330,2331,2337)) { $anchors[$id]=$resultTop }
+                $historyMode=if ($historyManagement) { 'management' } elseif ($advanced) { 'advanced' } else { 'normal' }
+                $statusHandle=Control 2325
+                if (-not (Visible 2325)) { $uiFailures.Add("$Label statistics/management status HWND is hidden") }
+                # Use the full native HWND, not Effective/Intersect or a foreign HFONT.
+                $statusRect=[StatusBarNative]::InParent($statusHandle,$hostWindow,[uint32]$ownedPid)
+                $statusDocument=[ModernNative]::Document($statusRect,$scroll.Position,$dpi)
+                $historyGeometry=[ModernNative]::HistoryGeometry($advanced,$historyManagement,$statusDocument,$dpi)
+                if ($null -ne $historyGeometry.Failure) { $uiFailures.Add("$Label $($historyGeometry.Failure)") }
+                else { $historyStatusExtra=$historyGeometry.StatusExtra }
+                $statusMargin=[ModernNative]::PageRightMargin($hostClient.Width,$statusRect,$dpi)
+                if ($null -ne $statusMargin.Failure -or [Math]::Abs($statusRect.Left-[ModernNative]::Scale(24,$dpi)) -gt 1) {
+                    $uiFailures.Add("$Label complete status HWND must span the actual host client with 24-DIP margins: $($statusMargin.Failure)")
+                }
+                if (-not $historyManagement) {
+                    $anchors[2320]=if ($advanced) { 386 } else { 232 }
+                    $anchors[2325]=if ($advanced) { 424 } else { 270 }
+                    $pixelAnchors[2332]=$historyGeometry.ChartTop
+                    foreach ($id in @(2335,2336,2353)) { $pixelAnchors[$id]=$historyGeometry.SortTop }
+                    $pixelAnchors[2338]=$historyGeometry.SortTop+[ModernNative]::Scale(36,$dpi)
+                    foreach ($id in @(2330,2331,2337)) { $pixelAnchors[$id]=$historyGeometry.TableTop }
+                    if ((Visible 2332) -eq $advanced) { $uiFailures.Add("$Label advanced filters must replace the chart, not the results") }
+                }
             }
         }
         2 { $anchors=@{2200=324;2207=146;2224=208;2225=208;2226=244;2228=244} }
@@ -944,6 +1252,8 @@ function Assert-PageLayout([string]$Label,[ValidateSet('any','top','bottom')][st
             $uiFailures.Add("$Label invalid document bounds ID=$id class=$kind document=$document extentBottom=$documentBottom host=$hostClient")
         }
         if ($anchors.ContainsKey($id) -and [Math]::Abs($document.Top-[ModernNative]::Scale($anchors[$id],$dpi)) -gt 1) { $uiFailures.Add("$Label stale document coordinate ID=$id top=$($document.Top) expectedDIP=$($anchors[$id]) scroll=$($scroll.Position)") }
+        if ($pixelAnchors.ContainsKey($id) -and [Math]::Abs($document.Top-$pixelAnchors[$id]) -gt 1) { $uiFailures.Add("$Label stale status-relative coordinate ID=$id top=$($document.Top) expectedPhysical=$($pixelAnchors[$id]) scroll=$($scroll.Position)") }
+        if ($active -eq 1 -and $id -eq 2332 -and $raw.Height -ne [ModernNative]::Scale(200,$dpi)) { $uiFailures.Add("$Label history chart must retain exactly 200 DIP height") }
         if ($effective.Width -gt 0 -and $effective.Height -gt 0) {
             foreach ($fixed in @($tabRect,$footerRect)) {
                 $overlap=[ModernNative]::Intersect($effective,$fixed)
@@ -952,6 +1262,24 @@ function Assert-PageLayout([string]$Label,[ValidateSet('any','top','bottom')][st
         }
     }
     if ($rects.Count -eq 0) { $uiFailures.Add("$Label empty visible viewport child set; layout NOT validated") }
+    if ($null -ne $historyGeometry) {
+        $statuses=@($rects | Where-Object { $_.ID -eq 2325 })
+        if ($statuses.Count -ne 1) { $uiFailures.Add("$Label expected exactly one visible complete history status HWND") }
+        if ($historyManagement) {
+            $storage=@($rects | Where-Object { $_.ID -eq 2351 })
+            $virtualHeight=[Math]::Max($client.Height,[ModernNative]::Scale(820,$dpi)+$historyStatusExtra)
+            if ($statuses.Count -eq 1 -and $storage.Count -eq 1) {
+                if ([Math]::Abs($statuses[0].Document.Bottom-($virtualHeight-[ModernNative]::Scale(56,$dpi))) -gt 1 -or
+                    [Math]::Abs($statuses[0].Document.Top-$storage[0].Document.Bottom-[ModernNative]::Scale(8,$dpi)) -gt 1) {
+                    $uiFailures.Add("$Label management storage/status must end at the independently sized document tail with an 8-DIP gap")
+                }
+            } else { $uiFailures.Add("$Label management requires exactly one complete storage/status pair") }
+        } else {
+            foreach ($required in @(2335,2336,2353,2338)) {
+                if (@($rects | Where-Object { $_.ID -eq $required }).Count -ne 1) { $uiFailures.Add("$Label missing/duplicate history sort/view row ID=$required") }
+            }
+        }
+    }
     for ($a=0;$a -lt $rects.Count;$a++) {
         for ($b=$a+1;$b -lt $rects.Count;$b++) {
             # Check the complete visible-page document, including currently scrolled
@@ -968,16 +1296,19 @@ function Assert-PageLayout([string]$Label,[ValidateSet('any','top','bottom')][st
             else { @(2337,2330,2331) }
         }
         2 { @(2221) }
-        3 { @(2001) }
+        3 {
+            $narrow=[ModernNative]::SettingsContentDip($hostClient.Width,$dpi) -lt 688
+            if ($narrow) { @(2003) } else { @(2001) }
+        }
         default { throw "$Label unknown active page $active" }
     }
     $tails=@($rects | Where-Object { $_.ID -in $tailIds })
-    $rightMarginIds=if ($active -eq 3) { @(2010) } else { @($tailIds) }
+    $rightMarginIds=if ($active -eq 3) { @(0) } else { @($tailIds) }
     $wideControls=@($rects | Where-Object { $_.ID -in $rightMarginIds })
     if ($active -eq 3) {
-        # Settings lays out this uncapped input even in other categories. Keep
-        # actual-client scrollbar-width coverage when both tracks reach their caps.
-        $wideControls=@([pscustomobject]@{ ID=2010; Handle=(Control 2010) })
+        # URL stays elastic even while hidden. The bounded storage dropdown has
+        # its own exact cap proof below, never a right-margin exemption.
+        $wideControls=@([pscustomobject]@{ ID=0; Handle=$settingsControls['url'] })
     }
     $rightMargins=[Collections.Generic.List[object]]::new()
     if ($wideControls.Count -ne 1) {
@@ -1003,6 +1334,38 @@ function Assert-PageLayout([string]$Label,[ValidateSet('any','top','bottom')][st
             if ($null -ne $width.Failure) { $uiFailures.Add("$Label settings segment ID=${id}: $($width.Failure)") }
         }
     }
+    $fieldWidths=[Collections.Generic.List[object]]::new()
+    $actionGeometry=[Collections.Generic.List[object]]::new()
+    $networkGeometry=[Collections.Generic.List[object]]::new()
+    $settingsBottom=$null
+    if ($active -eq 3) {
+        $category=[int](Message 2039 0x147)
+        foreach ($field in @('url','ip','port','key','key-visibility','injection','storage','secrets','whitelist','client-token','origins','connect-ports')) {
+            $h=$settingsControls[$field]
+            [ProxyUiSmoke]::CheckOwner($h,[uint32]$ownedPid)
+            $full=[StatusBarNative]::InParent($h,$hostWindow,[uint32]$ownedPid)
+            $proof=[ModernNative]::SettingsFieldWidth($field,$hostClient.Width,$full,$dpi)
+            $fieldWidths.Add($proof)
+            if ($null -ne $proof.Failure) { $uiFailures.Add("$Label $($proof.Failure)") }
+        }
+        foreach ($id in @(2001,2002,2003,2004)) {
+            $found=@($rects | Where-Object { $_.ID -eq $id })
+            if ($found.Count -ne 1) { $uiFailures.Add("$Label expected one visible settings action ID=$id; found $($found.Count)"); continue }
+            $proof=[ModernNative]::SettingsAction($category,$id,$hostClient.Width,$found[0].Document,$dpi)
+            $actionGeometry.Add($proof)
+            if ($null -ne $proof.Failure) { $uiFailures.Add("$Label $($proof.Failure)") }
+        }
+        if ($category -eq 3) {
+            foreach ($id in 2050..2055) {
+                $found=@($rects | Where-Object { $_.ID -eq $id })
+                if ($found.Count -ne 1) { $uiFailures.Add("$Label expected one visible network Edit ID=$id; found $($found.Count)"); continue }
+                $proof=[ModernNative]::SettingsNetwork($id,$hostClient.Width,$found[0].Document,$dpi)
+                $networkGeometry.Add($proof)
+                if ($null -ne $proof.Failure) { $uiFailures.Add("$Label $($proof.Failure)") }
+            }
+        }
+        $settingsBottom=[ModernNative]::SettingsDocumentBottom($category,$hostClient.Width,$dpi)
+    }
     $tailProof=$null; $tailFull=$null
     if ($tails.Count -ne 1) {
         $uiFailures.Add("$Label expected exactly one visible page tail among IDs $($tailIds -join ','); found $($tails.Count)")
@@ -1011,25 +1374,30 @@ function Assert-PageLayout([string]$Label,[ValidateSet('any','top','bottom')][st
         if ($active -eq 3) {
             $actions=@($rects | Where-Object { $_.ID -in @(2001,2002,2003,2004) })
             $lastVisibleBottom=($rects | ForEach-Object { $_.Document.Bottom } | Measure-Object -Maximum).Maximum
-            if ($actions.Count -ne 4 -or @($actions | Where-Object { [Math]::Abs($_.Document.Bottom-$lastVisibleBottom) -gt 1 }).Count -gt 0) {
-                $uiFailures.Add("$Label settings action row must be the current visible children's actual end; no hidden-category tail allowed")
+            $lastActionBottom=($actions | ForEach-Object { $_.Document.Bottom } | Measure-Object -Maximum).Maximum
+            if ($actions.Count -ne 4 -or [Math]::Abs($lastActionBottom-$lastVisibleBottom) -gt 1 -or
+                [Math]::Abs($lastVisibleBottom-$settingsBottom) -gt 1 -or [Math]::Abs($tail.Document.Bottom-$settingsBottom) -gt 1) {
+                $uiFailures.Add("$Label settings final action row must exactly end at category/content-width bottom=$settingsBottom; no phantom or hidden-category tail allowed")
             }
         } else { $lastVisibleBottom=$tail.Document.Bottom }
         # Read the FULL native HWND rect afresh, not Effective/Intersect or the
         # viewport-clipped screenshot. A tall tail may extend above the viewport.
         $tailFull=[StatusBarNative]::InParent($tail.Handle,$window,[uint32]$ownedPid)
-        $tailProof=[ModernNative]::PageTail([int]$active,$client.Height,$clip,$footerRect,$scroll,$tailFull,[int]$lastVisibleBottom,$dpi)
+        $tailProof=[ModernNative]::PageTail([int]$active,$client.Height,$clip,$footerRect,$scroll,$tailFull,[int]$lastVisibleBottom,$dpi,[int]$historyStatusExtra)
         if ($null -ne $tailProof.Failure) { $uiFailures.Add("$Label tail ID=$($tail.ID): $($tailProof.Failure)") }
     }
-    Record "$Label viewport/document geometry (native closed combo bounds; complete tail; actual-client right margin; capped settings segments)" @{ Page=$active; Endpoint=$Endpoint; DPI=$dpi; Host="$hostRect"; HostClient="$hostClient"; Clip="$clip"; Footer="$footerRect"; Scroll=$scroll; DocumentBottom=$documentBottom; TailIDs=@($tailIds); FullTail=$tailFull; TailProof=$tailProof; RightMarginIDs=@($rightMarginIds); RightMargins=$rightMargins.ToArray(); SegmentWidths=$segmentWidths.ToArray(); Children=$rects.ToArray() }
+    Record "$Label viewport/document geometry (native closed combos; complete tail; strict elastic right margin; exact typed settings caps/actions)" @{ Page=$active; Endpoint=$Endpoint; DPI=$dpi; Host="$hostRect"; HostClient="$hostClient"; Clip="$clip"; Footer="$footerRect"; Scroll=$scroll; DocumentBottom=$documentBottom; SettingsDocumentBottom=$settingsBottom; HistoryMode=$historyMode; HistoryStatusExtraPhysical=$historyStatusExtra; HistoryGeometry=$historyGeometry; HistoryMeasurementScope='Complete status HWND only; actual-font text-fit measurement remains Rust in-process, not performed here'; TailIDs=@($tailIds); FullTail=$tailFull; TailProof=$tailProof; RightMarginIDs=@($rightMarginIds); RightMargins=$rightMargins.ToArray(); SegmentWidths=$segmentWidths.ToArray(); FieldWidths=$fieldWidths.ToArray(); Actions=$actionGeometry.ToArray(); Network=$networkGeometry.ToArray(); Children=$rects.ToArray() }
     for ($i=$startFailures;$i -lt $uiFailures.Count;$i++) { Write-Warning $uiFailures[$i] }
 }
 function Assert-HistoryLayout([string]$Label) { Assert-PageLayout $Label }
 function Assert-Report([string]$Expected='Local/Day') {
-    Wait-State "backend 10 requests, $Expected" {
+    $localized=[ModernNative]::HistoryReportLabel($Expected)
+    Wait-State "backend 10 requests, $Expected -> $localized" {
         [ProxyUiSmoke]::IsWindowEnabled((Control 2320)) -and
-        (Text 2325).Contains('匹配 10 请求') -and (Text 2325).Contains($Expected)
+        [ModernNative]::HistoryReportStatus((Text 2325),$Expected)
     }
+    Fence
+    if (-not [ModernNative]::HistoryReportStatus((Text 2325),$Expected)) { throw 'Applied Chinese history status changed before the post-result layout fence' }
     foreach ($needle in @('请求 10；完整 10 / 部分 0 / 未知 0','输入 100 / 输出 50 / 总 150','缓存命中 30','推理 20')) {
         if (-not (Text 2330).Contains($needle)) { throw "Real backend summary missing '$needle': $(Text 2330)" }
     }
@@ -1426,6 +1794,89 @@ try {
     $draft="http://127.0.0.1:$($mock.Port)/unsaved-modern-ui-draft"
     [ProxyUiSmoke]::SetText($draftEdit,[uint32]$ownedPid,$draft)
     [ModernNative]::Message($draftEdit,[uint32]$ownedPid,0xB1,7,16) | Out-Null
+    $baseEdits=@([ModernNative]::DirectChildren($hostWindow,[uint32]$ownedPid) | Where-Object {
+        [ProxyUiSmoke]::Class($_) -eq 'Edit' -and [ClarityNative]::GetDlgCtrlID($_) -eq 0
+    })
+    $keyEdits=@($baseEdits | Where-Object { ([ProxyUiSmoke]::GetWindowLongW($_,-16) -band 0x20) -ne 0 })
+    $portEdits=@($baseEdits | Where-Object { ([ProxyUiSmoke]::GetWindowLongW($_,-16) -band 0x2000) -ne 0 })
+    $ipEdits=@($baseEdits | Where-Object { $_ -ne $draftEdit -and $_ -notin $keyEdits -and $_ -notin $portEdits })
+    $baseCombos=@([ModernNative]::DirectChildren($hostWindow,[uint32]$ownedPid) | Where-Object {
+        [ProxyUiSmoke]::Class($_) -eq 'ComboBox' -and [ClarityNative]::GetDlgCtrlID($_) -eq 0
+    })
+    $injectionCombos=@($baseCombos | Where-Object { [ProxyUiSmoke]::IsWindowVisible($_) })
+    if ($baseEdits.Count -ne 4 -or $keyEdits.Count -ne 1 -or $portEdits.Count -ne 1 -or $ipEdits.Count -ne 1 -or
+        $baseCombos.Count -ne 2 -or $injectionCombos.Count -ne 1) { throw 'Exact URL/IP/port/Key/injection/secrets native settings identities missing' }
+    $settingsControls=@{
+        'url'=$draftEdit; 'ip'=$ipEdits[0]; 'port'=$portEdits[0]; 'key'=$keyEdits[0];
+        'key-visibility'=(Control 2066); 'injection'=$injectionCombos[0];
+        'storage'=(Control 2010); 'secrets'=(@($baseCombos | Where-Object { $_ -ne $injectionCombos[0] })[0]);
+        'whitelist'=(Control 2040); 'client-token'=(Control 2042); 'origins'=(Control 2048); 'connect-ports'=(Control 2046)
+    }
+    # Numeric fixtures use legal ASCII values. Rejected WM_SETTEXT must leave
+    # text and selection intact, not throw through the success-only SetText API.
+    $numericEdits=@($portEdits[0]) + @(2050..2055 | ForEach-Object { Control $_ })
+    if ([ProxyUiSmoke]::Class($settingsControls['key-visibility']) -ne 'Button') { throw '2066 must retain a native Button' }
+    foreach ($number in $numericEdits) {
+        Assert-Child
+        $before=[ModernNative]::Edit($number,[uint32]$ownedPid)
+        $capacity=if ($number -eq $settingsControls['port']) { 5 } else { 10 }
+        if (([ProxyUiSmoke]::GetWindowLongW($number,-16) -band 0x2000) -eq 0 -or $before.Password -or $before.Limit -ne $capacity) {
+            throw 'Numeric Edit must retain ES_NUMBER, the exact 5/10-digit limit and an unmasked native value'
+        }
+        $legal=if ($capacity -eq 5) { '54321' } else { '4294967295' }
+        [ProxyUiSmoke]::SetText($number,[uint32]$ownedPid,$legal)
+        [ModernNative]::Message($number,[uint32]$ownedPid,0xB1,1,3) | Out-Null
+        $accepted=[ModernNative]::Edit($number,[uint32]$ownedPid)
+        if ($accepted.Text -cne $legal -or $accepted.Selection -ne 196609) { throw 'Legal numeric fixture/UTF-16 selection was not retained' }
+        foreach ($invalid in @('12x','-1',' 1','1.5','１',('9' * ($capacity+1)))) {
+            Assert-Child
+            if ([ModernNative]::TryNumericText($number,[uint32]$ownedPid,$invalid) -ne 0) { throw 'Invalid/oversized numeric WM_SETTEXT reported success' }
+            $rejected=[ModernNative]::Edit($number,[uint32]$ownedPid)
+            foreach ($property in @('NativeStyle','Password','Text','Length','Selection','Margins','Mask','Limit')) {
+                if ($rejected.$property -cne $accepted.$property) { throw "Rejected numeric input changed native Edit $property" }
+            }
+        }
+        [ProxyUiSmoke]::SetText($number,[uint32]$ownedPid,$before.Text)
+        [ModernNative]::Message($number,[uint32]$ownedPid,0xB1,1,3) | Out-Null
+        $restored=[ModernNative]::Edit($number,[uint32]$ownedPid)
+        foreach ($property in @('NativeStyle','Password','Text','Length','Margins','Mask','Limit')) {
+            if ($restored.$property -cne $before.$property) { throw "Numeric fixture restoration changed native Edit $property" }
+        }
+        $expectedEnd=[Math]::Min(3,$before.Length)
+        if ($restored.Selection -ne (1 -bor ($expectedEnd -shl 16))) { throw 'Restored numeric fixture lost its deliberate native selection' }
+    }
+    Fence
+    Record 'seven numeric native Edits: legal ASCII fixture, exact limits, six invalid WM_SETTEXT cases preserve value and selection' @{ Edits=$numericEdits.Count; PortLimit=5; NetworkLimit=10; ClipboardTouched=$false; Saved=$false }
+    # Empty fixture-only passwords remain unread, including while the Key mask
+    # is temporarily off. Remask and prove page/category auto-hide before PNGs.
+    $keyEdit=$settingsControls['key']
+    $keyBefore=[ModernNative]::Edit($keyEdit,[uint32]$ownedPid)
+    if (-not $keyBefore.Password -or $keyBefore.Length -ne 0 -or $keyBefore.Mask -ne 0x25cf -or
+        (Text 2066) -cne '显示上游 Key(&K)') { throw 'Expected empty masked Key and exact reveal Button caption' }
+    Click 2066
+    Wait-State 'native reveal removes only Key password mask' { [ModernNative]::Message($keyEdit,[uint32]$ownedPid,0xD2,0,0) -eq 0 }
+    if ([ModernNative]::Message($keyEdit,[uint32]$ownedPid,14,0,0) -ne 0 -or (Text 2066) -cne '隐藏上游 Key(&K)') { throw 'Empty Key reveal changed text length/caption' }
+    foreach ($property in @('Selection','Margins','Limit')) {
+        $messageCode=@{ Selection=0xB0; Margins=0xD4; Limit=0xD5 }[$property]
+        if ([ModernNative]::Message($keyEdit,[uint32]$ownedPid,$messageCode,0,0) -ne $keyBefore.$property) { throw "Key reveal changed native Edit $property" }
+    }
+    Click 2066
+    Wait-State 'native reveal remasks Key' { [ModernNative]::Message($keyEdit,[uint32]$ownedPid,0xD2,0,0) -eq 0x25cf }
+    Click 2066
+    Wait-State 'Key revealed before category auto-remask probe' { [ModernNative]::Message($keyEdit,[uint32]$ownedPid,0xD2,0,0) -eq 0 }
+    Select-Category 1
+    if ([ModernNative]::Message($keyEdit,[uint32]$ownedPid,0xD2,0,0) -ne 0x25cf) { throw 'Leaving upstream category did not remask Key' }
+    Select-Category 0
+    Click 2066
+    Wait-State 'Key revealed before page auto-remask probe' { [ModernNative]::Message($keyEdit,[uint32]$ownedPid,0xD2,0,0) -eq 0 }
+    Select-Page 0 2109
+    if ([ModernNative]::Message($keyEdit,[uint32]$ownedPid,0xD2,0,0) -ne 0x25cf) { throw 'Leaving settings page did not remask Key' }
+    Select-Category 0
+    $keyAfter=[ModernNative]::Edit($keyEdit,[uint32]$ownedPid)
+    foreach ($property in @('Password','NativeStyle','Length','Text','Selection','Margins','Mask','Limit')) {
+        if ($keyAfter.$property -cne $keyBefore.$property) { throw "Key mask/category/page cycle changed native Edit $property" }
+    }
+    Record '2066 native Key reveal/remask and category/page auto-remask (empty private fixture, no exposed screenshot)' @{ Mask=0x25cf; TextRead=$false; CapturedWhileRevealed=$false; Saved=$false }
     $editBaseline=[Collections.Generic.List[object]]::new()
     $editBaseline.Add([ModernNative]::Edit($historyEdit,[uint32]$ownedPid))
     foreach ($h in [ModernNative]::DirectChildren($hostWindow,[uint32]$ownedPid)) {
@@ -1436,7 +1887,11 @@ try {
             $editBaseline.Add($state)
         }
     }
-    if ($editBaseline.Count -lt 5 -or @($editBaseline | Where-Object Password).Count -lt 2) { throw 'Viewport-native settings/password/input fixtures missing; input preservation NOT validated' }
+    # 4 base settings Edits + whitelist/token/CONNECT ports/Origin + 6 network
+    # numbers + the history IP draft. Exact identities, not a lowered count gate.
+    if ($editBaseline.Count -ne 15 -or @($editBaseline | Where-Object Password).Count -ne 2 -or $numericEdits.Count -ne 7) {
+        throw 'Expected exactly 15 native Edit baselines (14 settings + history), two masked secrets and seven numeric fields'
+    }
     foreach ($category in 0..5) {
         Select-Category $category
         Assert-PageLayout "settings-category-$category"
@@ -1502,7 +1957,7 @@ try {
     if ($matrix.Count -ne 16) { throw 'Four-page, two-size, light/dark offscreen evidence matrix incomplete; expected 16 top captures' }
     if ($settingsMatrix.Count -ne 24 -or $historyTailMatrix.Count -ne 24) { throw 'Six-category/history-tail TOP/BOTTOM/cache matrix incomplete; expected 24 entries each (two themes x two sizes x six views)' }
     Assert-ConfigUnchanged
-    Record 'native Edit values/selection/styles/masks/limits/margins and no-region contract retained; theme preview never saved config' @{ Edits=$editBaseline.Count; MatrixEntries=$matrix.Count; SettingsTailEntries=$settingsMatrix.Count; HistoryTailEntries=$historyTailMatrix.Count; PasswordScope='Empty masked fields only, no nonempty-secret retention claim' }
+    Record 'native Edit values/selection/styles/masks/limits/margins and no-region contract retained; theme preview never saved config' @{ Edits=$editBaseline.Count; MatrixEntries=$matrix.Count; SettingsTailEntries=$settingsMatrix.Count; HistoryTailEntries=$historyTailMatrix.Count; PasswordScope='Empty private fields only; 2066 reveal/remask and category/page auto-remask tested before captures, no nonempty-secret retention claim' }
     if ($mock.Requests -ne 10) { throw 'Unexpected extra network requests during theme/history testing' }
     if ($uiFailures.Count -gt 0) { throw ("UI layout/contrast evidence failures:`n"+($uiFailures -join "`n")) }
     $stage='clean owned-child exit'
@@ -1559,15 +2014,16 @@ try {
         ExpectedPageMatrixEntries=16; PageMatrixComplete=($matrix.Count -eq 16);
         ExpectedSettingsTailEntries=24; SettingsTailMatrixComplete=($settingsMatrix.Count -eq 24); SettingsTailMatrix=@($settingsMatrix.ToArray());
         ExpectedHistoryTailEntries=24; HistoryTailMatrixComplete=($historyTailMatrix.Count -eq 24); HistoryTailMatrix=@($historyTailMatrix.ToArray());
-        ManagementTailCoverage='2325 complete-tail assertion supported; GUI entry NOT exercised because 2339 starts HistoryStorage disk I/O, not a layout-only switch';
+        ManagementTailCoverage='2325 complete-tail/status-extra/storage-gap assertion supported; GUI entry NOT exercised because 2339 starts HistoryStorage disk I/O, not a layout-only switch';
+        HistoryStatusScope='Exact two-section Chinese ten-request fixture; complete status HWND minimum/anchors and chart/sort/result relationships; independent physical extra-derived scroll extent. No cross-process HFONT or actual-font/glyph-fit acceptance; Rust in-process measurement tests are separate and not run here';
         Checks=@($checks.ToArray()); Screenshots=@($shots.ToArray()); PageMatrix=@($matrix.ToArray()); ReadabilityEvidence=@($readability.ToArray()); Seconds=[Math]::Round($overall.Elapsed.TotalSeconds,2);
         CaptureKind='All PNGs are PrintWindow OFFSCREEN rendering at physical-pixel dimensions, NOT desktop/screen/occlusion/residual evidence';
         VisualReadabilityReview='NOT RUN by this script: manually inspect every page, text, legend, disabled state and clipped/scrolling area in the recorded PNGs; interior color evidence is not OCR or every-glyph proof';
-        Limits='Current monitor actual DPI only; requested 800x680/1000x820 outer DIP sizes may be work-area-clamped (recorded), not an interactive minimum-track or multi-DPI test. No high-contrast switch, screen-reader, physical keyboard/tray or long-run resource acceptance. No fixed legacy Palette RGB, uniform-white-tile or per-item blue-border requirement. Passwords start empty; only mask/length/style/selection retention checked. No Cargo, real upstream/key/data, clipboard access, Explorer, Startup/firewall/system preference changes, config Save, global input or IPC to another instance. Pending is observed, never artificially delayed.'
+        Limits='Current monitor actual DPI only; requested 800x680/1000x820 outer DIP sizes may be work-area-clamped (recorded), not an interactive minimum-track or multi-DPI test. No high-contrast switch, screen-reader, physical keyboard/tray or long-run resource acceptance. No fixed legacy Palette RGB, uniform-white-tile or per-item blue-border requirement. Passwords remain empty; 2066 reveal/remask and category/page auto-remask plus mask/length/style/selection retention checked, with no revealed-Key captures or nonempty-secret retention claim. Numeric WM_SETTEXT probes use legal private fixtures and reject illegal/oversized input without touching clipboard. No Cargo, real upstream/key/data, clipboard access, Explorer, Startup/firewall/system preference changes, config Save, global input or IPC to another instance. Pending is observed, never artificially delayed.'
     }
     [IO.File]::WriteAllText((Join-Path $output 'results.json'),($report | ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($true))
     Write-Output "Modern UI artifacts: $output"
 }
 if ($null -ne $failure) { throw $failure }
 if ($cleanupErrors.Count -gt 0) { throw ($cleanupErrors -join '; ') }
-Write-Output 'PASS: six-category/native segmented clicks and CB compatibility, real loopback queries/pending, viewport/document/full-tail 16-DIP padding and content-sized settings extents, native switches/Edit draft retention, relative light/dark and scoped contrast evidence, four-page/two-size and six-category/history-subview TOP/BOTTOM/cache PrintWindow OFFSCREEN matrices and owned-child cleanup. Management entry (storage I/O), physical-screen and complete visual readability acceptance NOT performed.'
+Write-Output 'PASS: six-category/native segmented clicks and CB compatibility, real loopback queries/pending with exact localized status, full-status-relative history rows/independent extra-derived extents, viewport/document/full-tail 16-DIP padding and content-sized settings extents, native switches/Edit draft retention, exact typed settings widths/responsive action tails, seven numeric rejection fixtures and empty-Key reveal/remask, relative light/dark and scoped contrast evidence, four-page/two-size and six-category/history-subview TOP/BOTTOM/cache PrintWindow OFFSCREEN matrices and owned-child cleanup. Management entry (storage I/O), physical-screen and complete visual readability acceptance NOT performed.'

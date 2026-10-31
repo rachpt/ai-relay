@@ -88,7 +88,7 @@ pub(super) struct ScrollPaint(WindowDc);
 impl ScrollPaint {
     pub(super) unsafe fn begin(hwnd: HWND, state: &State, message: u32, w: WPARAM) -> Option<Self> {
         // SAFETY: keep a short-lived composited DC until native drawing and the
-        // dark overlay finish. No redraw/visibility/range state is changed.
+        // themed overlay finish. No redraw/visibility/range state is changed.
         unsafe {
             let value = state.get();
             if !value.attached

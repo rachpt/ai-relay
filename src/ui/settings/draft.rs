@@ -4,19 +4,18 @@ use crate::config::{Config, InjectionMode, SecretStorage, SecretString, StorageM
 
 pub(super) fn field_value(
     current: &toml::Value,
+    section: &str,
     field: &str,
     input: &str,
     checked: bool,
 ) -> Result<toml::Value, &'static str> {
     Ok(match current {
         toml::Value::Boolean(_) => toml::Value::Boolean(checked),
-        toml::Value::Integer(_) => toml::Value::Integer(
-            input
-                .trim()
-                .parse::<u32>()
-                .map(i64::from)
-                .map_err(|_| "请输入 0–4294967295 范围内的整数。")?,
-        ),
+        toml::Value::Integer(_) => toml::Value::Integer(i64::from(
+            numeric::find(section, field)
+                .ok_or("未知数字字段，不能保存。")?
+                .parse(input)?,
+        )),
         toml::Value::Array(_) => {
             let parsed: toml::Table = format!("value = {input}")
                 .parse()
@@ -58,12 +57,9 @@ impl Settings {
             .trim()
             .parse()
             .map_err(|_| "监听 IP 无效，请输入 IPv4 或 IPv6 地址。")?;
-        config.listen.port = text(self.port)
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .filter(|p| *p != 0)
-            .ok_or("监听端口必须在 1–65535 之间。")?;
+        config.listen.port = numeric::PORT
+            .parse(&text(self.port))
+            .map_err(|error| format!("监听端口：{error}"))? as u16;
         config.keys.upstream_api_key = SecretString::new(text(self.key));
         config.keys.injection_mode = match selected(self.injection) {
             1 => InjectionMode::Always,
@@ -90,7 +86,7 @@ impl Settings {
                 .ok_or("未知设置字段。")?;
             // SAFETY: Live native child; only checkboxes interpret BM_GETCHECK.
             let checked = unsafe { SendMessageW(control, BM_GETCHECK, 0, 0) != 0 };
-            *target = field_value(target, field, &text(control), checked)
+            *target = field_value(target, section, field, &text(control), checked)
                 .map_err(|error| format!("{section}.{field}：{error}"))?;
         }
         config = value

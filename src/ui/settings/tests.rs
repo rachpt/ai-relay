@@ -1,3 +1,10 @@
+#[path = "tests/lifecycle.rs"]
+mod lifecycle_tests;
+#[path = "tests/numeric.rs"]
+mod numeric_tests;
+#[path = "tests/secret.rs"]
+mod secret_tests;
+
 use super::draft::field_value;
 use super::*;
 use crate::{config::Config, windows::Font};
@@ -99,6 +106,14 @@ unsafe extern "system" fn settings_test_proc(
         if message == WM_NOTIFY && choices::notify(l) {
             return 0;
         }
+        if message == WM_COMMAND && w >> 16 == 0 {
+            let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Settings;
+            if !pointer.is_null() && w as u32 == KEY_VISIBILITY {
+                (*pointer).toggle_key_visibility();
+                PostMessageW(hwnd, WM_APP + 120, w, l);
+                return 0;
+            }
+        }
         DefWindowProcW(hwnd, message, w, l)
     }
 }
@@ -190,6 +205,7 @@ fn login_startup_probe_cannot_replace_proxy_launch_result() {
 
 #[test]
 fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
+    let fonts = [96, 120, 144, 168, 192].map(|dpi| (dpi, Font::new(dpi).unwrap()));
     let mut native = NativeSettings::new();
     let settings = &mut native.settings;
     set_text(settings.url, "https://draft.invalid/v1");
@@ -207,16 +223,69 @@ fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
     let appearance = theme::Theme::new(ThemeMode::Light).unwrap();
     // SAFETY: All controls/rectangles belong to this test thread; no State or modal calls.
     unsafe {
-        for dpi in [96, 144, 192] {
+        for (dpi, font) in &fonts {
+            let dpi = *dpi;
+            settings.set_font(font.0);
             choices::apply(settings.category, appearance.kind, appearance.palette, dpi);
             choices::apply(settings.theme, appearance.kind, appearance.palette, dpi);
-            for content_width in [696, 952, 1440, 696] {
+            for content_width in [528, 576, 679, 680, 687, 688, 696, 952, 1440, 696] {
                 for category in 0..6 {
                     select(settings.category, category);
                     settings.show_page(3);
                     settings.layout(dpi, scale(content_width, dpi), scale(820, dpi));
                     let actions_y = settings.actions_y();
-                    assert_eq!(actions_y, [342, 432, 656, 480, 610, 552][category]);
+                    if category == 0 {
+                        let ip = native_rect(settings.ip);
+                        let port = native_rect(settings.port);
+                        let hint = native_rect(
+                            settings
+                                .numbers
+                                .iter()
+                                .find(|number| number.control == settings.port)
+                                .unwrap()
+                                .hint,
+                        );
+                        let key = native_rect(settings.key);
+                        assert_eq!(ip.bottom, port.bottom);
+                        assert_eq!(
+                            hint.top - port.bottom,
+                            scale(4, dpi),
+                            "DPI {dpi}, width {content_width}: port bottom {}, hint top {}",
+                            port.bottom,
+                            hint.top
+                        );
+                        assert!(
+                            hint.bottom + scale(2, dpi) <= key.top,
+                            "DPI {dpi}, width {content_width}: hint bottom {}, Key top {}",
+                            hint.bottom,
+                            key.top
+                        );
+                    }
+                    let expected_ids = (2040..=2055).chain([2063, 2064]).collect::<Vec<_>>();
+                    assert_eq!(
+                        settings
+                            .fields
+                            .iter()
+                            .map(|(control, _, _)| GetDlgCtrlID(*control) as u32)
+                            .collect::<Vec<_>>(),
+                        expected_ids
+                    );
+                    let document_bottom = settings.document_bottom(dpi, scale(content_width, dpi));
+                    assert_eq!(
+                        document_bottom,
+                        scale(
+                            actions_y - 48 + if content_width < 688 { 76 } else { 32 },
+                            dpi
+                        )
+                    );
+                    assert_eq!(
+                        actions_y,
+                        if category == 3 {
+                            layout::network_actions_y(content_width)
+                        } else {
+                            [358, 432, 656, 0, 610, 552][category]
+                        }
+                    );
 
                     let mut origin = windows_sys::Win32::Foundation::POINT::default();
                     assert_ne!(ClientToScreen(native.parent, &mut origin), 0);
@@ -239,9 +308,31 @@ fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
                         assert!(rect.right > rect.left && rect.bottom > rect.top);
                         assert!(rect.left >= origin.x + scale(24, dpi));
                         assert!(rect.right <= origin.x + scale(24 + content_width, dpi));
-                        assert!(rect.bottom <= origin.y + scale(820 - 56, dpi));
+                        assert!(rect.bottom <= origin.y + document_bottom);
+                        if control == settings.key_visibility {
+                            let measure = CreateCompatibleDC(null_mut());
+                            assert!(!measure.is_null());
+                            let old = SelectObject(measure, font.0);
+                            let caption = wide(&text(control).replace('&', ""));
+                            let mut extent = SIZE::default();
+                            assert_ne!(
+                                GetTextExtentPoint32W(
+                                    measure,
+                                    caption.as_ptr(),
+                                    caption.len() as i32 - 1,
+                                    &mut extent
+                                ),
+                                0
+                            );
+                            assert!(extent.cx <= rect.right - rect.left - scale(42, dpi));
+                            SelectObject(measure, old);
+                            DeleteDC(measure);
+                        }
                         if matches!(id, SAVE | START | STOP | LOAD) {
-                            assert_eq!(rect.top - origin.y, scale(actions_y - 48, dpi));
+                            let (_, top, _, _) = settings
+                                .action_geometry(dpi, scale(content_width, dpi), id, actions_y)
+                                .unwrap();
+                            assert_eq!(rect.top - origin.y, top);
                         }
                         for &(other, other_rect) in &controls[index + 1..] {
                             assert!(
@@ -249,8 +340,17 @@ fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
                                     || other_rect.right <= rect.left
                                     || rect.bottom <= other_rect.top
                                     || other_rect.bottom <= rect.top,
-                                "DPI {dpi}, category {category}: {id} overlaps {}",
-                                GetDlgCtrlID(other)
+                                "DPI {dpi}, width {content_width}, category {category}: ID {id}, HWND {control:p}, rect {:?}, source {:?} overlaps ID {}, HWND {other:p}, rect {:?}, source {:?}",
+                                (rect.left, rect.top, rect.right, rect.bottom),
+                                settings.controls.iter().find(|row| row.0 == control),
+                                GetDlgCtrlID(other),
+                                (
+                                    other_rect.left,
+                                    other_rect.top,
+                                    other_rect.right,
+                                    other_rect.bottom
+                                ),
+                                settings.controls.iter().find(|row| row.0 == other)
                             );
                         }
                     }
@@ -275,6 +375,78 @@ fn native_categories_fit_common_dpi_without_overlapping_or_losing_drafts() {
         settings.show_page(3);
         assert!(visible(settings.category));
         assert_eq!(selected(settings.category), 5);
+    }
+}
+
+#[test]
+fn native_field_widths_follow_type_and_network_reflows_without_recreating_edits() {
+    let fonts = [96, 120, 144, 168, 192].map(|dpi| (dpi, Font::new(dpi).unwrap()));
+    let mut native = NativeSettings::new();
+    let settings = &mut native.settings;
+    let handles: Vec<_> = settings.controls.iter().map(|row| row.0).collect();
+    for (dpi, font) in &fonts {
+        let dpi = *dpi;
+        settings.set_font(font.0);
+        for content_width in [528, 679, 680, 696, 1440, 528] {
+            settings.layout(dpi, scale(content_width, dpi), scale(900, dpi));
+            let width = |control| {
+                let rect = native_rect(control);
+                rect.right - rect.left
+            };
+            assert!(width(settings.ip) <= scale(256, dpi));
+            assert_eq!(width(settings.port), scale(108, dpi));
+            assert!(width(settings.injection) <= scale(320, dpi));
+            assert!(width(settings.storage) <= scale(320, dpi));
+            assert!(width(settings.secrets) <= scale(440, dpi));
+            assert_eq!(
+                width(settings.url),
+                scale(content_width, dpi) - scale(156, dpi)
+            );
+            let key = native_rect(settings.key);
+            let reveal = native_rect(settings.key_visibility);
+            assert!(key.right + scale(8, dpi) <= reveal.left);
+            assert_eq!(reveal.right, native_rect(settings.url).right);
+            let list = settings
+                .fields
+                .iter()
+                .find(|(_, _, name)| *name == "whitelist")
+                .unwrap()
+                .0;
+            let ports = settings
+                .fields
+                .iter()
+                .find(|(_, _, name)| *name == "connect_allowed_ports")
+                .unwrap()
+                .0;
+            assert_eq!(width(list), scale(content_width, dpi) - scale(256, dpi));
+            assert!(width(ports) <= scale(220, dpi));
+            let network: Vec<_> = settings
+                .numbers
+                .iter()
+                .filter(|field| field.spec.section == "network")
+                .collect();
+            for number in &network {
+                assert_eq!(width(number.control), scale(148, dpi));
+            }
+            let first = native_rect(network[0].control);
+            let second = native_rect(network[1].control);
+            if content_width >= layout::NETWORK_TWO_COLUMNS_DIP {
+                assert_eq!(first.top, second.top);
+                assert!(first.right < second.left);
+                assert!(settings.document_bottom(dpi, scale(content_width, dpi)) > 0);
+            } else {
+                assert_eq!(first.left, second.left);
+                assert!(first.bottom < second.top);
+            }
+            assert_eq!(
+                settings
+                    .controls
+                    .iter()
+                    .map(|row| row.0)
+                    .collect::<Vec<_>>(),
+                handles
+            );
+        }
     }
 }
 
@@ -512,7 +684,7 @@ fn access_and_protocol_fields_round_trip_without_losing_secrets() {
         ("network", "max_active_requests", "17", false),
     ] {
         let target = value.get_mut(section).unwrap().get_mut(field).unwrap();
-        *target = field_value(target, field, input, checked).unwrap();
+        *target = field_value(target, section, field, input, checked).unwrap();
     }
     let actual: Config = value.try_into().unwrap();
     actual.validate_for_save().unwrap();
@@ -535,7 +707,7 @@ fn window_checkboxes_round_trip_without_changing_proxy_preferences() {
     let mut value = toml::Value::try_from(&original).unwrap();
     for field in ["close_to_tray", "remember_window_geometry"] {
         let target = value.get_mut("ui").unwrap().get_mut(field).unwrap();
-        *target = field_value(target, field, "", false).unwrap();
+        *target = field_value(target, "ui", field, "", false).unwrap();
     }
     let actual: Config = value.try_into().unwrap();
     assert!(!actual.ui.close_to_tray);
@@ -557,11 +729,11 @@ fn invalid_field_input_is_rejected_without_echoing_the_input() {
         ("allowed_origins", "[1]"),
         ("allowed_origins", "[]\nextra = 'synthetic-private-value'"),
     ] {
-        let error = field_value(&array, field, input, false).unwrap_err();
+        let error = field_value(&array, "access", field, input, false).unwrap_err();
         assert!(!error.contains("synthetic-private-value"));
     }
     let integer = toml::Value::Integer(1);
     for input in ["-1", "4294967296", "1.5", ""] {
-        assert!(field_value(&integer, "max_active_requests", input, false).is_err());
+        assert!(field_value(&integer, "network", "max_active_requests", input, false).is_err());
     }
 }

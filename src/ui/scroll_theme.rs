@@ -1,11 +1,11 @@
-//! Non-client scrollbar presentation and dark-mode mouse tracking. Text, tables,
+//! Non-client scrollbar presentation and themed mouse tracking. Text, tables,
 //! scroll ranges, selection, clipboard, keyboard/wheel input and MSAA stay native.
 //!
 //! Call `apply` on the owning UI thread after native/control theme selection and
 //! again on theme/DPI changes. Only multiline Edit, report ListView and the known
-//! viewport have mouse adapters. Dark report lists use local composited painting;
-//! native client pixels, window regions and scrolling state are not replaced.
-//! Light/high contrast retain native tracking. PrintWindow implementations which
+//! viewport have mouse adapters. Light/dark report lists use local composited
+//! painting; native client pixels, regions and scrolling state are not replaced.
+//! High contrast retains native tracking. PrintWindow implementations which
 //! omit WM_PRINT/PRF_NONCLIENT cannot include the non-client overlay.
 #![cfg(windows)]
 
@@ -169,7 +169,7 @@ unsafe fn supported_window(hwnd: HWND) -> bool {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         supported(&class, style)
             // The log viewer hides both native bars when content fits. Retain
-            // dark presentation so later overflow is themed before its paint.
+            // themed presentation so later overflow is themed before its paint.
             || (class.eq_ignore_ascii_case("Edit")
                 && GetDlgCtrlID(hwnd) == super::logs::CONTENT as i32
                 && style & ES_MULTILINE as u32 != 0)
@@ -230,8 +230,8 @@ unsafe fn detach(hwnd: HWND, state: &State) {
     }
 }
 
-/// Theme native non-client scrollbars without changing their styles/range/page.
-/// Light/high-contrast modes remove the subclass and request native frame paint.
+/// Theme native non-client scrollbars without replacing their range/page/content.
+/// Light/dark share presentation and tracking; high contrast restores native paint.
 /// Failed HWND/API/attachment queries leave native rendering in place.
 ///
 /// # Safety
@@ -246,7 +246,7 @@ pub(super) unsafe fn apply(hwnd: HWND, kind: Resolved, palette: Palette, dpi: u3
             return;
         }
         let previous = state(hwnd);
-        if kind != Resolved::Dark || !supported_window(hwnd) {
+        if kind == Resolved::Contrast || !supported_window(hwnd) {
             if let Some(previous) = previous {
                 detach(hwnd, &previous);
                 let value = previous.get();
@@ -960,7 +960,7 @@ unsafe extern "system" fn tracking_keyboard(code: i32, w: WPARAM, l: LPARAM) -> 
     }
 }
 unsafe fn begin_tracking(hwnd: HWND, state: &State, vertical: bool, point: POINT) -> bool {
-    // SAFETY: only supported dark non-client bars are intercepted. Capture is
+    // SAFETY: only supported themed non-client bars are intercepted. Capture is
     // explicit, not DefSubclassProc's modal scrollbar loop; timers exist only
     // until this interaction ends (repeat and capture/disabled/hidden checks).
     unsafe {
@@ -1658,6 +1658,21 @@ mod tests {
             accent_surface: 0x543e29,
         }
     }
+    fn palette_for(kind: Resolved) -> Palette {
+        if kind == Resolved::Light {
+            Palette {
+                background: 0xf3f3f3,
+                surface: 0xffffff,
+                text: 0x1a1a1a,
+                disabled: 0x616161,
+                accent: 0xb85f00,
+                border: 0xe0e0e0,
+                accent_surface: 0xf9f2ea,
+            }
+        } else {
+            palette()
+        }
+    }
     struct Window(HWND);
     impl Drop for Window {
         fn drop(&mut self) {
@@ -1825,7 +1840,7 @@ mod tests {
             assert_eq!(
                 SendMessageW(hwnd, WM_NCHITTEST, 0, packed(point)),
                 if vertical { HTVSCROLL } else { HTHSCROLL } as LRESULT,
-                "a real pointer on the native bar must reach dark NC tracking"
+                "a real pointer on the native bar must reach themed NC tracking"
             );
             SendMessageW(
                 hwnd,
@@ -1892,12 +1907,19 @@ mod tests {
         }
     }
     unsafe fn printed_tracking(hwnd: HWND, bitmap: &BitmapDc) {
-        // SAFETY: scratch DC. Query the live native thumb after scrolling, while
-        // capture is STILL held; this cannot be satisfied by painting on release.
+        // SAFETY: query/print while capture is STILL held, never only on release.
         unsafe {
             assert_eq!(GetCapture(), hwnd);
             let value = state(hwnd).unwrap().get();
             let tracking = value.tracking.unwrap();
+            printed_bar(hwnd, bitmap, tracking.hit.vertical, value.palette.accent);
+            assert_eq!(GetCapture(), hwnd);
+        }
+    }
+    unsafe fn printed_bar(hwnd: HWND, bitmap: &BitmapDc, vertical: bool, color: u32) {
+        // SAFETY: scratch DC and live native geometry, no screen pixels required.
+        unsafe {
+            let value = state(hwnd).unwrap().get();
             let mut window = RECT::default();
             assert_ne!(GetWindowRect(hwnd, &mut window), 0);
             let origin = POINT {
@@ -1905,8 +1927,22 @@ mod tests {
                 y: window.top,
             };
             let bounds = offset(window, origin);
-            let bar = bar(hwnd, tracking.hit.vertical, origin, bounds).unwrap();
+            let bar = bar(hwnd, vertical, origin, bounds).unwrap();
             let thumb = slim_thumb(bar, value.dpi).unwrap();
+            let thickness = if vertical {
+                thumb.right - thumb.left
+            } else {
+                thumb.bottom - thumb.top
+            };
+            let available = if vertical {
+                bar.rect.right - bar.rect.left
+            } else {
+                bar.rect.bottom - bar.rect.top
+            };
+            assert_eq!(
+                thickness,
+                scale(6, value.dpi).max(3).min((available - 2).max(1))
+            );
             SendMessageW(
                 hwnd,
                 WM_PRINT,
@@ -1917,10 +1953,7 @@ mod tests {
                 x: (thumb.left + thumb.right) / 2,
                 y: (thumb.top + thumb.bottom) / 2,
             };
-            assert_eq!(
-                GetPixel(bitmap.dc, center.x, center.y),
-                value.palette.accent
-            );
+            assert_eq!(GetPixel(bitmap.dc, center.x, center.y), color);
             let edge = if bar.vertical {
                 POINT {
                     x: bar.rect.left + 1,
@@ -1936,7 +1969,6 @@ mod tests {
                 GetPixel(bitmap.dc, edge.x, edge.y),
                 value.palette.background
             );
-            assert_eq!(GetCapture(), hwnd);
         }
     }
 
@@ -1954,14 +1986,27 @@ mod tests {
         ] {
             assert!(!supported(class, style));
         }
-        let p = palette();
-        assert_eq!(component_color(STATE_SYSTEM_UNAVAILABLE, true, p), p.border);
-        assert_eq!(component_color(STATE_SYSTEM_PRESSED, true, p), p.accent);
-        assert_eq!(component_color(0, false, p), p.border);
+        for kind in [Resolved::Light, Resolved::Dark] {
+            let p = palette_for(kind);
+            assert_eq!(component_color(STATE_SYSTEM_UNAVAILABLE, true, p), p.border);
+            assert_eq!(component_color(STATE_SYSTEM_PRESSED, true, p), p.accent);
+            assert_eq!(component_color(STATE_SYSTEM_HOTTRACKED, true, p), p.accent);
+            assert_eq!(component_color(0, true, p), p.disabled);
+            assert_eq!(component_color(0, false, p), p.border);
+        }
     }
 
     #[test]
     fn known_viewport_keeps_dark_scrollbars_across_empty_and_scrolling_pages() {
+        viewport_restores_themed_scrollbar(Resolved::Dark);
+    }
+
+    #[test]
+    fn known_viewport_keeps_light_scrollbars_across_empty_and_scrolling_pages() {
+        viewport_restores_themed_scrollbar(Resolved::Light);
+    }
+
+    fn viewport_restores_themed_scrollbar(kind: Resolved) {
         // SAFETY: Hidden private HWND tree, scratch bitmap and native scroll
         // ranges only. No user settings, system theme, mouse or clipboard changes.
         unsafe {
@@ -1972,8 +2017,8 @@ mod tests {
             viewport.prepare(96, 360, 0);
             let hwnd = viewport.handle;
             assert_eq!(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL, 0);
-            let p = palette();
-            apply(hwnd, Resolved::Dark, p, 96);
+            let p = palette_for(kind);
+            apply(hwnd, kind, p, 96);
             assert!(
                 state(hwnd).is_some(),
                 "fit page must retain the host subclass"
@@ -1997,11 +2042,11 @@ mod tests {
                 assert_eq!(
                     GetPixel(bitmap.dc, x, y),
                     p.background,
-                    "restored native scrollbar lost its dark track"
+                    "restored native scrollbar lost its themed track"
                 );
                 viewport.prepare(96, 360, 3);
                 viewport.arrange(96, 360, 3);
-                apply(hwnd, Resolved::Dark, p, 96);
+                apply(hwnd, kind, p, 96);
                 assert!(state(hwnd).is_some());
             }
             apply(hwnd, Resolved::Contrast, p, 96);
@@ -2037,8 +2082,8 @@ mod tests {
                     Resolved::Dark,
                     Resolved::Contrast,
                 ] {
-                    apply(hwnd, kind, p, dpi);
-                    assert_eq!(state(hwnd).is_some(), kind == Resolved::Dark);
+                    apply(hwnd, kind, palette_for(kind), dpi);
+                    assert_eq!(state(hwnd).is_some(), kind != Resolved::Contrast);
                     assert_eq!(GetWindowLongPtrW(hwnd, GWL_STYLE), style);
                     assert_eq!(GetWindowLongPtrW(hwnd, GWL_EXSTYLE), ex_style);
                     assert_eq!([scroll(hwnd, SB_VERT), scroll(hwnd, SB_HORZ)], before);
@@ -2064,6 +2109,7 @@ mod tests {
                 Resolved::Contrast,
                 Resolved::Dark,
             ] {
+                let p = palette_for(kind);
                 apply(hwnd, kind, p, 96);
                 SetPixel(bitmap.dc, x, y, sentinel);
                 let printed = PrintWindow(hwnd, bitmap.dc, 0);
@@ -2079,7 +2125,7 @@ mod tests {
                         (PRF_NONCLIENT | PRF_CLIENT) as LPARAM,
                     );
                 }
-                if kind == Resolved::Dark {
+                if kind != Resolved::Contrast {
                     assert_eq!(
                         GetPixel(bitmap.dc, x, y),
                         p.background,
@@ -2146,7 +2192,8 @@ mod tests {
                     (PRF_NONCLIENT | PRF_CLIENT) as LPARAM,
                 );
                 if n % 3 == 0 {
-                    apply(hwnd, Resolved::Light, p, 96);
+                    apply(hwnd, Resolved::Light, palette_for(Resolved::Light), 96);
+                    apply(hwnd, Resolved::Contrast, p, 96);
                     apply(hwnd, Resolved::Dark, p, 96);
                 }
             }
@@ -2213,7 +2260,7 @@ mod tests {
             SendMessageW(hwnd, WM_MOUSEWHEEL, (120u32 << 16) as WPARAM, 0);
             assert!(scroll(hwnd, SB_VERT).3 < before);
             let current = scroll(hwnd, SB_VERT);
-            apply(hwnd, Resolved::Light, palette(), 96);
+            apply(hwnd, Resolved::Light, palette_for(Resolved::Light), 96);
             assert_eq!(scroll(hwnd, SB_VERT), current);
         }
     }
@@ -2233,7 +2280,7 @@ mod tests {
                     DestroyWindow(hwnd);
                     return 0;
                 }
-                apply(hwnd, Resolved::Light, palette(), 96);
+                apply(hwnd, Resolved::Contrast, palette(), 96);
             }
             if message == WM_NCDESTROY {
                 RemoveWindowSubclass(hwnd, Some(destroy_during_default), id);
@@ -2247,13 +2294,18 @@ mod tests {
         // SAFETY: private native children and test-only lifetime probes.
         unsafe {
             let parent = Window(window("STATIC", WS_POPUP, null_mut()));
-            for action in [1, 2] {
+            for (kind, action) in [
+                (Resolved::Light, 1),
+                (Resolved::Light, 2),
+                (Resolved::Dark, 1),
+                (Resolved::Dark, 2),
+            ] {
                 let hwnd = edit(parent.0);
                 assert_ne!(
                     SetWindowSubclass(hwnd, Some(destroy_during_default), SUBCLASS_ID + 1, action),
                     0
                 );
-                apply(hwnd, Resolved::Dark, palette(), 96);
+                apply(hwnd, kind, palette_for(kind), 96);
                 let retained = state(hwnd).unwrap();
                 let text = [b'N' as u16, 0];
                 SendMessageW(hwnd, WM_SETTEXT, 0, text.as_ptr() as LPARAM);
@@ -2467,6 +2519,15 @@ mod tests {
 
     #[test]
     fn hidden_edit_mouse_drag_updates_native_position_before_release_and_prints_dark() {
+        edit_mouse_drag(Resolved::Dark);
+    }
+
+    #[test]
+    fn light_edit_hover_and_both_axis_drags_keep_native_state_and_slim_palette() {
+        edit_mouse_drag(Resolved::Light);
+    }
+
+    fn edit_mouse_drag(kind: Resolved) {
         // SAFETY: hidden test HWNDs; no synthetic system input, real clipboard,
         // GUI launch, network or user configuration is involved.
         unsafe {
@@ -2474,27 +2535,45 @@ mod tests {
             let parent = Window(window("STATIC", WS_POPUP, null_mut()));
             let hwnd = edit(parent.0);
             tracking_probe(hwnd, &calls);
-            apply(hwnd, Resolved::Dark, palette(), 96);
+            apply(hwnd, kind, palette_for(kind), 96);
             let bitmap = BitmapDc::new();
             let initial = [scroll(hwnd, SB_VERT), scroll(hwnd, SB_HORZ)];
-            let bar = screen_bar(hwnd, true).unwrap();
-            let hover = POINT {
-                x: (bar.rect.left + bar.rect.right) / 2,
-                y: bar.rect.top + (bar.thumb_top + bar.thumb_bottom) / 2,
-            };
-            SendMessageW(hwnd, WM_NCMOUSEMOVE, HTVSCROLL as WPARAM, packed(hover));
-            let retained = state(hwnd).unwrap();
-            assert_eq!(
-                retained.get().hover,
-                Some(Hit {
-                    vertical: true,
-                    part: Part::Thumb
-                })
-            );
-            assert!(retained.get().tracking.is_none());
-            assert_eq!(retained.get().timer, 0, "hover must not start polling");
-            SendMessageW(hwnd, WM_NCMOUSELEAVE, 0, 0);
-            assert!(retained.get().hover.is_none());
+            let p = palette_for(kind);
+            for vertical in [true, false] {
+                let bar = screen_bar(hwnd, vertical).unwrap();
+                let hover = if vertical {
+                    POINT {
+                        x: (bar.rect.left + bar.rect.right) / 2,
+                        y: bar.rect.top + (bar.thumb_top + bar.thumb_bottom) / 2,
+                    }
+                } else {
+                    POINT {
+                        x: bar.rect.left + (bar.thumb_top + bar.thumb_bottom) / 2,
+                        y: (bar.rect.top + bar.rect.bottom) / 2,
+                    }
+                };
+                printed_bar(hwnd, &bitmap, vertical, p.disabled);
+                SendMessageW(
+                    hwnd,
+                    WM_NCMOUSEMOVE,
+                    if vertical { HTVSCROLL } else { HTHSCROLL } as WPARAM,
+                    packed(hover),
+                );
+                let retained = state(hwnd).unwrap();
+                assert_eq!(
+                    retained.get().hover,
+                    Some(Hit {
+                        vertical,
+                        part: Part::Thumb
+                    })
+                );
+                assert!(retained.get().tracking.is_none());
+                assert_eq!(retained.get().timer, 0, "hover must not start polling");
+                printed_bar(hwnd, &bitmap, vertical, p.accent);
+                SendMessageW(hwnd, WM_NCMOUSELEAVE, 0, 0);
+                assert!(retained.get().hover.is_none());
+                printed_bar(hwnd, &bitmap, vertical, p.disabled);
+            }
             let selected = selection(hwnd);
             let focus = GetFocus();
             let mut caret = POINT::default();
@@ -2570,7 +2649,7 @@ mod tests {
             assert_eq!(
                 calls.get(),
                 0,
-                "dark NC input entered native modal tracking"
+                "themed NC input entered native modal tracking"
             );
             SendMessageW(hwnd, EM_SETSEL, 7, 7);
             SendMessageW(hwnd, WM_KEYDOWN, 0x27, 0);
@@ -2671,7 +2750,7 @@ mod tests {
                 scroll(hwnd, SB_HORZ).3,
                 (i64::from(native.1) - i64::from(native.2.saturating_sub(1))) as i32
             );
-            apply(hwnd, Resolved::Light, palette(), 96);
+            apply(hwnd, Resolved::Contrast, palette(), 96);
             SendMessageW(hwnd, EM_SETLIMITTEXT, 2_000_000, 0);
             let text: Vec<u16> = "x\r\n"
                 .repeat(90_000)
@@ -2739,6 +2818,15 @@ mod tests {
 
     #[test]
     fn held_line_page_repeat_stops_at_pointer_and_cancel_releases_ownership() {
+        held_line_page_repeat(Resolved::Dark);
+    }
+
+    #[test]
+    fn light_held_line_page_repeat_stops_at_pointer_and_cancel_releases_ownership() {
+        held_line_page_repeat(Resolved::Light);
+    }
+
+    fn held_line_page_repeat(kind: Resolved) {
         // SAFETY: only test children receive NC/capture/timer messages. Repeat
         // ticks are explicit; no sleeps or message-pump timing assumptions.
         unsafe {
@@ -2746,7 +2834,7 @@ mod tests {
             let parent = Window(window("STATIC", WS_POPUP, null_mut()));
             let hwnd = edit(parent.0);
             tracking_probe(hwnd, &calls);
-            apply(hwnd, Resolved::Dark, palette(), 96);
+            apply(hwnd, kind, palette_for(kind), 96);
             let point = press(hwnd, true, Part::LineAfter);
             let first = scroll(hwnd, SB_VERT).3;
             assert!(first > 0);
@@ -2917,6 +3005,15 @@ mod tests {
 
     #[test]
     fn native_query_cancel_keeps_attachment_but_never_continues_stale_scroll() {
+        native_query_cancellation(Resolved::Dark);
+    }
+
+    #[test]
+    fn light_native_queries_do_not_continue_canceled_or_restarted_generations() {
+        native_query_cancellation(Resolved::Light);
+    }
+
+    fn native_query_cancellation(kind: Resolved) {
         // SAFETY: hidden test-owned native controls. Owner-data rows and a test
         // rectangle probe reach the genuine >i32 pixel branch without allocating
         // billions of pixels/items or changing its production overflow threshold.
@@ -2990,7 +3087,7 @@ mod tests {
                         0
                     );
                     tracking_probe(hwnd, &calls);
-                    apply(hwnd, Resolved::Dark, palette(), 96);
+                    apply(hwnd, kind, palette_for(kind), 96);
                     press(hwnd, vertical, Part::Thumb);
                     let retained = state(hwnd).unwrap();
                     let tracking = retained.get().tracking.unwrap();
@@ -3065,11 +3162,16 @@ mod tests {
         unsafe {
             let calls = Cell::new(0);
             let parent = Window(window("STATIC", WS_POPUP, null_mut()));
-            for action in [1, 2] {
+            for (kind, action) in [
+                (Resolved::Light, 1),
+                (Resolved::Light, 2),
+                (Resolved::Dark, 1),
+                (Resolved::Dark, 2),
+            ] {
                 let hwnd = edit(parent.0);
                 SetWindowSubclass(hwnd, Some(destroy_during_default), SUBCLASS_ID + 1, action);
                 tracking_probe(hwnd, &calls);
-                apply(hwnd, Resolved::Dark, palette(), 96);
+                apply(hwnd, kind, palette_for(kind), 96);
                 let retained = state(hwnd).unwrap();
                 let mut point = press(hwnd, true, Part::Thumb);
                 point.y += 35;
@@ -3092,6 +3194,15 @@ mod tests {
 
     #[test]
     fn capture_escape_disable_hide_theme_dpi_resize_and_destroy_cancel() {
+        capture_cancellation(Resolved::Dark);
+    }
+
+    #[test]
+    fn light_capture_cancels_on_theme_contrast_escape_geometry_and_destroy() {
+        capture_cancellation(Resolved::Light);
+    }
+
+    fn capture_cancellation(kind: Resolved) {
         // SAFETY: hidden native HWND tree and scalar messages; no global theme,
         // focus, cursor or input injection. Capture is always released by the SUT.
         unsafe {
@@ -3099,7 +3210,7 @@ mod tests {
             let bitmap = BitmapDc::new();
             for action in 0..14 {
                 let hwnd = edit(parent.0);
-                apply(hwnd, Resolved::Dark, palette(), 96);
+                apply(hwnd, kind, palette_for(kind), 96);
                 let retained = state(hwnd).unwrap();
                 let mut point = press(hwnd, true, Part::Thumb);
                 point.y += 30;
@@ -3119,7 +3230,14 @@ mod tests {
                         ShowWindow(hwnd, SW_HIDE);
                     }
                     4 => apply(hwnd, Resolved::Contrast, palette(), 96),
-                    5 => apply(hwnd, Resolved::Light, palette(), 96),
+                    5 => {
+                        let next = if kind == Resolved::Dark {
+                            Resolved::Light
+                        } else {
+                            Resolved::Dark
+                        };
+                        apply(hwnd, next, palette_for(next), 96);
+                    }
                     6 => {
                         SendMessageW(hwnd, WM_THEMECHANGED, 0, 0);
                     }
@@ -3157,8 +3275,10 @@ mod tests {
                     assert_eq!(GetCapture(), parent.0);
                     ReleaseCapture();
                 }
-                if matches!(action, 4 | 5 | 9) {
+                if matches!(action, 4 | 9) {
                     assert!(!retained.get().attached);
+                } else {
+                    assert!(retained.get().attached);
                 }
                 if !matches!(action, 8 | 9) {
                     assert_eq!(
@@ -3173,7 +3293,13 @@ mod tests {
                         "stale repeat continued after cancel"
                     );
                 }
-                if matches!(action, 4 | 5) {
+                if action == 5 {
+                    assert!(Rc::ptr_eq(&retained, &state(hwnd).unwrap()));
+                    let p = retained.get().palette;
+                    assert_ne!(p.background, palette_for(kind).background);
+                    printed_bar(hwnd, &bitmap, true, p.disabled);
+                }
+                if action == 4 {
                     let bar = native_bar(hwnd, true);
                     let mut window = RECT::default();
                     GetWindowRect(hwnd, &mut window);
@@ -3185,7 +3311,7 @@ mod tests {
                             bar.rcScrollBar.top - window.top + bar.dxyLineButton + 2
                         ),
                         palette().background,
-                        "contrast/light must restore the native frame during an active drag"
+                        "contrast must restore the native frame during an active drag"
                     );
                 }
                 DestroyWindow(hwnd);
@@ -3195,6 +3321,15 @@ mod tests {
 
     #[test]
     fn hidden_report_and_viewport_use_native_ranges_during_capture() {
+        report_and_viewport_capture(Resolved::Dark);
+    }
+
+    #[test]
+    fn light_report_and_viewport_capture_keep_full_width_native_ranges() {
+        report_and_viewport_capture(Resolved::Light);
+    }
+
+    fn report_and_viewport_capture(kind: Resolved) {
         // SAFETY: hidden common controls and the real known viewport; no data
         // files or external GUI. All native scroll state stays control-owned.
         unsafe {
@@ -3227,7 +3362,7 @@ mod tests {
             }
             SendMessageW(list, LVM_SETITEMCOUNT, 100_000, 0);
             tracking_probe(list, &calls);
-            apply(list, Resolved::Dark, palette(), 96);
+            apply(list, kind, palette_for(kind), 96);
             let bitmap = BitmapDc::new();
             let initial = [scroll(list, SB_VERT), scroll(list, SB_HORZ)];
             for vertical in [true, false] {
@@ -3261,7 +3396,7 @@ mod tests {
             viewport.arrange(96, 150_000, 0);
             let hwnd = viewport.handle;
             tracking_probe(hwnd, &calls);
-            apply(hwnd, Resolved::Dark, palette(), 96);
+            apply(hwnd, kind, palette_for(kind), 96);
             let original = scroll(hwnd, SB_VERT);
             let mut point = press(hwnd, true, Part::Thumb);
             point.y += 1000;
@@ -3466,13 +3601,22 @@ mod tests {
 
     #[test]
     fn cancellation_leaves_native_selection_and_other_window_capture_untouched() {
+        unrelated_capture_is_preserved(Resolved::Dark);
+    }
+
+    #[test]
+    fn light_cancellation_keeps_native_selection_and_unrelated_capture() {
+        unrelated_capture_is_preserved(Resolved::Light);
+    }
+
+    fn unrelated_capture_is_preserved(kind: Resolved) {
         // SAFETY: Private HWNDs on this thread; cancel owns neither native Edit
         // selection capture nor a sibling's capture and must not release either.
         unsafe {
             let parent = Window(window("STATIC", WS_POPUP, null_mut()));
             let hwnd = edit(parent.0);
             let other = edit(parent.0);
-            apply(hwnd, Resolved::Dark, palette(), 96);
+            apply(hwnd, kind, palette_for(kind), 96);
             let selected = selection(hwnd);
             for captured in [hwnd, other] {
                 SetCapture(captured);
@@ -3486,15 +3630,30 @@ mod tests {
 
     #[test]
     fn geometry_and_no_redraw_queue_damage_without_synchronous_overlay() {
+        geometry_and_no_redraw(Resolved::Dark);
+    }
+
+    #[test]
+    fn light_geometry_and_no_redraw_do_not_paint_intermediate_frames() {
+        geometry_and_no_redraw(Resolved::Light);
+    }
+
+    fn geometry_and_no_redraw(kind: Resolved) {
         // SAFETY: hidden HWND/DC; the test hook observes only this thread's NC
         // screen passes, not printing. This checks the intermediate layout, not
         // merely a screenshot after the transaction has already completed.
         unsafe {
             let parent = Window(window("STATIC", WS_POPUP, null_mut()));
             let hwnd = edit(parent.0);
-            apply(hwnd, Resolved::Dark, palette(), 96);
+            apply(hwnd, kind, palette_for(kind), 96);
             let before = SCREEN_PASSES.with(Cell::get);
             SendMessageW(hwnd, WM_SETREDRAW, 0, 0);
+            let retained = state(hwnd).unwrap();
+            for next in [Resolved::Light, Resolved::Dark, kind] {
+                apply(hwnd, next, palette_for(next), 96);
+                assert!(Rc::ptr_eq(&retained, &state(hwnd).unwrap()));
+                assert!(!retained.get().redraw);
+            }
             MoveWindow(hwnd, 31, 29, 390, 250, 0);
             SendMessageW(hwnd, WM_DPICHANGED_AFTERPARENT, 0, 0);
             SendMessageW(hwnd, WM_THEMECHANGED, 0, 0);
@@ -3521,6 +3680,15 @@ mod tests {
 
     #[test]
     fn mouse_tracking_print_and_cancellation_do_not_leak_gdi() {
+        mouse_tracking_gdi(Resolved::Dark);
+    }
+
+    #[test]
+    fn light_mouse_tracking_print_and_cancellation_do_not_leak_gdi() {
+        mouse_tracking_gdi(Resolved::Light);
+    }
+
+    fn mouse_tracking_gdi(kind: Resolved) {
         // SAFETY: hidden scratch windows and bitmap; repeated real capture is
         // balanced before resource counts, and no timer stays active afterwards.
         unsafe {
@@ -3528,7 +3696,7 @@ mod tests {
             let parent = Window(window("STATIC", WS_POPUP, null_mut()));
             let hwnd = edit(parent.0);
             tracking_probe(hwnd, &calls);
-            apply(hwnd, Resolved::Dark, palette(), 96);
+            apply(hwnd, kind, palette_for(kind), 96);
             let bitmap = BitmapDc::new();
             let once = || {
                 for vertical in [true, false] {

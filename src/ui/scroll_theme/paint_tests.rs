@@ -3,6 +3,7 @@ use super::*;
 struct ScrollPaintProbe {
     samples: Cell<usize>,
     native_track: Cell<u32>,
+    expected: u32,
 }
 
 unsafe fn physical_track(hwnd: HWND, vertical: bool) -> u32 {
@@ -50,7 +51,7 @@ unsafe extern "system" fn sample_native_scroll(
     data: usize,
 ) -> LRESULT {
     // SAFETY: the stack probe outlives the test-owned child. Sample BEFORE
-    // returning to the dark overlay, never use a ListView DC to trigger a flush.
+    // returning to the themed overlay, never use a ListView DC to trigger a flush.
     unsafe {
         let result = DefSubclassProc(hwnd, message, w, l);
         if matches!(
@@ -62,9 +63,8 @@ unsafe extern "system" fn sample_native_scroll(
                 let color = physical_track(hwnd, vertical);
                 probe.native_track.set(color);
                 assert_eq!(
-                    color,
-                    palette().background,
-                    "native scroll exposed a light track before dark overlay"
+                    color, probe.expected,
+                    "native scroll exposed a system track before themed overlay"
                 );
                 probe.samples.set(probe.samples.get() + 1);
             }
@@ -124,11 +124,23 @@ unsafe fn report_fixture(parent: HWND) -> HWND {
 #[test]
 #[ignore = "requires an unobscured interactive desktop; run explicitly and serially"]
 fn report_scroll_never_exposes_native_track_before_dark_overlay() {
+    physical_report_scroll(Resolved::Dark);
+}
+
+#[test]
+#[ignore = "requires an unobscured interactive desktop; run explicitly and serially"]
+fn report_scroll_never_exposes_native_track_before_light_overlay() {
+    physical_report_scroll(Resolved::Light);
+}
+
+fn physical_report_scroll(kind: Resolved) {
     // SAFETY: own visible HWND only, no application data, network or clipboard.
     unsafe {
+        let p = palette_for(kind);
         let probe = ScrollPaintProbe {
             samples: Cell::new(0),
             native_track: Cell::new(0),
+            expected: p.background,
         };
         let calls = Cell::new(0);
         let parent = Window(window("STATIC", WS_POPUP | WS_VISIBLE, null_mut()));
@@ -143,7 +155,7 @@ fn report_scroll_never_exposes_native_track_before_dark_overlay() {
             0
         );
         tracking_probe(hwnd, &calls);
-        apply(hwnd, Resolved::Dark, palette(), 96);
+        apply(hwnd, kind, p, 96);
         SetWindowPos(parent.0, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         ShowWindow(parent.0, SW_SHOW);
         SetForegroundWindow(parent.0);
@@ -161,7 +173,7 @@ fn report_scroll_never_exposes_native_track_before_dark_overlay() {
         std::thread::sleep(std::time::Duration::from_millis(150));
         windows_sys::Win32::Graphics::Dwm::DwmFlush();
         for vertical in [true, false] {
-            assert_eq!(physical_track(hwnd, vertical), palette().background);
+            assert_eq!(physical_track(hwnd, vertical), p.background);
             let before = scroll(hwnd, if vertical { SB_VERT } else { SB_HORZ }).3;
             let mut point = press(hwnd, vertical, Part::Thumb);
             for _ in 0..8 {
@@ -173,7 +185,7 @@ fn report_scroll_never_exposes_native_track_before_dark_overlay() {
                 captured_mouse(hwnd, WM_MOUSEMOVE, point);
                 assert_eq!(GetCapture(), hwnd);
                 for axis in [true, false] {
-                    assert_eq!(physical_track(hwnd, axis), palette().background);
+                    assert_eq!(physical_track(hwnd, axis), p.background);
                 }
             }
             assert!(scroll(hwnd, if vertical { SB_VERT } else { SB_HORZ }).3 > before);
@@ -187,36 +199,170 @@ fn report_scroll_never_exposes_native_track_before_dark_overlay() {
             let point = press(hwnd, vertical, Part::PageAfter);
             SendMessageW(hwnd, WM_TIMER, TRACK_TIMER, 0);
             assert_eq!(GetCapture(), hwnd);
-            assert_eq!(physical_track(hwnd, vertical), palette().background);
+            assert_eq!(physical_track(hwnd, vertical), p.background);
             captured_mouse(hwnd, WM_LBUTTONUP, point);
         }
         SendMessageW(hwnd, LVM_ENSUREVISIBLE, 90, 0);
         SendMessageW(hwnd, WM_MOUSEWHEEL, (120u32 << 16) as WPARAM, 0);
         windows_sys::Win32::Graphics::Dwm::DwmFlush();
         for vertical in [true, false] {
-            assert_eq!(physical_track(hwnd, vertical), palette().background);
+            assert_eq!(physical_track(hwnd, vertical), p.background);
         }
         assert!(probe.samples.get() >= 40);
         assert_eq!(calls.get(), 0);
         assert_ne!(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE, 0);
         assert!(GetPropW(hwnd, windows_sys::w!("SysSetRedraw")).is_null());
         println!(
-            "{} intermediate physical track samples remained dark",
+            "{} intermediate physical track samples retained the {kind:?} palette",
             probe.samples.get()
         );
     }
 }
 
 #[test]
-fn report_compositing_is_local_owned_and_restored_in_light_and_contrast() {
+fn light_report_both_axes_hover_drag_hold_and_theme_switch_keep_native_selection() {
+    // SAFETY: private hidden native report, explicit capture/timer messages and
+    // scratch print bitmap only; no desktop input or clipboard modifications.
+    unsafe {
+        let calls = Cell::new(0);
+        let parent = Window(window("STATIC", WS_POPUP, null_mut()));
+        let hwnd = report_fixture(parent.0);
+        tracking_probe(hwnd, &calls);
+        let native = [scroll(hwnd, SB_VERT), scroll(hwnd, SB_HORZ)];
+        let mut selected = LVITEMW {
+            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+            state: LVIS_SELECTED | LVIS_FOCUSED,
+            ..Default::default()
+        };
+        SendMessageW(
+            hwnd,
+            LVM_SETITEMSTATE,
+            3,
+            (&mut selected as *mut LVITEMW) as LPARAM,
+        );
+        SendMessageW(hwnd, LVM_SETSELECTIONMARK, 0, 3);
+        let p = palette_for(Resolved::Light);
+        apply(hwnd, Resolved::Light, p, 96);
+        let retained = state(hwnd).unwrap();
+        let bitmap = BitmapDc::new();
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        for vertical in [true, false] {
+            let message = if vertical { WM_VSCROLL } else { WM_HSCROLL };
+            SendMessageW(hwnd, message, SB_TOP as WPARAM, 0);
+            let bar = screen_bar(hwnd, vertical).unwrap();
+            let thumb = slim_thumb(bar, 96).unwrap();
+            // Hit the original native thumb outside the narrow painted capsule.
+            let hover = if vertical {
+                POINT {
+                    x: bar.rect.left + 1,
+                    y: (thumb.top + thumb.bottom) / 2,
+                }
+            } else {
+                POINT {
+                    x: (thumb.left + thumb.right) / 2,
+                    y: bar.rect.top + 1,
+                }
+            };
+            assert_eq!(
+                hit(bar, hover),
+                Some(Hit {
+                    vertical,
+                    part: Part::Thumb
+                })
+            );
+            assert!(!contains(thumb, hover));
+            SendMessageW(
+                hwnd,
+                WM_NCMOUSEMOVE,
+                if vertical { HTVSCROLL } else { HTHSCROLL } as WPARAM,
+                packed(hover),
+            );
+            assert_eq!(
+                retained.get().hover,
+                Some(Hit {
+                    vertical,
+                    part: Part::Thumb
+                })
+            );
+            assert_eq!(retained.get().timer, 0);
+            printed_bar(hwnd, &bitmap, vertical, p.accent);
+            SendMessageW(hwnd, WM_NCMOUSELEAVE, 0, 0);
+            printed_bar(hwnd, &bitmap, vertical, p.disabled);
+            let mut point = press(hwnd, vertical, Part::Thumb);
+            if vertical {
+                point.y += 30;
+            } else {
+                point.x += 40;
+            }
+            captured_mouse(hwnd, WM_MOUSEMOVE, point);
+            let position = scroll(hwnd, if vertical { SB_VERT } else { SB_HORZ });
+            assert!(position.3 > 0, "report must scroll before release");
+            let initial = native[usize::from(!vertical)];
+            assert_eq!(
+                (position.0, position.1, position.2),
+                (initial.0, initial.1, initial.2)
+            );
+            printed_tracking(hwnd, &bitmap);
+            captured_mouse(hwnd, WM_LBUTTONUP, point);
+            for part in [Part::LineAfter, Part::PageAfter] {
+                SendMessageW(hwnd, message, SB_TOP as WPARAM, 0);
+                let point = press(hwnd, vertical, part);
+                let first = scroll(hwnd, if vertical { SB_VERT } else { SB_HORZ }).3;
+                assert!(first > 0);
+                SendMessageW(hwnd, WM_TIMER, TRACK_TIMER, 0);
+                assert!(scroll(hwnd, if vertical { SB_VERT } else { SB_HORZ }).3 > first);
+                assert_eq!(GetCapture(), hwnd);
+                printed_bar(hwnd, &bitmap, vertical, p.disabled);
+                captured_mouse(hwnd, WM_LBUTTONUP, point);
+            }
+            assert_eq!(GetWindowLongPtrW(hwnd, GWL_STYLE), style);
+            assert_eq!(GetWindowLongPtrW(hwnd, GWL_EXSTYLE), ex_style);
+        }
+        let native = [scroll(hwnd, SB_VERT), scroll(hwnd, SB_HORZ)];
+        for kind in [Resolved::Dark, Resolved::Light] {
+            press(hwnd, true, Part::Thumb);
+            apply(hwnd, kind, palette_for(kind), 144);
+            assert!(Rc::ptr_eq(&retained, &state(hwnd).unwrap()));
+            assert!(retained.get().tracking.is_none());
+            assert_eq!(retained.get().timer, 0);
+            assert!(retained.get().keyboard_hook.is_null());
+            assert_ne!(GetCapture(), hwnd);
+            assert_eq!(GetWindowLongPtrW(hwnd, GWL_EXSTYLE), ex_style);
+            assert_eq!([scroll(hwnd, SB_VERT), scroll(hwnd, SB_HORZ)], native);
+            for vertical in [true, false] {
+                printed_bar(hwnd, &bitmap, vertical, palette_for(kind).disabled);
+            }
+        }
+        assert_eq!(SendMessageW(hwnd, LVM_GETSELECTEDCOUNT, 0, 0), 1);
+        assert_eq!(SendMessageW(hwnd, LVM_GETSELECTIONMARK, 0, 0), 3);
+        assert_eq!(
+            SendMessageW(hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as LPARAM),
+            3
+        );
+        assert_eq!(SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0), 100);
+        assert_eq!(calls.get(), 0);
+        apply(hwnd, Resolved::Contrast, palette(), 96);
+        assert!(state(hwnd).is_none());
+        assert!(!retained.get().attached);
+        assert_eq!([scroll(hwnd, SB_VERT), scroll(hwnd, SB_HORZ)], native);
+        assert_eq!(
+            GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_COMPOSITED,
+            0
+        );
+    }
+}
+
+#[test]
+fn report_compositing_is_local_owned_in_light_dark_and_restored_in_contrast() {
     // SAFETY: hidden test windows; preserve styles installed by other owners.
     unsafe {
         let parent = Window(window("STATIC", WS_POPUP, null_mut()));
         let hwnd = report_fixture(parent.0);
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let native = [scroll(hwnd, SB_VERT), scroll(hwnd, SB_HORZ)];
-        for kind in [Resolved::Light, Resolved::Contrast] {
-            apply(hwnd, Resolved::Dark, palette(), 96);
+        for kind in [Resolved::Light, Resolved::Dark, Resolved::Light] {
+            apply(hwnd, kind, palette_for(kind), 96);
             assert!(state(hwnd).unwrap().get().composited);
             assert_eq!(
                 GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
@@ -227,17 +373,20 @@ fn report_compositing_is_local_owned_and_restored_in_light_and_contrast() {
                 0
             );
             assert_eq!([scroll(hwnd, SB_VERT), scroll(hwnd, SB_HORZ)], native);
-            apply(hwnd, kind, palette(), 96);
+            apply(hwnd, Resolved::Contrast, palette(), 96);
+            assert!(state(hwnd).is_none());
             assert_eq!(GetWindowLongPtrW(hwnd, GWL_EXSTYLE), style);
         }
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_COMPOSITED as isize);
-        apply(hwnd, Resolved::Dark, palette(), 96);
-        assert!(!state(hwnd).unwrap().get().composited);
-        apply(hwnd, Resolved::Light, palette(), 96);
-        assert_ne!(
-            GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_COMPOSITED,
-            0
-        );
+        for kind in [Resolved::Light, Resolved::Dark] {
+            apply(hwnd, kind, palette_for(kind), 96);
+            assert!(!state(hwnd).unwrap().get().composited);
+            apply(hwnd, Resolved::Contrast, palette(), 96);
+            assert_ne!(
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_COMPOSITED,
+                0
+            );
+        }
     }
 }
 
@@ -315,26 +464,39 @@ fn native_nc_region_excludes_both_bars_and_corner_but_preserves_border_and_borro
             ),
             0
         );
-        apply(hwnd, Resolved::Dark, palette(), 96);
-        probe.armed.set(true);
-        SendMessageW(hwnd, WM_NCPAINT, 1, 0);
-        let mut rect = RECT::default();
-        GetWindowRect(hwnd, &mut rect);
-        probe.original = CreateRectRgnIndirect(&rect);
-        SendMessageW(hwnd, WM_NCPAINT, probe.original as WPARAM, 0);
-        assert_eq!(probe.count.get(), 2);
+        for (index, kind) in [Resolved::Light, Resolved::Dark].into_iter().enumerate() {
+            probe.armed.set(false);
+            apply(hwnd, kind, palette_for(kind), 96);
+            probe.armed.set(true);
+            SendMessageW(hwnd, WM_NCPAINT, 1, 0);
+            let mut rect = RECT::default();
+            GetWindowRect(hwnd, &mut rect);
+            probe.original = CreateRectRgnIndirect(&rect);
+            SendMessageW(hwnd, WM_NCPAINT, probe.original as WPARAM, 0);
+            assert_eq!(probe.count.get(), 2 * (index + 1));
+            DeleteObject(probe.original);
+            probe.original = null_mut();
+        }
         RemoveWindowSubclass(hwnd, Some(inspect_nc_region), SUBCLASS_ID + 31);
-        DeleteObject(probe.original);
     }
 }
 
 #[test]
 fn composited_report_never_bypasses_no_redraw_and_does_not_hold_dc_for_menu_keys() {
+    composited_no_redraw(Resolved::Dark);
+}
+
+#[test]
+fn light_composited_report_respects_no_redraw_and_menu_key_dc_lifetime() {
+    composited_no_redraw(Resolved::Light);
+}
+
+fn composited_no_redraw(kind: Resolved) {
     // SAFETY: scratch hidden windows. No real menu or clipboard is invoked.
     unsafe {
         let parent = Window(window("STATIC", WS_POPUP, null_mut()));
         let hwnd = report_fixture(parent.0);
-        apply(hwnd, Resolved::Dark, palette(), 96);
+        apply(hwnd, kind, palette_for(kind), 96);
         let retained = state(hwnd).unwrap();
         assert!(paint::ScrollPaint::begin(hwnd, &retained, WM_KEYDOWN, 0x5d).is_none());
         assert!(paint::ScrollPaint::begin(hwnd, &retained, WM_KEYDOWN, 0x79).is_none());
@@ -375,7 +537,7 @@ unsafe extern "system" fn theme_during_style(
                 DestroyWindow(hwnd);
                 return 0;
             }
-            apply(hwnd, probe.target, palette(), 96);
+            apply(hwnd, probe.target, palette_for(probe.target), 96);
         }
         if message == WM_NCDESTROY {
             RemoveWindowSubclass(hwnd, Some(theme_during_style), id);
@@ -389,54 +551,51 @@ fn reentrant_style_theme_requests_keep_latest_intent_and_owned_style() {
     // SAFETY: hidden local HWNDs, one-shot style notifications on owner thread.
     unsafe {
         for message in [WM_STYLECHANGING, WM_STYLECHANGED] {
-            for target in [Resolved::Light, Resolved::Contrast, Resolved::Dark] {
-                for destroy in [false, true] {
-                    let probe = ThemeProbe {
-                        message,
-                        target,
-                        destroy,
-                        armed: Cell::new(false),
-                        fired: Cell::new(false),
-                    };
-                    let parent = Window(window("STATIC", WS_POPUP, null_mut()));
-                    let hwnd = report_fixture(parent.0);
-                    assert_ne!(
-                        SetWindowSubclass(
-                            hwnd,
-                            Some(theme_during_style),
-                            SUBCLASS_ID + 32,
-                            (&probe as *const ThemeProbe) as usize
-                        ),
-                        0
-                    );
-                    if target == Resolved::Dark {
-                        apply(hwnd, Resolved::Dark, palette(), 96);
-                    }
-                    probe.armed.set(true);
-                    apply(
-                        hwnd,
-                        if target == Resolved::Dark {
-                            Resolved::Light
-                        } else {
-                            Resolved::Dark
-                        },
-                        palette(),
-                        96,
-                    );
-                    assert!(probe.fired.get());
-                    if destroy {
-                        assert_eq!(IsWindow(hwnd), 0);
-                        continue;
-                    }
-                    let retained = state(hwnd);
-                    assert_eq!(retained.is_some(), target == Resolved::Dark);
-                    assert_eq!(
-                        GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_COMPOSITED != 0,
-                        target == Resolved::Dark
-                    );
-                    if let Some(retained) = retained {
-                        assert!(retained.get().enabled && retained.get().composited);
-                        assert!(!retained.get().changing_style);
+            for requested in [Resolved::Light, Resolved::Dark, Resolved::Contrast] {
+                for target in [Resolved::Light, Resolved::Contrast, Resolved::Dark] {
+                    for destroy in [false, true] {
+                        let probe = ThemeProbe {
+                            message,
+                            target,
+                            destroy,
+                            armed: Cell::new(false),
+                            fired: Cell::new(false),
+                        };
+                        let parent = Window(window("STATIC", WS_POPUP, null_mut()));
+                        let hwnd = report_fixture(parent.0);
+                        assert_ne!(
+                            SetWindowSubclass(
+                                hwnd,
+                                Some(theme_during_style),
+                                SUBCLASS_ID + 32,
+                                (&probe as *const ThemeProbe) as usize
+                            ),
+                            0
+                        );
+                        if requested == Resolved::Contrast {
+                            apply(hwnd, Resolved::Light, palette_for(Resolved::Light), 96);
+                        }
+                        probe.armed.set(true);
+                        apply(hwnd, requested, palette_for(requested), 96);
+                        assert!(probe.fired.get());
+                        if destroy {
+                            assert_eq!(IsWindow(hwnd), 0);
+                            continue;
+                        }
+                        let retained = state(hwnd);
+                        assert_eq!(retained.is_some(), target != Resolved::Contrast);
+                        assert_eq!(
+                            GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_COMPOSITED != 0,
+                            target != Resolved::Contrast
+                        );
+                        if let Some(retained) = retained {
+                            assert!(retained.get().enabled && retained.get().composited);
+                            assert!(!retained.get().changing_style);
+                            assert_eq!(
+                                retained.get().palette.background,
+                                palette_for(target).background
+                            );
+                        }
                     }
                 }
             }
@@ -451,13 +610,15 @@ fn report_composited_scroll_and_theme_cycles_do_not_leak_gdi() {
         let parent = Window(window("STATIC", WS_POPUP, null_mut()));
         let hwnd = report_fixture(parent.0);
         let once = || {
-            apply(hwnd, Resolved::Dark, palette(), 96);
-            for _ in 0..4 {
-                SendMessageW(hwnd, LVM_SCROLL, 8, 20);
-                SendMessageW(hwnd, WM_NCPAINT, 1, 0);
+            for kind in [Resolved::Light, Resolved::Dark] {
+                apply(hwnd, kind, palette_for(kind), 96);
+                for _ in 0..4 {
+                    SendMessageW(hwnd, LVM_SCROLL, 8, 20);
+                    SendMessageW(hwnd, WM_NCPAINT, 1, 0);
+                }
+                SendMessageW(hwnd, WM_VSCROLL, SB_TOP as WPARAM, 0);
             }
-            SendMessageW(hwnd, WM_VSCROLL, SB_TOP as WPARAM, 0);
-            apply(hwnd, Resolved::Light, palette(), 96);
+            apply(hwnd, Resolved::Contrast, palette(), 96);
             GdiFlush();
             GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS)
         };

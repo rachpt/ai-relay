@@ -304,6 +304,19 @@ fn near(a: u32, b: u32) -> bool {
         .all(|shift| (((a >> shift) & 255) as i32 - ((b >> shift) & 255) as i32).abs() <= 24)
 }
 
+fn mixed(pixel: u32, background: u32, foreground: u32) -> bool {
+    pixel != background
+        && pixel != foreground
+        && (1..16u32).any(|coverage| {
+            pixel
+                == [0, 8, 16].into_iter().fold(0, |color, shift| {
+                    let a = (background >> shift) & 255;
+                    let b = (foreground >> shift) & 255;
+                    color | (((a * (16 - coverage) + b * coverage + 8) / 16) << shift)
+                })
+        })
+}
+
 #[test]
 fn actual_draw_keeps_24_dip_icon_neutral_text_ellipsis_and_full_native_value() {
     let mut native = NativeState::new();
@@ -382,6 +395,18 @@ fn actual_draw_keeps_24_dip_icon_neutral_text_ellipsis_and_full_native_value() {
                 let colors = colors(expected_kind, kind, p);
                 assert!(icon.iter().any(|color| near(*color, colors.icon)));
                 assert!(icon.contains(&colors.badge));
+                if kind != theme::Resolved::Contrast {
+                    assert!(
+                        icon.iter()
+                            .any(|color| mixed(*color, p.background, colors.icon)),
+                        "outer circle has no AA coverage: {expected_kind:?}/{kind:?}/{dpi}"
+                    );
+                    assert!(
+                        icon.iter()
+                            .any(|color| mixed(*color, colors.badge, colors.icon)),
+                        "symbol/ring has no AA coverage: {expected_kind:?}/{kind:?}/{dpi}"
+                    );
+                }
                 if kind == theme::Resolved::Contrast {
                     assert!(
                         icon.iter()
@@ -457,6 +482,122 @@ fn actual_draw_keeps_24_dip_icon_neutral_text_ellipsis_and_full_native_value() {
             );
             resize(hwnd, width, height);
         }
+    }
+}
+
+#[test]
+fn status_print_messages_keep_borrowed_dc_clip_pixels_and_gdi_fallback_readable() {
+    let mut native = NativeState::new();
+    let target = Bitmap::new();
+    // SAFETY: Hidden native fixture, no focus/activation or message pump; the
+    // stable State owns all fonts until the status subclass is destroyed.
+    unsafe { attach(&mut *native.state).unwrap() };
+    let hwnd = native.state.status_label;
+    for dpi in [96, 144, 192] {
+        native.state.update_dpi(native.hwnd, dpi).unwrap();
+        resize(hwnd, scale(360, dpi), scale(HEIGHT, dpi));
+        for kind in [theme::Resolved::Light, theme::Resolved::Dark] {
+            native.state.theme.kind = kind;
+            native.state.theme.palette = palette(kind);
+            settings::set_text(hwnd, "代理状态：运行中\n保留完整原生文字");
+            // SAFETY: Mutations are confined to a private memory DC. The clip is
+            // copied by SelectClipRgn and remains alive until after inspection.
+            unsafe {
+                let _saved = SavedDc::new(target.dc);
+                let sentinel = 0x794321;
+                let entire = RECT {
+                    left: 0,
+                    top: 0,
+                    right: Bitmap::WIDTH,
+                    bottom: Bitmap::HEIGHT,
+                };
+                SetDCBrushColor(target.dc, sentinel);
+                let clip = Region::new(RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1000,
+                    bottom: 100,
+                });
+                let hole_rect = RECT {
+                    left: scale(27, dpi),
+                    top: scale(15, dpi),
+                    right: scale(31, dpi),
+                    bottom: scale(23, dpi),
+                };
+                let hole = Region::new(hole_rect);
+                assert_eq!(CombineRgn(clip.0, clip.0, hole.0, RGN_DIFF), COMPLEXREGION);
+                assert_ne!(SelectClipRgn(target.dc, clip.0), ERROR);
+                SetStretchBltMode(target.dc, HALFTONE);
+                SetTextColor(target.dc, 0x123456);
+                SetBkColor(target.dc, 0x234567);
+                SetDCPenColor(target.dc, 0x345678);
+                SetBkMode(target.dc, OPAQUE as i32);
+                let before = DcState::capture(target.dc);
+                let after = Region::new(RECT::default());
+                for message in [WM_PRINT, WM_PRINTCLIENT] {
+                    // Clear clip holes too, then restore the lender's full DC
+                    // state and complex clip before this independent print.
+                    {
+                        let _clear = SavedDc::new(target.dc);
+                        assert_ne!(SelectClipRgn(target.dc, null_mut()), ERROR);
+                        SetDCBrushColor(target.dc, sentinel);
+                        assert_ne!(FillRect(target.dc, &entire, GetStockObject(DC_BRUSH)), 0);
+                    }
+                    assert_eq!(DcState::capture(target.dc), before);
+                    assert_eq!(GetClipRgn(target.dc, after.0), 1);
+                    assert_ne!(EqualRgn(clip.0, after.0), 0);
+                    SendMessageW(hwnd, message, target.dc as WPARAM, PRF_CLIENT as LPARAM);
+                    assert_eq!(DcState::capture(target.dc), before);
+                    assert_eq!(GetClipRgn(target.dc, after.0), 1);
+                    assert_ne!(EqualRgn(clip.0, after.0), 0);
+                    assert!(
+                        target
+                            .pixels(hole_rect)
+                            .iter()
+                            .all(|color| *color == sentinel)
+                    );
+                    let icon = target.pixels(RECT {
+                        left: scale(24, dpi),
+                        top: scale(12, dpi),
+                        right: scale(40, dpi),
+                        bottom: scale(28, dpi),
+                    });
+                    let colors = colors(StatusKind::Running, kind, palette(kind));
+                    assert!(icon.contains(&colors.icon));
+                    assert!(icon.iter().any(|color| mixed(
+                        *color,
+                        palette(kind).background,
+                        colors.icon
+                    )));
+                }
+            }
+        }
+    }
+    // Rejecting an oversized raster must still paint the semantic symbol using
+    // GDI. Center the large icon partly above the DIB so its center is visible.
+    unsafe {
+        let _saved = SavedDc::new(target.dc);
+        let colors = colors(
+            StatusKind::Running,
+            theme::Resolved::Light,
+            palette(theme::Resolved::Light),
+        );
+        assert!(status_raster(257, StatusKind::Running, colors, 0xf3f3f3).is_none());
+        status_icon(
+            target.dc,
+            RECT {
+                left: 0,
+                top: -96,
+                right: 257,
+                bottom: 161,
+            },
+            StatusKind::Running,
+            colors,
+            0xf3f3f3,
+            theme::Resolved::Light,
+        );
+        assert_eq!(GetPixel(target.dc, 130, 32), colors.icon);
+        assert_eq!(GetPixel(target.dc, 70, 32), colors.badge);
     }
 }
 
